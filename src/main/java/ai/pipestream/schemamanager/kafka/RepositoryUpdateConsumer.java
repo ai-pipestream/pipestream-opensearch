@@ -66,11 +66,14 @@ public class RepositoryUpdateConsumer {
     @Incoming("repository-document-events-in")
     public Uni<Void> consumeDocumentEvent(Message<RepositoryEvent> message) {
         RepositoryEvent event = message.getPayload();
+        // #region agent log
+        LOG.info("AGENT_DEBUG run=initial hypothesis=H4 location=RepositoryUpdateConsumer.consumeDocumentEvent message=\"consumer reached after deserialization\"");
+        // #endregion
         LOG.infof("*** OPENSEARCH-MANAGER RECEIVED REPOSITORY EVENT: documentId=%s, accountId=%s ***",
                 event.getDocumentId(), event.getAccountId());
 
         // Use dynamic gRPC to call repository service and get node metadata (without payload)
-        return grpcClientFactory.getClient("repository-service", MutinyFilesystemServiceGrpc::newMutinyStub)
+        return grpcClientFactory.getClient("repository", MutinyFilesystemServiceGrpc::newMutinyStub)
             .flatMap(repoClient -> {
                 GetFilesystemNodeRequest getNodeRequest = GetFilesystemNodeRequest.newBuilder()
                     .setDrive(event.getAccountId())
@@ -219,4 +222,5 @@ public class RepositoryUpdateConsumer {
                 return Uni.createFrom().voidItem();
         }
     }
+
 }
