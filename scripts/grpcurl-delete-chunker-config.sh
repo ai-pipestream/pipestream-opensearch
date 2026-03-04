@@ -5,6 +5,6 @@
 
 set -e
 ID="${1:?Usage: $0 <id> [host:port]}"
-HOST="${2:-localhost:38103}"
+HOST="${2:-localhost:18103}"
 
 grpcurl -plaintext -d "{\"id\": \"$ID\"}" "$HOST" ai.pipestream.opensearch.v1.ChunkerConfigService/DeleteChunkerConfig

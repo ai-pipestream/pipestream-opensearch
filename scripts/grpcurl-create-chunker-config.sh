@@ -7,7 +7,7 @@
 set -e
 NAME="${1:?Usage: $0 <name> <config_id> [host:port]}"
 CONFIG_ID="${2:?Usage: $0 <name> <config_id> [host:port]}"
-HOST="${3:-localhost:38103}"
+HOST="${3:-localhost:18103}"
 
 grpcurl -plaintext -d "{
   \"name\": \"$NAME\",

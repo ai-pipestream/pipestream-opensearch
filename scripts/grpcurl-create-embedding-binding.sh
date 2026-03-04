@@ -7,7 +7,7 @@ set -e
 INDEX_NAME="${1:?Usage: $0 <index_name> <embedding_config_id> [field_name] [host:port]}"
 EMBEDDING_CONFIG_ID="${2:?Usage: $0 <index_name> <embedding_config_id> [field_name] [host:port]}"
 FIELD_NAME="${3:-embeddings_384.embedding}"
-HOST="${4:-localhost:38103}"
+HOST="${4:-localhost:18103}"
 
 grpcurl -plaintext -d "{
   \"index_name\": \"$INDEX_NAME\",

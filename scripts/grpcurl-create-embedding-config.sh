@@ -7,7 +7,7 @@ set -e
 NAME="${1:?Usage: $0 <name> <model_identifier> [dimensions] [host:port]}"
 MODEL_ID="${2:?Usage: $0 <name> <model_identifier> [dimensions] [host:port]}"
 DIMENSIONS="${3:-384}"
-HOST="${4:-localhost:38103}"
+HOST="${4:-localhost:18103}"
 
 grpcurl -plaintext -d "{
   \"name\": \"$NAME\",

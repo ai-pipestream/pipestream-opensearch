@@ -7,7 +7,7 @@
 set -e
 ID_OR_NAME="${1:?Usage: $0 <id_or_name> [--by-name] [host:port]}"
 BY_NAME="false"
-HOST="localhost:38103"
+HOST="localhost:18103"
 
 shift || true
 while [[ $# -gt 0 ]]; do

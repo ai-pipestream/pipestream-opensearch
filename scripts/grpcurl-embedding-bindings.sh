@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # List index-embedding bindings (optionally filtered by index name).
 # Usage: ./grpcurl-embedding-bindings.sh [host:port] [index_name] [page_size]
-# Example: ./grpcurl-embedding-bindings.sh localhost:38103 repository-pipedocs
+# Example: ./grpcurl-embedding-bindings.sh localhost:18103 repository-pipedocs
 
 set -e
-HOST="${1:-localhost:38103}"
+HOST="${1:-localhost:18103}"
 INDEX_NAME="${2:-}"
 PAGE_SIZE="${3:-10}"
 if [[ -n "$INDEX_NAME" ]]; then

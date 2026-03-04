@@ -4,7 +4,7 @@
 # Prerequisites: opensearch-manager running, grpcurl installed, OpenSearch + PostgreSQL available
 
 set -e
-HOST="${1:-localhost:38103}"
+HOST="${1:-localhost:18103}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INDEX_NAME="grpcurl-test-index-$(date +%s)"
 EMBEDDING_NAME="grpcurl-test-embedder-$(date +%s)"

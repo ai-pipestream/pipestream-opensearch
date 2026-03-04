@@ -3,7 +3,7 @@
 # Tests: gRPC endpoints, DB persistence, OpenSearch connectivity
 
 set -e
-HOST="${1:-localhost:38103}"
+HOST="${1:-localhost:18103}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=== opensearch-manager Service Health Check ==="

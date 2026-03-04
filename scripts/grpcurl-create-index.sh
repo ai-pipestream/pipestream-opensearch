@@ -7,7 +7,7 @@
 set -e
 INDEX_NAME="${1:?Usage: $0 <index_name> [dimension] [host:port]}"
 DIMENSION="${2:-384}"
-HOST="${3:-localhost:38103}"
+HOST="${3:-localhost:18103}"
 
 grpcurl -plaintext "$HOST" ai.pipestream.opensearch.v1.OpenSearchManagerService/CreateIndex "{
   \"index_name\": \"$INDEX_NAME\",

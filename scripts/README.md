@@ -11,7 +11,7 @@ brew install grpcurl
 
 ## Default host
 
-- **localhost:38103** (from `%dev.quarkus.http.port`)
+- **localhost:18103** (from `%dev.quarkus.http.port`)
 
 Override by passing host:port as the first argument where supported.
 
@@ -61,7 +61,7 @@ Override by passing host:port as the first argument where supported.
 
 # List indices (all or filtered)
 ./grpcurl-list-indices.sh
-./grpcurl-list-indices.sh localhost:38103 pipeline-
+./grpcurl-list-indices.sh localhost:18103 pipeline-
 
 # Check if index exists
 ./grpcurl-index-exists.sh repository-pipedocs
@@ -71,7 +71,7 @@ Override by passing host:port as the first argument where supported.
 
 # List embedding configs and bindings
 ./grpcurl-embedding-configs.sh
-./grpcurl-embedding-bindings.sh localhost:38103 repository-pipedocs
+./grpcurl-embedding-bindings.sh localhost:18103 repository-pipedocs
 
 # Chunker configs
 ./grpcurl-chunker-configs.sh
