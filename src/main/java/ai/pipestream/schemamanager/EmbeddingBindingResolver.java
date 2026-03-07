@@ -15,6 +15,11 @@ import org.jboss.logging.Logger;
 public class EmbeddingBindingResolver {
 
     private static final Logger LOG = Logger.getLogger(EmbeddingBindingResolver.class);
+    private static final String DEFAULT_RESULT_SET_NAME = "default";
+
+    private static String normalizeResultSetName(String resultSetName) {
+        return (resultSetName == null || resultSetName.isBlank()) ? DEFAULT_RESULT_SET_NAME : resultSetName;
+    }
 
     /**
      * Resolves VectorFieldDefinition for the given index and field by looking up
@@ -24,7 +29,29 @@ public class EmbeddingBindingResolver {
      */
     @WithSession
     public Uni<VectorFieldDefinition> resolve(String indexName, String fieldName) {
-        return IndexEmbeddingBinding.findByIndexAndField(indexName, fieldName)
+        return resolve(indexName, fieldName, null);
+    }
+
+    @WithSession
+    public Uni<VectorFieldDefinition> resolve(String indexName, String fieldName, String resultSetName) {
+        String normalizedResultSetName = normalizeResultSetName(resultSetName);
+        return IndexEmbeddingBinding.findByIndexFieldAndResultSetName(indexName, fieldName, normalizedResultSetName)
+                .onItem().transformToUni(binding -> {
+                    if (binding != null) {
+                        return Uni.createFrom().item(binding);
+                    }
+
+                    return IndexEmbeddingBinding.findByIndexFieldAndResultSetName(indexName, fieldName, DEFAULT_RESULT_SET_NAME)
+                            .onItem().transformToUni(fallbackBinding -> {
+                                if (fallbackBinding != null) {
+                                    return Uni.createFrom().item(fallbackBinding);
+                                }
+
+                                LOG.warnf("No binding found for index=%s field=%s resultSet=%s",
+                                        indexName, fieldName, normalizedResultSetName);
+                                return Uni.createFrom().item((IndexEmbeddingBinding) null);
+                            });
+                })
                 .onItem().transformToUni(binding -> {
                     if (binding == null || binding.embeddingModelConfig == null) {
                         return Uni.createFrom().item((VectorFieldDefinition) null);

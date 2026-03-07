@@ -82,6 +82,7 @@ class EmbeddingConfigEntityTest {
     void crud_indexEmbeddingBinding_withEmbeddingModelConfig(UniAsserter asserter) {
         String configId = "emb-" + UUID.randomUUID();
         String bindingId = "binding-" + UUID.randomUUID();
+        String altBindingId = "binding-alt-" + UUID.randomUUID();
         String indexName = "test-index";
         String fieldName = "embeddings_384";
 
@@ -110,6 +111,21 @@ class EmbeddingConfigEntityTest {
                                     return binding.persist();
                                 })));
 
+        // Create second run binding with the same index+field but distinct run name
+        asserter.execute(() ->
+                Panache.withTransaction(() ->
+                        EmbeddingModelConfig.findById(configId)
+                                .chain(c -> {
+                                    if (c == null) throw new AssertionError("EmbeddingModelConfig not found: " + configId);
+                                    IndexEmbeddingBinding binding = new IndexEmbeddingBinding();
+                                    binding.id = altBindingId;
+                                    binding.indexName = indexName;
+                                    binding.embeddingModelConfig = (EmbeddingModelConfig) c;
+                                    binding.fieldName = fieldName;
+                                    binding.resultSetName = "alt-run";
+                                    return binding.persist();
+                                })));
+
         // Read by index name
         asserter.assertThat(
                 () -> Panache.withSession(() -> IndexEmbeddingBinding.findByIndexName(indexName)),
@@ -130,10 +146,21 @@ class EmbeddingConfigEntityTest {
 
         // Read by index and field
         asserter.assertThat(
-                () -> Panache.withSession(() -> IndexEmbeddingBinding.findByIndexAndField(indexName, fieldName)),
+                () -> Panache.withSession(() -> IndexEmbeddingBinding.findAllByIndexAndField(indexName, fieldName)),
                 found -> {
                     assertNotNull(found);
-                    assertEquals(bindingId, found.id);
+                    assertEquals(2, found.size());
+                    assertTrue(found.stream().anyMatch(x -> bindingId.equals(x.id)));
+                    assertTrue(found.stream().anyMatch(x -> altBindingId.equals(x.id)));
+                });
+
+        // Read by index + field + run name
+        asserter.assertThat(
+                () -> Panache.withSession(() -> IndexEmbeddingBinding.findByIndexFieldAndResultSetName(indexName, fieldName, "alt-run")),
+                found -> {
+                    assertNotNull(found);
+                    assertEquals(altBindingId, found.id);
+                    assertEquals("alt-run", found.resultSetName);
                     assertEquals(configId, found.embeddingModelConfig.id);
                 });
 
@@ -141,6 +168,9 @@ class EmbeddingConfigEntityTest {
         asserter.execute(() ->
                 Panache.withTransaction(() ->
                         IndexEmbeddingBinding.findById(bindingId).chain(b -> b.delete())));
+        asserter.execute(() ->
+                Panache.withTransaction(() ->
+                        IndexEmbeddingBinding.findById(altBindingId).chain(b -> b.delete())));
         asserter.execute(() ->
                 Panache.withTransaction(() ->
                         EmbeddingModelConfig.findById(configId).chain(c -> c.delete())));

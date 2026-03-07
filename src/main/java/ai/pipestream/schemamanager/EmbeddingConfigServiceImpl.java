@@ -25,6 +25,7 @@ import java.util.UUID;
 public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc.EmbeddingConfigServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(EmbeddingConfigServiceImpl.class);
+    private static final String DEFAULT_RESULT_SET_NAME = "default";
 
     private final SemanticMetadataEventProducer eventProducer;
 
@@ -152,7 +153,7 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                     entity.indexName = request.getIndexName();
                     entity.embeddingModelConfig = (EmbeddingModelConfig) emc;
                     entity.fieldName = request.getFieldName();
-                    entity.resultSetName = request.hasResultSetName() ? request.getResultSetName() : null;
+                    entity.resultSetName = normalizeResultSetName(request.hasResultSetName() ? request.getResultSetName() : null);
                     return entity.persist().replaceWith(entity);
                 }))
                 .onItem().transform(e -> toIndexEmbeddingBindingProto((IndexEmbeddingBinding) e))
@@ -164,7 +165,13 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
     @WithSession
     public Uni<GetIndexEmbeddingBindingResponse> getIndexEmbeddingBinding(GetIndexEmbeddingBindingRequest request) {
         Uni<IndexEmbeddingBinding> lookup = request.hasIndexName() && request.hasFieldName()
-                ? IndexEmbeddingBinding.findByIndexAndField(request.getIndexName(), request.getFieldName())
+                ? IndexEmbeddingBinding.findByIndexFieldAndResultSetName(
+                        request.getIndexName(),
+                        request.getFieldName(),
+                        DEFAULT_RESULT_SET_NAME)
+                        .onItem().transformToUni(binding -> binding != null
+                                ? Uni.createFrom().item(binding)
+                                : IndexEmbeddingBinding.findByIndexAndField(request.getIndexName(), request.getFieldName()))
                 : IndexEmbeddingBinding.findById(request.getId());
         return Panache.withSession(() -> lookup)
                 .onItem().transformToUni(b -> b != null
@@ -189,7 +196,7 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                     ai.pipestream.opensearch.v1.IndexEmbeddingBinding previous = toIndexEmbeddingBindingProto(entity);
                     if (request.hasIndexName()) entity.indexName = request.getIndexName();
                     if (request.hasFieldName()) entity.fieldName = request.getFieldName();
-                    if (request.hasResultSetName()) entity.resultSetName = request.getResultSetName();
+                    if (request.hasResultSetName()) entity.resultSetName = normalizeResultSetName(request.getResultSetName());
                     if (request.hasEmbeddingModelConfigId()) {
                         return EmbeddingModelConfig.findById(request.getEmbeddingModelConfigId())
                                 .onItem().transformToUni(emc -> {
@@ -275,7 +282,7 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                 .setIndexName(b.indexName)
                 .setEmbeddingModelConfigId(b.embeddingModelConfig != null ? b.embeddingModelConfig.id : "")
                 .setFieldName(b.fieldName);
-        if (b.resultSetName != null) pb.setResultSetName(b.resultSetName);
+        pb.setResultSetName(normalizeResultSetName(b.resultSetName));
         if (b.createdAt != null) pb.setCreatedAt(toTimestamp(b.createdAt));
         if (b.updatedAt != null) pb.setUpdatedAt(toTimestamp(b.updatedAt));
         return pb.build();
@@ -305,5 +312,12 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
         } catch (NumberFormatException e) {
             return 0;
         }
+    }
+
+    private String normalizeResultSetName(String value) {
+        if (value == null || value.isBlank()) {
+            return DEFAULT_RESULT_SET_NAME;
+        }
+        return value;
     }
 }

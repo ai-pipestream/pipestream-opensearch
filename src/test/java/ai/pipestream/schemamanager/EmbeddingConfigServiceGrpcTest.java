@@ -145,6 +145,99 @@ class EmbeddingConfigServiceGrpcTest {
     }
 
     @Test
+    void createMultipleIndexEmbeddingBindingsForSameIndexFieldWithDifferentResultSets() {
+        String configNamePrimary = "binding-primary-model-" + UUID.randomUUID();
+        var primaryConfigResp = embeddingConfigClient.createEmbeddingModelConfig(
+                CreateEmbeddingModelConfigRequest.newBuilder()
+                        .setName(configNamePrimary)
+                        .setModelIdentifier("test/model-primary")
+                        .setDimensions(384)
+                        .build()
+        ).await().indefinitely();
+
+        String configNameSecondary = "binding-secondary-model-" + UUID.randomUUID();
+        var secondaryConfigResp = embeddingConfigClient.createEmbeddingModelConfig(
+                CreateEmbeddingModelConfigRequest.newBuilder()
+                        .setName(configNameSecondary)
+                        .setModelIdentifier("test/model-secondary")
+                        .setDimensions(768)
+                        .build()
+        ).await().indefinitely();
+
+        String indexName = "multi-result-set-index-" + UUID.randomUUID();
+        String fieldName = "embeddings_dynamic";
+
+        var defaultBindingResp = embeddingConfigClient.createIndexEmbeddingBinding(
+                CreateIndexEmbeddingBindingRequest.newBuilder()
+                        .setIndexName(indexName)
+                        .setEmbeddingModelConfigId(primaryConfigResp.getConfig().getId())
+                        .setFieldName(fieldName)
+                        .setResultSetName("default")
+                        .build()
+        ).await().indefinitely();
+
+        var altBindingResp = embeddingConfigClient.createIndexEmbeddingBinding(
+                CreateIndexEmbeddingBindingRequest.newBuilder()
+                        .setIndexName(indexName)
+                        .setEmbeddingModelConfigId(secondaryConfigResp.getConfig().getId())
+                        .setFieldName(fieldName)
+                        .setResultSetName("alt-run")
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(defaultBindingResp.getBinding().getResultSetName(), equalTo("default"));
+        assertThat(altBindingResp.getBinding().getResultSetName(), equalTo("alt-run"));
+        assertThat(defaultBindingResp.getBinding().getId(), not(equalTo(altBindingResp.getBinding().getId())));
+
+        var resolveDefaultResp = embeddingConfigClient.getIndexEmbeddingBinding(
+                GetIndexEmbeddingBindingRequest.newBuilder()
+                        .setId(defaultBindingResp.getBinding().getId())
+                        .build()
+        ).await().indefinitely();
+        assertThat(resolveDefaultResp.getBinding().getResultSetName(), equalTo("default"));
+
+        var resolveAltResp = embeddingConfigClient.getIndexEmbeddingBinding(
+                GetIndexEmbeddingBindingRequest.newBuilder()
+                        .setId(altBindingResp.getBinding().getId())
+                        .build()
+        ).await().indefinitely();
+        assertThat(resolveAltResp.getBinding().getResultSetName(), equalTo("alt-run"));
+
+        var byIndexFieldResp = embeddingConfigClient.getIndexEmbeddingBinding(
+                GetIndexEmbeddingBindingRequest.newBuilder()
+                        .setIndexName(indexName)
+                        .setFieldName(fieldName)
+                        .build()
+        ).await().indefinitely();
+        assertThat(byIndexFieldResp.getBinding().getResultSetName(), equalTo("default"));
+
+        var allBindingsResp = embeddingConfigClient.listIndexEmbeddingBindings(
+                ListIndexEmbeddingBindingsRequest.newBuilder()
+                        .setIndexName(indexName)
+                        .setPageSize(10)
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(allBindingsResp.getBindingsCount(), greaterThanOrEqualTo(2));
+        assertThat(allBindingsResp.getBindingsList().stream().anyMatch(b -> "default".equals(b.getResultSetName())), is(true));
+        assertThat(allBindingsResp.getBindingsList().stream().anyMatch(b -> "alt-run".equals(b.getResultSetName())), is(true));
+
+        embeddingConfigClient.deleteIndexEmbeddingBinding(
+                DeleteIndexEmbeddingBindingRequest.newBuilder().setId(defaultBindingResp.getBinding().getId()).build()
+        ).await().indefinitely();
+        embeddingConfigClient.deleteIndexEmbeddingBinding(
+                DeleteIndexEmbeddingBindingRequest.newBuilder().setId(altBindingResp.getBinding().getId()).build()
+        ).await().indefinitely();
+
+        embeddingConfigClient.deleteEmbeddingModelConfig(
+                DeleteEmbeddingModelConfigRequest.newBuilder().setId(primaryConfigResp.getConfig().getId()).build()
+        ).await().indefinitely();
+        embeddingConfigClient.deleteEmbeddingModelConfig(
+                DeleteEmbeddingModelConfigRequest.newBuilder().setId(secondaryConfigResp.getConfig().getId()).build()
+        ).await().indefinitely();
+    }
+
+    @Test
     void getEmbeddingModelConfig_notFound_throws() {
         assertThrows(StatusRuntimeException.class, () ->
                 embeddingConfigClient.getEmbeddingModelConfig(
