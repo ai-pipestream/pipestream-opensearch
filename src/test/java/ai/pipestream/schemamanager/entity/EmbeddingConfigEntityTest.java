@@ -1,9 +1,6 @@
 package ai.pipestream.schemamanager.entity;
 
-import ai.pipestream.test.support.OpensearchContainerTestResource;
-import ai.pipestream.test.support.OpensearchWireMockTestResource;
 import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.vertx.RunOnVertxContext;
 import io.quarkus.test.vertx.UniAsserter;
@@ -14,8 +11,6 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
-@QuarkusTestResource(OpensearchWireMockTestResource.class)
-@QuarkusTestResource(OpensearchContainerTestResource.class)
 class EmbeddingConfigEntityTest {
 
     @Test

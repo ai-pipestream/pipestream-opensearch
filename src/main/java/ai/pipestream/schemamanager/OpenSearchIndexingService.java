@@ -138,8 +138,13 @@ public class OpenSearchIndexingService {
         return VectorSetIndexBindingEntity.findBinding(vs.id, indexName)
             .onItem().transformToUni(existing -> {
                 if (existing != null) {
-                    return Uni.createFrom().voidItem();
+                    // Binding exists in DB — verify the OpenSearch index+field is still there.
+                    // This handles the case where the index was deleted externally.
+                    return ensureOpenSearchMappingExists(indexName, vs);
                 }
+
+                LOG.infof("Creating index binding: vectorSet=%s index=%s field=%s dimensions=%d",
+                        vs.name, indexName, vs.fieldName, vs.vectorDimensions);
 
                 VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
                 binding.id = UUID.randomUUID().toString();
@@ -150,13 +155,28 @@ public class OpenSearchIndexingService {
                 binding.status = "ACTIVE";
 
                 return binding.<VectorSetIndexBindingEntity>persist()
-                    .onItem().transformToUni(b -> {
-                        VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
-                            .setDimension(vs.vectorDimensions)
-                            .build();
-                        return openSearchClient.createIndexWithNestedMapping(indexName, vs.fieldName, vfd)
-                            .replaceWith(Uni.createFrom().voidItem());
-                    });
+                    .onItem().transformToUni(b -> ensureOpenSearchMappingExists(indexName, vs));
+            });
+    }
+
+    /**
+     * Verify the OpenSearch index and nested field mapping exist, creating them if missing.
+     * This is idempotent — safe to call on every document, but only does real work when
+     * the index or field is missing (e.g., after an index deletion).
+     */
+    private Uni<Void> ensureOpenSearchMappingExists(String indexName, VectorSetEntity vs) {
+        return openSearchClient.nestedMappingExists(indexName, vs.fieldName)
+            .onItem().transformToUni(exists -> {
+                if (exists) {
+                    return Uni.createFrom().voidItem();
+                }
+                LOG.infof("OpenSearch mapping missing for index=%s field=%s — creating (dimensions=%d)",
+                        indexName, vs.fieldName, vs.vectorDimensions);
+                VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
+                    .setDimension(vs.vectorDimensions)
+                    .build();
+                return openSearchClient.createIndexWithNestedMapping(indexName, vs.fieldName, vfd)
+                    .replaceWith(Uni.createFrom().voidItem());
             });
     }
 

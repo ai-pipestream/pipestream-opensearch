@@ -1,13 +1,10 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
-import ai.pipestream.test.support.OpensearchContainerTestResource;
-import ai.pipestream.test.support.OpensearchWireMockTestResource;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
-import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -24,8 +21,6 @@ import static org.junit.jupiter.api.Assertions.*;
  * dimension denormalization, and edge cases.
  */
 @QuarkusTest
-@QuarkusTestResource(OpensearchWireMockTestResource.class)
-@QuarkusTestResource(OpensearchContainerTestResource.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class VectorSetServiceGrpcTest {
 
@@ -50,6 +45,7 @@ class VectorSetServiceGrpcTest {
         var resp = chunkerClient.createChunkerConfig(
                 CreateChunkerConfigRequest.newBuilder()
                         .setName("test-chunker-" + suffix)
+                        .setConfigId("token-body-512-50-" + suffix)
                         .setConfigJson(configJson)
                         .build()
         ).await().indefinitely();

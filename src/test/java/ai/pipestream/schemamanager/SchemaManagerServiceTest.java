@@ -7,10 +7,7 @@ import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
 import ai.pipestream.schemamanager.v1.KnnMethodDefinition;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
-import ai.pipestream.test.support.OpensearchWireMockTestResource;
-import ai.pipestream.test.support.OpensearchConsulTestResource;
 import io.quarkus.grpc.GrpcClient;
-import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -23,8 +20,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
-@QuarkusTestResource(OpensearchWireMockTestResource.class)
-@QuarkusTestResource(OpensearchConsulTestResource.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class SchemaManagerServiceTest {
 

@@ -69,9 +69,8 @@ dependencies {
     implementation "ai.pipestream:pipestream-descriptor-api:${pipestreamBomVersion}"
     implementation "ai.pipestream:pipestream-descriptor-apicurio:${pipestreamBomVersion}"
 
-    // Service discovery and registration with Consul
+    // Service discovery with Consul (registration handled by pipestream-service-registration)
     implementation 'io.smallrye.stork:stork-service-discovery-consul'
-    implementation 'io.smallrye.stork:stork-service-registration-consul'
     implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
 
     // Pipestream platform libraries (managed via BOM/catalog)

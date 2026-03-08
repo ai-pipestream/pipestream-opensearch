@@ -1,7 +1,10 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
 import ai.pipestream.schemamanager.util.AnyDocumentMapper;
+import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
+import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsResponse;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
 import jakarta.inject.Singleton;
@@ -23,6 +26,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
 
     @Inject
     AnyDocumentMapper anyDocumentMapper;
+
+    @Inject
+    OpenSearchSchemaService schemaService;
+
+    @Inject
+    EmbeddingBindingResolver embeddingBindingResolver;
 
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -75,5 +84,42 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     @Override
     public Uni<SearchFilesystemMetaResponse> searchFilesystemMeta(SearchFilesystemMetaRequest request) {
         return indexingService.searchFilesystemMeta(request);
+    }
+
+    @Override
+    public Uni<EnsureNestedEmbeddingsFieldExistsResponse> ensureNestedEmbeddingsFieldExists(
+            EnsureNestedEmbeddingsFieldExistsRequest request) {
+        String indexName = request.getIndexName();
+        String fieldName = request.getNestedFieldName();
+
+        // Resolve VectorFieldDefinition first (DB on event loop), then do OpenSearch ops (worker thread)
+        Uni<ai.pipestream.schemamanager.v1.VectorFieldDefinition> vfdUni;
+        if (request.hasVectorFieldDefinition() && request.getVectorFieldDefinition().getDimension() > 0) {
+            vfdUni = Uni.createFrom().item(request.getVectorFieldDefinition());
+        } else {
+            vfdUni = embeddingBindingResolver.resolve(indexName, fieldName);
+        }
+
+        return vfdUni.flatMap(vfd -> {
+            if (vfd == null) {
+                return Uni.createFrom().failure(
+                        io.grpc.Status.FAILED_PRECONDITION
+                                .withDescription("Cannot resolve vector dimensions for " + indexName + "/" + fieldName)
+                                .asRuntimeException());
+            }
+            // Now check existence and create on worker thread (OpenSearch I/O)
+            return schemaService.nestedMappingExists(indexName, fieldName)
+                    .flatMap(exists -> {
+                        if (exists) {
+                            return Uni.createFrom().item(EnsureNestedEmbeddingsFieldExistsResponse.newBuilder()
+                                    .setSchemaExisted(true)
+                                    .build());
+                        }
+                        return schemaService.createIndexWithNestedMapping(indexName, fieldName, vfd)
+                                .map(success -> EnsureNestedEmbeddingsFieldExistsResponse.newBuilder()
+                                        .setSchemaExisted(false)
+                                        .build());
+                    });
+        });
     }
 }

@@ -1,11 +1,8 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
-import ai.pipestream.test.support.OpensearchContainerTestResource;
-import ai.pipestream.test.support.OpensearchWireMockTestResource;
 import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
-import io.quarkus.test.common.QuarkusTestResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -22,8 +19,6 @@ import static org.junit.jupiter.api.Assertions.*;
  * See: https://quarkus.io/guides/grpc-service-implementation#testing-your-services
  */
 @QuarkusTest
-@QuarkusTestResource(OpensearchWireMockTestResource.class)
-@QuarkusTestResource(OpensearchContainerTestResource.class)
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class EmbeddingConfigServiceGrpcTest {
 
