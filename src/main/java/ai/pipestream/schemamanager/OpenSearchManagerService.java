@@ -39,6 +39,20 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     }
 
     @Override
+    public io.smallrye.mutiny.Multi<StreamIndexDocumentsResponse> streamIndexDocuments(io.smallrye.mutiny.Multi<StreamIndexDocumentsRequest> requests) {
+        // Collect documents into batches of 100 or every 500ms
+        return requests.group().intoLists().of(100, java.time.Duration.ofMillis(500))
+                .onItem().transformToMultiAndConcatenate(batch -> {
+                    if (batch.isEmpty()) {
+                        return io.smallrye.mutiny.Multi.createFrom().empty();
+                    }
+                    LOG.debugf("Processing micro-batch of %d documents for streaming ingestion", batch.size());
+                    return indexingService.indexDocumentsBatch(batch)
+                            .onItem().transformToMulti(list -> io.smallrye.mutiny.Multi.createFrom().iterable(list));
+                });
+    }
+
+    @Override
     public Uni<IndexAnyDocumentResponse> indexAnyDocument(IndexAnyDocumentRequest request) {
         return Uni.createFrom().item(() -> {
             try {
