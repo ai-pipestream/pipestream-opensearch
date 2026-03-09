@@ -1,23 +1,21 @@
 package ai.pipestream.schemamanager;
 
-import ai.pipestream.opensearch.v1.CreateEmbeddingModelConfigRequest;
-import ai.pipestream.opensearch.v1.CreateIndexEmbeddingBindingRequest;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
+import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
 import ai.pipestream.schemamanager.v1.KnnMethodDefinition;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.junit.QuarkusTest;
+import io.smallrye.mutiny.Multi;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.util.List;
 import java.util.UUID;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -173,5 +171,37 @@ class SchemaManagerServiceTest {
 
         assertNotNull(response);
         assertThat("Schema should be created", response.getSchemaExisted(), is(false));
-    }
-}
+        }
+
+        @Test
+        void testStreamIndexDocuments() {
+        String indexName = "test-stream-" + UUID.randomUUID();
+
+        StreamIndexDocumentsRequest req1 = StreamIndexDocumentsRequest.newBuilder()
+                .setRequestId("req-1")
+                .setIndexName(indexName)
+                .setDocument(OpenSearchDocument.newBuilder()
+                        .setOriginalDocId("doc-1")
+                        .setTitle("Stream Doc 1")
+                        .build())
+                .build();
+
+        StreamIndexDocumentsRequest req2 = StreamIndexDocumentsRequest.newBuilder()
+                .setRequestId("req-2")
+                .setIndexName(indexName)
+                .setDocument(OpenSearchDocument.newBuilder()
+                        .setOriginalDocId("doc-2")
+                        .setTitle("Stream Doc 2")
+                        .build())
+                .build();
+
+        List<StreamIndexDocumentsResponse> responses = openSearchManagerService.streamIndexDocuments(Multi.createFrom().items(req1, req2))
+                .collect().asList().await().indefinitely();
+
+        assertNotNull(responses);
+        assertThat("Should have 2 responses", responses.size(), is(2));
+        assertThat("First response should be success", responses.get(0).getSuccess(), is(true));
+        assertThat("Second response should be success", responses.get(1).getSuccess(), is(true));
+        assertThat("Ids should match", responses.get(0).getRequestId(), anyOf(is("req-1"), is("req-2")));
+        }
+        }
