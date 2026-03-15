@@ -91,8 +91,33 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     }
 
     @Override
+    public Uni<DeleteIndexResponse> deleteIndex(DeleteIndexRequest request) {
+        return indexingService.deleteIndex(request);
+    }
+
+    @Override
     public Uni<IndexExistsResponse> indexExists(IndexExistsRequest request) {
         return indexingService.indexExists(request);
+    }
+
+    @Override
+    public Uni<ListIndicesResponse> listIndices(ListIndicesRequest request) {
+        return indexingService.listIndices(request);
+    }
+
+    @Override
+    public Uni<GetIndexStatsResponse> getIndexStats(GetIndexStatsRequest request) {
+        return indexingService.getIndexStats(request);
+    }
+
+    @Override
+    public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
+        return indexingService.deleteDocument(request);
+    }
+
+    @Override
+    public Uni<GetOpenSearchDocumentResponse> getOpenSearchDocument(GetOpenSearchDocumentRequest request) {
+        return indexingService.getOpenSearchDocument(request);
     }
 
     @Override
