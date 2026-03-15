@@ -1,6 +1,13 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.config.v1.ModuleDefinition;
+import ai.pipestream.events.v1.DocumentUploadedEvent;
+import ai.pipestream.repository.filesystem.v1.Drive;
+import ai.pipestream.repository.filesystem.v1.Node;
+import ai.pipestream.repository.v1.PipeDocUpdateNotification;
+import ai.pipestream.repository.v1.ProcessRequestUpdateNotification;
+import ai.pipestream.repository.v1.ProcessResponseUpdateNotification;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
@@ -14,9 +21,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.util.JsonFormat;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
+import io.quarkus.runtime.ShutdownEvent;
+import io.quarkus.runtime.StartupEvent;
+import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
+import io.smallrye.mutiny.subscription.BackPressureStrategy;
+import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 import org.opensearch.protobufs.BulkRequest;
@@ -26,6 +39,7 @@ import org.opensearch.protobufs.IndexOperation;
 import org.opensearch.protobufs.OperationContainer;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ExecutionException;
 
@@ -50,6 +64,8 @@ public class OpenSearchIndexingService {
 
     @Inject
     ObjectMapper objectMapper;
+
+    private volatile MultiEmitter<? super EntityIndexRequest> entityEmitter;
 
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         var document = request.getDocument();
@@ -459,6 +475,252 @@ public class OpenSearchIndexingService {
                         .build())
                 .build();
     }
+
+    // ===== Entity batching infrastructure =====
+
+    record EntityIndexRequest(String indexName, String docId, Map<String, Object> document) {}
+
+    void onStartup(@Observes StartupEvent event) {
+        Multi.createFrom().<EntityIndexRequest>emitter(em -> {
+            this.entityEmitter = em;
+        }, BackPressureStrategy.BUFFER)
+        .group().intoLists().of(500, Duration.ofMillis(500))
+        .onItem().transformToUniAndConcatenate(batch ->
+            processEntityBatch(batch)
+                .onFailure().recoverWithItem((Void) null)
+        )
+        .subscribe().with(
+            v -> {},
+            failure -> LOG.errorf(failure, "Entity batch processor terminated unexpectedly")
+        );
+        LOG.info("Entity batch processor started (batch size=500, flush interval=500ms)");
+    }
+
+    void onShutdown(@Observes ShutdownEvent event) {
+        if (entityEmitter != null) {
+            entityEmitter.complete();
+        }
+    }
+
+    /**
+     * Queue a document for batched indexing into OpenSearch.
+     * Fire-and-forget: the document will be included in the next bulk request.
+     */
+    public void queueForIndexing(String indexName, String docId, Map<String, Object> document) {
+        if (entityEmitter != null) {
+            entityEmitter.emit(new EntityIndexRequest(indexName, docId, document));
+        } else {
+            LOG.warnf("Entity batch emitter not ready, indexing %s/%s individually", indexName, docId);
+            indexEntityDirect(indexName, docId, document);
+        }
+    }
+
+    private Uni<Void> processEntityBatch(List<EntityIndexRequest> batch) {
+        if (batch.isEmpty()) return Uni.createFrom().voidItem();
+        LOG.infof("Bulk indexing %d entity documents", batch.size());
+
+        try {
+            var br = new org.opensearch.client.opensearch.core.BulkRequest.Builder();
+            for (EntityIndexRequest req : batch) {
+                br.operations(op -> op.index(idx -> idx
+                    .index(req.indexName())
+                    .id(req.docId())
+                    .document(req.document())
+                ));
+            }
+            return Uni.createFrom().completionStage(openSearchAsyncClient.bulk(br.build()))
+                .invoke(response -> {
+                    if (response.errors()) {
+                        long errors = response.items().stream()
+                            .filter(item -> item.error() != null).count();
+                        LOG.warnf("Bulk entity batch had %d errors out of %d items", errors, batch.size());
+                    } else {
+                        LOG.debugf("Successfully bulk indexed %d entity documents", batch.size());
+                    }
+                })
+                .replaceWithVoid()
+                .onFailure().invoke(e -> LOG.errorf(e, "Bulk entity indexing failed for batch of %d", batch.size()));
+        } catch (Exception e) {
+            LOG.errorf(e, "Failed to build bulk request for %d entity documents", batch.size());
+            return Uni.createFrom().voidItem();
+        }
+    }
+
+    private void indexEntityDirect(String indexName, String docId, Map<String, Object> document) {
+        try {
+            openSearchAsyncClient.index(r -> r.index(indexName).id(docId).document(document));
+        } catch (Exception e) {
+            LOG.errorf(e, "Direct entity indexing failed for %s/%s", indexName, docId);
+        }
+    }
+
+    // ===== Entity indexing methods (drives, nodes, modules, pipedocs, etc.) =====
+
+    public Uni<Void> indexDrive(Drive drive, java.util.UUID key) {
+        Map<String, Object> document = new HashMap<>();
+        document.put("name", drive.getName());
+        document.put("description", drive.getDescription());
+        if (!drive.getMetadata().isEmpty()) document.put("metadata", drive.getMetadata());
+        if (drive.hasCreatedAt()) document.put("created_at", drive.getCreatedAt().getSeconds() * 1000);
+        document.put("indexed_at", System.currentTimeMillis());
+        queueForIndexing(Index.FILESYSTEM_DRIVES.getIndexName(), key.toString(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteDrive(java.util.UUID key) {
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_DRIVES.getIndexName()).id(key.toString()))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey) {
+        Map<String, Object> document = new HashMap<>();
+        document.put(NodeFields.NODE_ID.getFieldName(), kafkaKey.toString());
+        document.put(CommonFields.NAME.getFieldName(), node.getName());
+        document.put(NodeFields.DRIVE.getFieldName(), drive);
+        document.put(NodeFields.NODE_TYPE.getFieldName(), node.getType().name());
+        document.put(NodeFields.PATH.getFieldName(), node.getPath());
+        if (!node.getContentType().isEmpty()) document.put("content_type", node.getContentType());
+        if (node.getSizeBytes() > 0) document.put("size_bytes", node.getSizeBytes());
+        if (!node.getS3Key().isEmpty()) document.put(NodeFields.S3_KEY.getFieldName(), node.getS3Key());
+        if (!node.getDocumentId().isEmpty()) document.put("document_id", node.getDocumentId());
+        document.put(CommonFields.CREATED_AT.getFieldName(), node.getCreatedAt().getSeconds() * 1000);
+        document.put(CommonFields.UPDATED_AT.getFieldName(), node.getUpdatedAt().getSeconds() * 1000);
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+        queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteNode(String nodeId, String drive) {
+        String docId = drive + "/" + nodeId;
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_NODES.getIndexName()).id(docId))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexModule(ModuleDefinition module) {
+        Map<String, Object> document = new HashMap<>();
+        document.put(ModuleFields.MODULE_ID.getFieldName(), module.getModuleId());
+        document.put(ModuleFields.IMPLEMENTATION_NAME.getFieldName(), module.getImplementationName());
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+        queueForIndexing(Index.REPOSITORY_MODULES.getIndexName(), module.getModuleId(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteModule(String moduleId) {
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_MODULES.getIndexName()).id(moduleId))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexPipeDoc(PipeDocUpdateNotification notification) {
+        Map<String, Object> document = new HashMap<>();
+        document.put(PipeDocFields.STORAGE_ID.getFieldName(), notification.getStorageId());
+        document.put(PipeDocFields.DOC_ID.getFieldName(), notification.getDocId());
+        document.put(CommonFields.DESCRIPTION.getFieldName(), notification.getDescription());
+        document.put(PipeDocFields.TITLE.getFieldName(), notification.getTitle());
+        document.put(PipeDocFields.AUTHOR.getFieldName(), notification.getAuthor());
+        if (notification.hasTags()) {
+            document.put(CommonFields.TAGS.getFieldName(), notification.getTags().getTagDataMap());
+        }
+        if (notification.hasOwnership()) {
+            var ownership = notification.getOwnership();
+            document.put("account_id", ownership.getAccountId());
+            document.put("datasource_id", ownership.getDatasourceId());
+            document.put("connector_id", ownership.getConnectorId());
+            if (ownership.getAclsCount() > 0) {
+                document.put("acls", ownership.getAclsList());
+            }
+        }
+        document.put(CommonFields.CREATED_AT.getFieldName(), notification.getCreatedAt().getSeconds() * 1000);
+        document.put(CommonFields.UPDATED_AT.getFieldName(), notification.getUpdatedAt().getSeconds() * 1000);
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+        queueForIndexing(Index.REPOSITORY_PIPEDOCS.getIndexName(), notification.getStorageId(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deletePipeDoc(String storageId) {
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PIPEDOCS.getIndexName()).id(storageId))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexDocumentUpload(DocumentUploadedEvent event) {
+        Map<String, Object> document = new HashMap<>();
+        document.put("doc_id", event.getDocId());
+        document.put("s3_key", event.getS3Key());
+        document.put("connector_id", event.getConnectorId());
+        document.put("account_id", event.getAccountId());
+        document.put("filename", event.getFilename());
+        document.put("filename_raw", event.getFilename());
+        document.put("mime_type", event.getMimeType());
+        document.put("path", event.getPath());
+        document.put("path_text", event.getPath());
+        if (event.hasCreationDate()) {
+            document.put("creation_date", event.getCreationDate().getSeconds() * 1000);
+        }
+        if (event.hasLastModifiedDate()) {
+            document.put("last_modified_date", event.getLastModifiedDate().getSeconds() * 1000);
+        }
+        if (!event.getMetadataMap().isEmpty()) {
+            document.put("metadata", event.getMetadataMap());
+        }
+        document.put("uploaded_at", System.currentTimeMillis());
+        String docId = event.getAccountId() + "/" + event.getDocId();
+        queueForIndexing(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName(), docId, document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteDocumentUpload(String accountId, String docId) {
+        String id = accountId + "/" + docId;
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName()).id(id))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexProcessRequest(ProcessRequestUpdateNotification notification) {
+        Map<String, Object> document = new HashMap<>();
+        document.put(ProcessFields.REQUEST_ID.getFieldName(), notification.getRequestId());
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+        queueForIndexing(Index.REPOSITORY_PROCESS_REQUESTS.getIndexName(), notification.getRequestId(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteProcessRequest(String requestId) {
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_REQUESTS.getIndexName()).id(requestId))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    public Uni<Void> indexProcessResponse(ProcessResponseUpdateNotification notification) {
+        Map<String, Object> document = new HashMap<>();
+        document.put(ProcessFields.RESPONSE_ID.getFieldName(), notification.getResponseId());
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+        queueForIndexing(Index.REPOSITORY_PROCESS_RESPONSES.getIndexName(), notification.getResponseId(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    public Uni<Void> deleteProcessResponse(String responseId) {
+        try {
+            return Uni.createFrom().completionStage(
+                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_RESPONSES.getIndexName()).id(responseId))
+            ).replaceWithVoid();
+        } catch (Exception e) { return Uni.createFrom().failure(e); }
+    }
+
+    // ===== Index administration methods =====
 
     public Uni<CreateIndexResponse> createIndex(CreateIndexRequest request) {
         return openSearchSchemaClient.createIndexWithNestedMapping(request.getIndexName(), "embeddings", request.getVectorFieldDefinition())

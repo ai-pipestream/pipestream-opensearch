@@ -15,7 +15,7 @@ import ai.pipestream.repository.v1.ProcessRequestUpdateNotification;
 import ai.pipestream.repository.v1.ProcessResponseUpdateNotification;
 import ai.pipestream.engine.v1.GraphUpdateEvent;
 import ai.pipestream.engine.v1.GraphUpdateEventKind;
-import ai.pipestream.schemamanager.opensearch.OpenSearchIndexingService;
+import ai.pipestream.schemamanager.OpenSearchIndexingService;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
