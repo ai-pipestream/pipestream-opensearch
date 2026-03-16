@@ -126,6 +126,11 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     }
 
     @Override
+    public Uni<SearchDocumentUploadsResponse> searchDocumentUploads(SearchDocumentUploadsRequest request) {
+        return indexingService.searchDocumentUploads(request);
+    }
+
+    @Override
     public Uni<EnsureNestedEmbeddingsFieldExistsResponse> ensureNestedEmbeddingsFieldExists(
             EnsureNestedEmbeddingsFieldExistsRequest request) {
         String indexName = request.getIndexName();

@@ -1,6 +1,7 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.schemamanager.api.AdminSearchService;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.events.v1.DocumentUploadedEvent;
 import ai.pipestream.repository.filesystem.v1.Drive;
@@ -41,6 +42,7 @@ import org.opensearch.protobufs.OperationContainer;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.*;
+import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutionException;
 
 import static ai.pipestream.schemamanager.opensearch.IndexConstants.*;
@@ -64,6 +66,9 @@ public class OpenSearchIndexingService {
 
     @Inject
     ObjectMapper objectMapper;
+
+    @Inject
+    AdminSearchService adminSearchService;
 
     private volatile MultiEmitter<? super EntityIndexRequest> entityEmitter;
 
@@ -656,7 +661,8 @@ public class OpenSearchIndexingService {
     public Uni<Void> indexDocumentUpload(DocumentUploadedEvent event) {
         Map<String, Object> document = new HashMap<>();
         document.put("doc_id", event.getDocId());
-        document.put("s3_key", event.getS3Key());
+        document.put("s3_key", event.getS3Key()); // TODO: remove after full re-crawl; storage_key supersedes this
+        document.put("storage_key", event.getS3Key()); // drive-agnostic storage reference
         document.put("connector_id", event.getConnectorId());
         document.put("account_id", event.getAccountId());
         document.put("filename", event.getFilename());
@@ -746,7 +752,147 @@ public class OpenSearchIndexingService {
 
     public Uni<SearchFilesystemMetaResponse> searchFilesystemMeta(SearchFilesystemMetaRequest request) {
         LOG.infof("Searching filesystem metadata: drive=%s, query=%s", request.getDrive(), request.getQuery());
-        return Uni.createFrom().item(SearchFilesystemMetaResponse.newBuilder().setTotalCount(0).build());
+
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 50;
+        int from = 0;
+        if (!request.getPageToken().isEmpty()) {
+            try { from = Integer.parseInt(request.getPageToken()); } catch (NumberFormatException ignored) {}
+        }
+
+        // Term filters
+        Map<String, String> filters = new LinkedHashMap<>();
+        filters.put(NodeFields.DRIVE.getFieldName(), request.getDrive());
+        if (request.getNodeTypesCount() == 1) {
+            filters.put(NodeFields.NODE_TYPE.getFieldName(), request.getNodeTypes(0));
+        }
+        if (request.hasParentId()) {
+            filters.put(NodeFields.PARENT_ID.getFieldName(), request.getParentId());
+        }
+        for (var entry : request.getMetadataFiltersMap().entrySet()) {
+            filters.put("metadata." + entry.getKey(), entry.getValue());
+        }
+
+        // Search fields for filesystem nodes
+        List<String> searchFields = List.of(
+                NodeFields.PATH_TEXT.getFieldName(),
+                NodeFields.NAME_TEXT.getFieldName(),
+                NodeFields.MIME_TYPE_TEXT.getFieldName(),
+                NodeFields.S3_KEY.getFieldName());
+
+        int finalFrom = from;
+        return adminSearchService.search(
+                Index.FILESYSTEM_NODES.getIndexName(),
+                request.getQuery(),
+                searchFields,
+                finalFrom, pageSize,
+                null, null,
+                filters
+        ).map(response -> {
+            SearchFilesystemMetaResponse.Builder respBuilder = SearchFilesystemMetaResponse.newBuilder();
+            long total = response.hits().total() != null ? response.hits().total().value() : 0;
+            respBuilder.setTotalCount(total);
+            respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
+
+            for (var hit : response.hits().hits()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> src = (Map<String, Object>) hit.source();
+                if (src == null) continue;
+
+                FilesystemSearchResult.Builder r = FilesystemSearchResult.newBuilder();
+                r.setNodeId(strVal(src, "node_id"));
+                r.setName(strVal(src, "name"));
+                r.setNodeType(strVal(src, "node_type"));
+                r.setDrive(strVal(src, "drive"));
+                if (src.containsKey("parent_id") && src.get("parent_id") != null) {
+                    r.setParentId(String.valueOf(src.get("parent_id")));
+                }
+                r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
+                respBuilder.addResults(r.build());
+            }
+
+            int nextFrom = finalFrom + pageSize;
+            if (nextFrom < total) {
+                respBuilder.setNextPageToken(String.valueOf(nextFrom));
+            }
+            return respBuilder.build();
+        });
+    }
+
+    public Uni<SearchDocumentUploadsResponse> searchDocumentUploads(SearchDocumentUploadsRequest request) {
+        LOG.infof("Searching document uploads: query=%s", request.getQuery());
+
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+        int from = 0;
+        if (!request.getPageToken().isEmpty()) {
+            try { from = Integer.parseInt(request.getPageToken()); } catch (NumberFormatException ignored) {}
+        }
+
+        // Term filters
+        Map<String, String> filters = new LinkedHashMap<>();
+        if (request.hasConnectorId()) {
+            filters.put("connector_id", request.getConnectorId());
+        }
+        if (request.hasMimeType()) {
+            filters.put("mime_type", request.getMimeType());
+        }
+
+        // Search across filename, path, and metadata text fields
+        List<String> searchFields = List.of("filename", "path_text", "filename_raw");
+
+        String sortField = request.getSortBy().isEmpty() ? null : request.getSortBy();
+        String sortOrder = request.getSortOrder().isEmpty() ? "desc" : request.getSortOrder();
+
+        int finalFrom = from;
+        return adminSearchService.search(
+                Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName(),
+                request.getQuery(),
+                searchFields,
+                finalFrom, pageSize,
+                sortField, sortOrder,
+                filters
+        ).map(response -> {
+            SearchDocumentUploadsResponse.Builder respBuilder = SearchDocumentUploadsResponse.newBuilder();
+            long total = response.hits().total() != null ? response.hits().total().value() : 0;
+            respBuilder.setTotalCount(total);
+            respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
+
+            for (var hit : response.hits().hits()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> src = (Map<String, Object>) hit.source();
+                if (src == null) continue;
+
+                DocumentUploadResult.Builder r = DocumentUploadResult.newBuilder();
+                r.setDocId(strVal(src, "doc_id"));
+                r.setFilename(strVal(src, "filename"));
+                r.setPath(strVal(src, "path"));
+                r.setMimeType(strVal(src, "mime_type"));
+                r.setAccountId(strVal(src, "account_id"));
+                r.setConnectorId(strVal(src, "connector_id"));
+                // Backward compat: prefer storage_key, fall back to s3_key
+                // TODO: remove s3_key fallback after full re-crawl
+                String storageKey = strVal(src, "storage_key");
+                if (storageKey.isEmpty()) {
+                    storageKey = strVal(src, "s3_key");
+                }
+                r.setStorageKey(storageKey);
+                if (src.containsKey("uploaded_at") && src.get("uploaded_at") instanceof Number) {
+                    r.setUploadedAt(((Number) src.get("uploaded_at")).longValue());
+                }
+                r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
+                respBuilder.addResults(r.build());
+            }
+
+            int nextFrom = finalFrom + pageSize;
+            if (nextFrom < total) {
+                respBuilder.setNextPageToken(String.valueOf(nextFrom));
+            }
+            return respBuilder.build();
+        });
+    }
+
+    private static String strVal(Map<String, Object> src, String key) {
+        Object v = src.get(key);
+        return v != null ? String.valueOf(v) : "";
     }
 
     public Uni<DeleteIndexResponse> deleteIndex(DeleteIndexRequest request) {
