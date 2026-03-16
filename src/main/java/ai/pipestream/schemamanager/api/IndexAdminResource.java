@@ -144,7 +144,8 @@ public class IndexAdminResource {
         if (payload.containsKey("dimensions")) {
             dimensions = ((Number) payload.get("dimensions")).intValue();
         } else {
-            dimensions = 384;
+            return Uni.createFrom().item(Response.status(400)
+                    .entity(Map.of("error", "Missing 'dimensions' — no default; must be specified explicitly")).build());
         }
         final String fieldName = payload.containsKey("fieldName")
                 ? (String) payload.get("fieldName") : "embeddings";

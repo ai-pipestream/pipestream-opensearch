@@ -348,24 +348,10 @@ public class OpenSearchIndexingService {
                             return entity.<VectorSetEntity>persist().replaceWith(entity);
                         })
                     )
-                    .onFailure().recoverWithUni(err -> {
-                        // Configs not in DB — return a transient (non-persisted) entity for mapping only
-                        int dimensions = inferDimensions(vset);
-                        if (dimensions <= 0) {
-                            LOG.warnf("Cannot infer vector dimensions for %s, skipping mapping creation", semanticId);
-                            return Uni.createFrom().failure(err);
-                        }
-                        LOG.infof("Configs not in DB for '%s', ensuring index mapping with inferred %dd vectors (no VectorSet persisted)", semanticId, dimensions);
-
-                        VectorSetEntity transientEntity = new VectorSetEntity();
-                        transientEntity.id = "transient-" + UUID.randomUUID();
-                        transientEntity.name = semanticId;
-                        transientEntity.fieldName = "vs_" + semanticId;
-                        transientEntity.resultSetName = "default";
-                        transientEntity.sourceField = vset.getSourceFieldName();
-                        transientEntity.vectorDimensions = dimensions;
-                        // Not persisted — just used to drive ensureOpenSearchMappingExists
-                        return Uni.createFrom().item(transientEntity);
+                    .onFailure().invoke(err -> {
+                        LOG.errorf(err, "VectorSet resolution failed for '%s' — chunker or embedding config not found in DB. "
+                                + "This document will NOT be indexed with correct vector mappings. "
+                                + "Ensure the semantic-manager has registered its configs before indexing.", semanticId);
                     });
             });
     }

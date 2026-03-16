@@ -70,19 +70,23 @@ public class SmokeTestResource {
      * Create an index with a nested KNN vector field mapping.
      *
      * @param indexName   the index name to create
-     * @param dimensions  vector dimensions (default 384)
+     * @param dimensions  vector dimensions (required — no default)
      * @param fieldName   nested field name (default "embeddings")
      */
     @POST
     @Path("/create-index")
     public Uni<Response> createIndex(
             @QueryParam("index") String indexName,
-            @QueryParam("dimensions") @DefaultValue("384") int dimensions,
+            @QueryParam("dimensions") @DefaultValue("0") int dimensions,
             @QueryParam("field") @DefaultValue("embeddings") String fieldName) {
 
         if (indexName == null || indexName.isBlank()) {
             return Uni.createFrom().item(Response.status(400)
                     .entity(Map.of("error", "Missing 'index' query param")).build());
+        }
+        if (dimensions <= 0) {
+            return Uni.createFrom().item(Response.status(400)
+                    .entity(Map.of("error", "Missing 'dimensions' query param — must be specified explicitly")).build());
         }
 
         VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
@@ -122,7 +126,11 @@ public class SmokeTestResource {
         String sourceField = stringOrDefault(payload, "sourceField", "body");
         String body = stringOrDefault(payload, "body", "This is a smoke test document for semantic indexing.");
         String title = stringOrDefault(payload, "title", "Smoke Test Document");
-        int dimensions = intOrDefault(payload, "dimensions", 384);
+        int dimensions = intOrDefault(payload, "dimensions", 0);
+        if (dimensions <= 0) {
+            return Uni.createFrom().item(Response.status(400)
+                    .entity(Map.of("error", "Missing 'dimensions' — must be specified explicitly")).build());
+        }
 
         if (indexName == null || indexName.isBlank()) {
             return Uni.createFrom().item(Response.status(400)
