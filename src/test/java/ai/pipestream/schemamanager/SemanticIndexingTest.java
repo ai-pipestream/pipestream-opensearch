@@ -28,7 +28,50 @@ class SemanticIndexingTest {
     @GrpcClient
     MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub managerService;
 
+    @GrpcClient
+    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerConfigService;
+
+    @GrpcClient
+    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingConfigService;
+
     private final String testIndexName = "test-pipeline-semantic-" + UUID.randomUUID().toString().substring(0, 8);
+
+    @BeforeAll
+    void createRequiredConfigs() {
+        // Create chunker configs used by the test
+        chunkerConfigService.createChunkerConfig(
+            CreateChunkerConfigRequest.newBuilder()
+                .setId("token_512").setName("Token 512").setConfigId("token_512")
+                .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
+                .build()
+        ).await().indefinitely();
+
+        chunkerConfigService.createChunkerConfig(
+            CreateChunkerConfigRequest.newBuilder()
+                .setId("sentence_v1").setName("Sentence V1").setConfigId("sentence_v1")
+                .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
+                .build()
+        ).await().indefinitely();
+
+        // Create embedding model configs used by the test
+        embeddingConfigService.createEmbeddingModelConfig(
+            CreateEmbeddingModelConfigRequest.newBuilder()
+                .setId("minilm_v2").setName("MiniLM V2").setModelIdentifier("ALL_MINILM_L6_V2").setDimensions(384)
+                .build()
+        ).await().indefinitely();
+
+        embeddingConfigService.createEmbeddingModelConfig(
+            CreateEmbeddingModelConfigRequest.newBuilder()
+                .setId("mpnet_v2").setName("MPNet V2").setModelIdentifier("ALL_MPNET_BASE_V2").setDimensions(768)
+                .build()
+        ).await().indefinitely();
+
+        embeddingConfigService.createEmbeddingModelConfig(
+            CreateEmbeddingModelConfigRequest.newBuilder()
+                .setId("bge_m3").setName("BGE M3").setModelIdentifier("BGE_M3").setDimensions(1024)
+                .build()
+        ).await().indefinitely();
+    }
 
     private static List<Float> fakeVector(int dimensions) {
         List<Float> vec = new ArrayList<>(dimensions);
