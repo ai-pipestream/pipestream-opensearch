@@ -1,0 +1,16 @@
+{
+  "template": {
+    "mappings": {
+      "properties": {
+        "account_id": { "type": "keyword" },
+        "datasource_id": { "type": "keyword" },
+        "document_id": { "type": "keyword" },
+        "retention_intent_days": { "type": "integer" },
+        "indexed_at": { "type": "date", "format": "epoch_millis" }
+      }
+    }
+  },
+  "_meta": {
+    "description": "Optional component template: apply to repository-related indices so ILM and dashboards can filter by tenant/datasource and retention_intent_days."
+  }
+}

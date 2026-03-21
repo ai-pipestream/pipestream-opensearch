@@ -1,0 +1,39 @@
+{
+  "policy": {
+    "description": "Default 30d retention for repository timeline indices; per-datasource overrides via retention_intent_days on documents + separate ISM jobs if needed.",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [],
+        "transitions": [
+          {
+            "state_name": "delete",
+            "conditions": {
+              "min_index_age": "30d"
+            }
+          }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [
+          {
+            "delete": {}
+          }
+        ],
+        "transitions": []
+      }
+    ],
+    "ism_template": [
+      {
+        "index_patterns": [
+          "pipestream-filesystem-nodes-*",
+          "pipestream-repository-pipedocs-*",
+          "pipestream-document-uploads-*"
+        ],
+        "priority": 100
+      }
+    ]
+  }
+}

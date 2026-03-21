@@ -7,7 +7,7 @@ plugins {
     alias(libs.plugins.maven.publish)
     id 'signing'
     id 'com.gradleup.nmcp' version '1.4.4'
-    id 'ai.pipestream.proto-toolchain' version '0.7.19'
+    id 'ai.pipestream.proto-toolchain' version '0.7.20'
 }
 
 scmVersion {
@@ -26,8 +26,14 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 // Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
-    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "main"
+    def localProtos = file("${rootDir}/../pipestream-protos")
+    if (localProtos.directory && new File(localProtos, ".git").exists()) {
+        gitRepo = "file://${localProtos.absolutePath}"
+        gitRef = "main"
+    } else {
+        gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+        gitRef = "main"
+    }
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
@@ -111,7 +117,7 @@ java {
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
-    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.36"
+    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.52"
 }
 compileJava {
     options.encoding = 'UTF-8'
