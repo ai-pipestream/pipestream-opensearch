@@ -122,6 +122,7 @@ test {
 compileJava {
     options.encoding = 'UTF-8'
     options.compilerArgs << '-parameters'
+    options.compilerArgs << '-Xlint:deprecation'
 }
 
 compileTestJava {
