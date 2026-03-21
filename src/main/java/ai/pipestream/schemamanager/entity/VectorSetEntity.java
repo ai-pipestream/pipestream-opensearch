@@ -46,8 +46,20 @@ public class VectorSetEntity extends PanacheEntityBase {
     @Column(name = "result_set_name", nullable = false)
     public String resultSetName;
 
-    @Column(name = "source_field", nullable = false)
-    public String sourceField;
+    @Column(name = "source_cel", nullable = false, columnDefinition = "TEXT")
+    public String sourceCel;
+
+    @Column(name = "provenance", nullable = false)
+    public String provenance;
+
+    @Column(name = "owner_type")
+    public String ownerType;
+
+    @Column(name = "owner_id")
+    public String ownerId;
+
+    @Column(name = "content_signature")
+    public String contentSignature;
 
     @Column(name = "vector_dimensions", nullable = false)
     public int vectorDimensions;

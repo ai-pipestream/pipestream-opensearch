@@ -20,7 +20,7 @@ The current practical contract remains:
 
 - Modules receive hydrated config JSON from the engine (per-node config), no `config_id` required by the module contract.
 - `opensearch-manager` interprets semantic metadata and owns how index field names are resolved and validated.
-- Dimension resolution order: VectorSet (preferred) → IndexEmbeddingBinding (legacy fallback) → null (actionable error).
+- Dimension resolution order: explicit `VectorFieldDefinition` on ensure → `resolve_vector_set_id` / inline config ids on `EnsureNestedEmbeddingsFieldExistsRequest` → VectorSet index binding (preferred) → IndexEmbeddingBinding (legacy fallback) → null (actionable error). See `docs/VECTOR_SET_RESOLUTION.md` and gRPC `ResolveVectorSetFromDirective`.
 
 ## 2) End-to-end document-to-index path
 

@@ -7,6 +7,7 @@ import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.LocalDateTime;
+import java.util.List;
 
 /**
  * Binds a VectorSet (Recipe) to a specific OpenSearch index.
@@ -50,9 +51,22 @@ public class VectorSetIndexBindingEntity extends PanacheEntityBase {
         return find("vectorSet.id = ?1 and indexName = ?2", vectorSetId, indexName).firstResult();
     }
 
+    /** First binding for a VectorSet (any index), for enriching proto index_name. */
+    public static Uni<VectorSetIndexBindingEntity> findFirstByVectorSetId(String vectorSetId) {
+        return find("vectorSet.id = ?1", vectorSetId).firstResult();
+    }
+
     public static Uni<VectorSetIndexBindingEntity> findBindingByDetails(
             String indexName, String fieldName, String resultSetName) {
         return find("indexName = ?1 and vectorSet.fieldName = ?2 and vectorSet.resultSetName = ?3",
                 indexName, fieldName, resultSetName).firstResult();
+    }
+
+    /** All VectorSet bindings for the given OpenSearch index names (for list enrichment). */
+    public static Uni<List<VectorSetIndexBindingEntity>> findAllByIndexNames(List<String> indexNames) {
+        if (indexNames == null || indexNames.isEmpty()) {
+            return Uni.createFrom().item(List.of());
+        }
+        return list("indexName in ?1", indexNames);
     }
 }

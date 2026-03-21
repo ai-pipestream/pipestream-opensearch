@@ -5,6 +5,7 @@ import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
 import ai.pipestream.schemamanager.util.AnyDocumentMapper;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsResponse;
+import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
 import jakarta.inject.Singleton;
@@ -32,6 +33,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
 
     @Inject
     EmbeddingBindingResolver embeddingBindingResolver;
+
+    @Inject
+    VectorSetServiceEngine vectorSetServiceEngine;
+
+    @Inject
+    VectorSetResolutionMetrics vectorSetResolutionMetrics;
 
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -111,6 +118,11 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     }
 
     @Override
+    public Uni<GetIndexMappingResponse> getIndexMapping(GetIndexMappingRequest request) {
+        return indexingService.getIndexMapping(request);
+    }
+
+    @Override
     public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
         return indexingService.deleteDocument(request);
     }
@@ -137,9 +149,30 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
         String fieldName = request.getNestedFieldName();
 
         // Resolve VectorFieldDefinition first (DB on event loop), then do OpenSearch ops (worker thread)
-        Uni<ai.pipestream.schemamanager.v1.VectorFieldDefinition> vfdUni;
+        Uni<VectorFieldDefinition> vfdUni;
         if (request.hasVectorFieldDefinition() && request.getVectorFieldDefinition().getDimension() > 0) {
             vfdUni = Uni.createFrom().item(request.getVectorFieldDefinition());
+        } else if (request.hasResolveVectorSetId() && !request.getResolveVectorSetId().isBlank()) {
+            vectorSetResolutionMetrics.recordEnsureNestedByVectorSetId();
+            vfdUni = vectorSetServiceEngine.resolveVectorSetFromDirective(
+                            ResolveVectorSetFromDirectiveRequest.newBuilder()
+                                    .setVectorSetId(request.getResolveVectorSetId())
+                                    .build())
+                    .onItem().transform(r -> r.getResolved() && r.getVectorSet().getVectorDimensions() > 0
+                            ? VectorFieldDefinition.newBuilder()
+                            .setDimension(r.getVectorSet().getVectorDimensions())
+                            .build()
+                            : null);
+        } else if (request.hasResolveChunkerConfigId() && request.hasResolveEmbeddingModelConfigId()
+                && !request.getResolveChunkerConfigId().isBlank()
+                && !request.getResolveEmbeddingModelConfigId().isBlank()) {
+            vectorSetResolutionMetrics.recordEnsureNestedInlineIds();
+            vfdUni = vectorSetServiceEngine.resolveEmbeddingDimensionsFromConfigIds(
+                            request.getResolveChunkerConfigId(),
+                            request.getResolveEmbeddingModelConfigId())
+                    .onItem().transform(dim -> dim != null && dim > 0
+                            ? VectorFieldDefinition.newBuilder().setDimension(dim).build()
+                            : null);
         } else {
             vfdUni = embeddingBindingResolver.resolve(indexName, fieldName);
         }

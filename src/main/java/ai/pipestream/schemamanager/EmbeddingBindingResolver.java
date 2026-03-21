@@ -12,6 +12,10 @@ import org.jboss.logging.Logger;
 /**
  * Resolves embedding dimensions using VectorSetIndexBinding (preferred) or IndexEmbeddingBinding (legacy fallback).
  * Used when EnsureNestedEmbeddingsFieldExists is called without explicit VectorFieldDefinition.
+ * <p>
+ * Directive-based resolution (registered {@code vector_set_id} or inline chunker/embedding ids) is handled
+ * in {@link OpenSearchManagerService} via {@link VectorSetServiceEngine} / {@link VectorSetResolver} before
+ * falling back to this class.
  */
 @ApplicationScoped
 public class EmbeddingBindingResolver {

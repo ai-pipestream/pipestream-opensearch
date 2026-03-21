@@ -49,4 +49,9 @@ public class VectorSetServiceImpl extends MutinyVectorSetServiceGrpc.VectorSetSe
     public Uni<ResolveVectorSetResponse> resolveVectorSet(ResolveVectorSetRequest request) {
         return engine.resolveVectorSet(request);
     }
+
+    @Override
+    public Uni<ResolveVectorSetFromDirectiveResponse> resolveVectorSetFromDirective(ResolveVectorSetFromDirectiveRequest request) {
+        return engine.resolveVectorSetFromDirective(request);
+    }
 }

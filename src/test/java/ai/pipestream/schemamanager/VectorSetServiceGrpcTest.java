@@ -378,6 +378,56 @@ class VectorSetServiceGrpcTest {
         assertThat(resolveResp.getFound(), is(false));
     }
 
+    @Test
+    void resolveVectorSetFromDirective_byRegisteredId() {
+        String uid = UUID.randomUUID().toString().substring(0, 8);
+        String chunkerId = createChunkerConfig("dir-" + uid);
+        String embeddingId = createEmbeddingConfig("dir-" + uid, 512);
+        var created = vectorSetClient.createVectorSet(
+                CreateVectorSetRequest.newBuilder()
+                        .setName("vs-dir-" + uid)
+                        .setChunkerConfigId(chunkerId)
+                        .setEmbeddingModelConfigId(embeddingId)
+                        .setIndexName("dir-index-" + uid)
+                        .setFieldName("embeddings")
+                        .setSourceField("document.search_metadata.body")
+                        .build()
+        ).await().indefinitely();
+
+        var dirResp = vectorSetClient.resolveVectorSetFromDirective(
+                ResolveVectorSetFromDirectiveRequest.newBuilder()
+                        .setVectorSetId(created.getVectorSet().getId())
+                        .build()
+        ).await().indefinitely();
+        assertThat(dirResp.getResolved(), is(true));
+        assertThat(dirResp.getVectorSet().getId(), equalTo(created.getVectorSet().getId()));
+        assertThat(dirResp.getVectorSet().getVectorDimensions(), equalTo(512));
+        assertThat(dirResp.getVectorSet().getSourceCel(), equalTo("document.search_metadata.body"));
+    }
+
+    @Test
+    void resolveVectorSetFromDirective_inlineEphemeral() {
+        String uid = UUID.randomUUID().toString().substring(0, 8);
+        String chunkerId = createChunkerConfig("inl-" + uid);
+        String embeddingId = createEmbeddingConfig("inl-" + uid, 256);
+        var dirResp = vectorSetClient.resolveVectorSetFromDirective(
+                ResolveVectorSetFromDirectiveRequest.newBuilder()
+                        .setInline(InlineVectorSetSpec.newBuilder()
+                                .setChunkerConfigId(chunkerId)
+                                .setEmbeddingModelConfigId(embeddingId)
+                                .setFieldName("emb")
+                                .setResultSetName("default")
+                                .setSourceCel("document.search_metadata.title")
+                                .setIndexName("ix-" + uid)
+                                .build())
+                        .build()
+        ).await().indefinitely();
+        assertThat(dirResp.getResolved(), is(true));
+        assertThat(dirResp.getVectorSet().getVectorDimensions(), equalTo(256));
+        assertThat(dirResp.getVectorSet().getProvenance(), equalTo(VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE));
+        assertThat(dirResp.getResolutionNotes(), equalTo("inline_ephemeral"));
+    }
+
     // --- In-use constraint tests ---
 
     @Test

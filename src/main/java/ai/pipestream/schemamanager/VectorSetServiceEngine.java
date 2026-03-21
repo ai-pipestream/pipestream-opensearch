@@ -1,6 +1,7 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.schemamanager.config.SemanticVectorSetConfig;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
@@ -36,6 +37,12 @@ public class VectorSetServiceEngine {
     @Inject
     SemanticMetadataEventProducer eventProducer;
 
+    @Inject
+    SemanticVectorSetConfig semanticVectorSetConfig;
+
+    @Inject
+    VectorSetResolutionMetrics resolutionMetrics;
+
     @WithTransaction
     public Uni<CreateVectorSetResponse> createVectorSet(CreateVectorSetRequest request) {
         return Panache.withTransaction(() -> {
@@ -53,6 +60,11 @@ public class VectorSetServiceEngine {
                                                 .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
                                                 .asRuntimeException());
                                     }
+                                    try {
+                                        validateSourceCelConflictAndLength(request);
+                                    } catch (RuntimeException ex) {
+                                        return Uni.createFrom().failure(ex);
+                                    }
                                     String id = request.hasId() && !request.getId().isBlank()
                                             ? request.getId()
                                             : UUID.randomUUID().toString();
@@ -64,10 +76,16 @@ public class VectorSetServiceEngine {
                                     entity.fieldName = request.getFieldName();
                                     entity.resultSetName = normalizeResultSetName(
                                             request.hasResultSetName() ? request.getResultSetName() : null);
-                                    entity.sourceField = request.getSourceField();
+                                    entity.sourceCel = effectiveSourceCel(request);
                                     entity.vectorDimensions = emc.dimensions;
                                     entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
-                                    
+                                    entity.provenance = request.hasProvenance()
+                                            ? provenanceToStorage(request.getProvenance())
+                                            : "REGISTERED";
+                                    entity.ownerType = request.hasOwnerType() ? request.getOwnerType() : null;
+                                    entity.ownerId = request.hasOwnerId() ? request.getOwnerId() : null;
+                                    entity.contentSignature = request.hasContentSignature() ? request.getContentSignature() : null;
+
                                     return entity.<VectorSetEntity>persist().onItem().transformToUni(saved -> {
                                         if (request.getIndexName() != null && !request.getIndexName().isBlank()) {
                                             VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
@@ -89,7 +107,7 @@ public class VectorSetServiceEngine {
 
     @WithSession
     public Uni<GetVectorSetResponse> getVectorSet(GetVectorSetRequest request) {
-        Uni<VectorSetEntity> lookup = request.getByName()
+        Uni<VectorSetEntity> lookup = request.hasByName() && request.getByName()
                 ? VectorSetEntity.findByName(request.getId())
                 : VectorSetEntity.findById(request.getId());
         return lookup.onItem().transformToUni(e -> e != null
@@ -109,12 +127,21 @@ public class VectorSetServiceEngine {
                                 .withDescription("VectorSet not found: " + request.getId())
                                 .asRuntimeException());
                     }
+                    try {
+                        validateUpdateSourceCel(request, e);
+                    } catch (RuntimeException ex) {
+                        return Uni.createFrom().failure(ex);
+                    }
                     VectorSet previous = toVectorSetProto(e);
 
                     if (request.hasName()) e.name = request.getName();
-                    if (request.hasSourceField()) e.sourceField = request.getSourceField();
+                    if (request.hasSourceField()) e.sourceCel = request.getSourceField();
+                    if (request.hasSourceCel()) e.sourceCel = request.getSourceCel();
                     if (request.hasResultSetName()) e.resultSetName = normalizeResultSetName(request.getResultSetName());
                     if (request.hasMetadata()) e.metadata = structToJson(request.getMetadata());
+                    if (request.hasProvenance()) e.provenance = provenanceToStorage(request.getProvenance());
+                    if (request.hasOwnerType()) e.ownerType = request.getOwnerType();
+                    if (request.hasOwnerId()) e.ownerId = request.getOwnerId();
 
                     Uni<VectorSetEntity> afterChunker;
                     if (request.hasChunkerConfigId()) {
@@ -234,6 +261,121 @@ public class VectorSetServiceEngine {
                 });
     }
 
+    /**
+     * Resolve a registered VectorSet id or an inline (ephemeral) tuple for sinks and semantic indexing.
+     */
+    @WithSession
+    public Uni<ResolveVectorSetFromDirectiveResponse> resolveVectorSetFromDirective(ResolveVectorSetFromDirectiveRequest request) {
+        return switch (request.getSpecCase()) {
+            case VECTOR_SET_ID -> resolveFromVectorSetId(request.getVectorSetId());
+            case INLINE -> resolveFromInlineSpec(request.getInline());
+            default -> Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("Oneof spec is required (vector_set_id or inline)")
+                    .asRuntimeException());
+        };
+    }
+
+    private Uni<ResolveVectorSetFromDirectiveResponse> resolveFromVectorSetId(String id) {
+        resolutionMetrics.recordDirectiveResolveById();
+        return VectorSetEntity.<VectorSetEntity>findById(id)
+                .onItem().transformToUni(e -> {
+                    if (e == null) {
+                        return Uni.createFrom().failure(Status.NOT_FOUND
+                                .withDescription("VectorSet not found: " + id)
+                                .asRuntimeException());
+                    }
+                    return VectorSetIndexBindingEntity.findFirstByVectorSetId(id)
+                            .onItem().transform(binding -> {
+                                String idx = binding != null ? binding.indexName : "";
+                                return ResolveVectorSetFromDirectiveResponse.newBuilder()
+                                        .setVectorSet(toVectorSetProto(e, idx))
+                                        .setResolved(true)
+                                        .setResolutionNotes("vector_set_id")
+                                        .build();
+                            });
+                });
+    }
+
+    private Uni<ResolveVectorSetFromDirectiveResponse> resolveFromInlineSpec(InlineVectorSetSpec spec) {
+        if (!semanticVectorSetConfig.inlineResolutionEnabled()) {
+            return Uni.createFrom().failure(Status.PERMISSION_DENIED
+                    .withDescription("Inline VectorSet resolution is disabled")
+                    .asRuntimeException());
+        }
+        resolutionMetrics.recordDirectiveResolveInline();
+        try {
+            validateSourceCelLength(spec.getSourceCel());
+        } catch (RuntimeException ex) {
+            return Uni.createFrom().failure(ex);
+        }
+        return ChunkerConfigEntity.<ChunkerConfigEntity>findById(spec.getChunkerConfigId())
+                .onItem().transformToUni(cc -> {
+                    if (cc == null) {
+                        return Uni.createFrom().failure(Status.NOT_FOUND
+                                .withDescription("Chunker config not found: " + spec.getChunkerConfigId())
+                                .asRuntimeException());
+                    }
+                    return EmbeddingModelConfig.<EmbeddingModelConfig>findById(spec.getEmbeddingModelConfigId())
+                            .onItem().transformToUni(emc -> {
+                                if (emc == null) {
+                                    return Uni.createFrom().failure(Status.NOT_FOUND
+                                            .withDescription("Embedding model config not found: " + spec.getEmbeddingModelConfigId())
+                                            .asRuntimeException());
+                                }
+                                String rs = normalizeResultSetName(
+                                        spec.getResultSetName() == null || spec.getResultSetName().isBlank()
+                                                ? null : spec.getResultSetName());
+                                VectorSet vs = VectorSet.newBuilder()
+                                        .setId("")
+                                        .setName("inline-ephemeral")
+                                        .setChunkerConfigId(cc.id)
+                                        .setEmbeddingModelConfigId(emc.id)
+                                        .setIndexName(spec.hasIndexName() ? spec.getIndexName() : "")
+                                        .setFieldName(spec.getFieldName())
+                                        .setResultSetName(rs)
+                                        .setSourceField(spec.getSourceCel())
+                                        .setSourceCel(spec.getSourceCel())
+                                        .setProvenance(VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE)
+                                        .setVectorDimensions(emc.dimensions)
+                                        .build();
+                                return Uni.createFrom().item(ResolveVectorSetFromDirectiveResponse.newBuilder()
+                                        .setVectorSet(vs)
+                                        .setResolved(true)
+                                        .setResolutionNotes("inline_ephemeral")
+                                        .build());
+                            });
+                });
+    }
+
+    /**
+     * Used by {@link OpenSearchManagerService} when EnsureNestedEmbeddingsFieldIds are provided instead of explicit dimensions.
+     */
+    @WithSession
+    public Uni<Integer> resolveEmbeddingDimensionsFromConfigIds(String chunkerConfigId, String embeddingModelConfigId) {
+        return ChunkerConfigEntity.<ChunkerConfigEntity>findById(chunkerConfigId)
+                .onItem().transformToUni(cc -> {
+                    if (cc == null) {
+                        return Uni.createFrom().failure(Status.NOT_FOUND
+                                .withDescription("Chunker config not found: " + chunkerConfigId)
+                                .asRuntimeException());
+                    }
+                    return EmbeddingModelConfig.<EmbeddingModelConfig>findById(embeddingModelConfigId)
+                            .onItem().transformToUni(emc -> {
+                                if (emc == null) {
+                                    return Uni.createFrom().failure(Status.NOT_FOUND
+                                            .withDescription("Embedding model config not found: " + embeddingModelConfigId)
+                                            .asRuntimeException());
+                                }
+                                return Uni.createFrom().item(emc.dimensions);
+                            });
+                });
+    }
+
+    /** Public hook for components that already have a loaded {@link VectorSetEntity}. */
+    public VectorSet entityToProto(VectorSetEntity e, String indexName) {
+        return toVectorSetProto(e, indexName);
+    }
+
     // --- Proto conversion ---
 
     private VectorSet toVectorSetProto(VectorSetEntity e) {
@@ -249,8 +391,13 @@ public class VectorSetServiceEngine {
                 .setIndexName(indexName != null ? indexName : "")
                 .setFieldName(e.fieldName)
                 .setResultSetName(e.resultSetName)
-                .setSourceField(e.sourceField);
+                .setSourceField(e.sourceCel)
+                .setSourceCel(e.sourceCel)
+                .setProvenance(storageToProvenance(e.provenance));
         b.setVectorDimensions(e.vectorDimensions);
+        if (e.ownerType != null && !e.ownerType.isBlank()) b.setOwnerType(e.ownerType);
+        if (e.ownerId != null && !e.ownerId.isBlank()) b.setOwnerId(e.ownerId);
+        if (e.contentSignature != null && !e.contentSignature.isBlank()) b.setContentSignature(e.contentSignature);
         if (e.createdAt != null) b.setCreatedAt(toTimestamp(e.createdAt));
         if (e.updatedAt != null) b.setUpdatedAt(toTimestamp(e.updatedAt));
         if (e.metadata != null && !e.metadata.isBlank()) {
@@ -263,6 +410,74 @@ public class VectorSetServiceEngine {
             }
         }
         return b.build();
+    }
+
+    private static VectorSetProvenance storageToProvenance(String s) {
+        if (s == null || s.isBlank()) {
+            return VectorSetProvenance.VECTOR_SET_PROVENANCE_REGISTERED;
+        }
+        return switch (s) {
+            case "INLINE" -> VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE;
+            case "MATERIALIZED" -> VectorSetProvenance.VECTOR_SET_PROVENANCE_MATERIALIZED;
+            case "REGISTERED" -> VectorSetProvenance.VECTOR_SET_PROVENANCE_REGISTERED;
+            default -> VectorSetProvenance.VECTOR_SET_PROVENANCE_UNSPECIFIED;
+        };
+    }
+
+    private static String provenanceToStorage(VectorSetProvenance p) {
+        if (p == null || p == VectorSetProvenance.VECTOR_SET_PROVENANCE_UNSPECIFIED) {
+            return "REGISTERED";
+        }
+        return switch (p) {
+            case VECTOR_SET_PROVENANCE_INLINE -> "INLINE";
+            case VECTOR_SET_PROVENANCE_MATERIALIZED -> "MATERIALIZED";
+            case VECTOR_SET_PROVENANCE_REGISTERED -> "REGISTERED";
+            default -> "REGISTERED";
+        };
+    }
+
+    private void validateSourceCelConflictAndLength(CreateVectorSetRequest request) {
+        String cel = request.hasSourceCel() ? request.getSourceCel() : "";
+        String legacy = request.getSourceField();
+        if (!cel.isBlank() && !legacy.isBlank() && !cel.equals(legacy)) {
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("source_cel and source_field conflict; omit one or make them equal")
+                    .asRuntimeException();
+        }
+        validateSourceCelLength(effectiveSourceCel(request));
+    }
+
+    private void validateUpdateSourceCel(UpdateVectorSetRequest request, VectorSetEntity current) {
+        if (request.hasSourceCel() && request.hasSourceField()
+                && !request.getSourceCel().equals(request.getSourceField())) {
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("source_cel and source_field conflict; omit one or make them equal")
+                    .asRuntimeException();
+        }
+        if (request.hasSourceCel()) {
+            validateSourceCelLength(request.getSourceCel());
+        } else if (request.hasSourceField()) {
+            validateSourceCelLength(request.getSourceField());
+        }
+    }
+
+    private String effectiveSourceCel(CreateVectorSetRequest request) {
+        if (request.hasSourceCel() && !request.getSourceCel().isBlank()) {
+            return request.getSourceCel();
+        }
+        return request.getSourceField();
+    }
+
+    private void validateSourceCelLength(String sourceCel) {
+        if (sourceCel == null || sourceCel.isBlank()) {
+            throw Status.INVALID_ARGUMENT.withDescription("source_cel (or legacy source_field) is required").asRuntimeException();
+        }
+        int max = semanticVectorSetConfig.sourceCelMaxChars();
+        if (sourceCel.length() > max) {
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("source_cel exceeds max length " + max)
+                    .asRuntimeException();
+        }
     }
 
     private com.google.protobuf.Timestamp toTimestamp(LocalDateTime ldt) {
