@@ -83,7 +83,9 @@ dependencies {
     implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
     implementation 'ai.pipestream:pipestream-server'
-    implementation 'ai.pipestream:pipestream-opensearch'
+    // Published Quarkus extension (replaces ai.pipestream:pipestream-opensearch)
+    implementation 'ai.pipestream:pipestream-opensearch-client:0.1.0-SNAPSHOT'
+    // Service uses opensearch-java client APIs; keep explicit compile dependency
     implementation libs.opensearch.java
 
     implementation libs.commons.lang3
@@ -122,6 +124,7 @@ test {
 compileJava {
     options.encoding = 'UTF-8'
     options.compilerArgs << '-parameters'
+    options.compilerArgs << '-Xlint:deprecation'
 }
 
 compileTestJava {

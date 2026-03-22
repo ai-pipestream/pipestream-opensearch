@@ -22,6 +22,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
+import io.quarkus.hibernate.reactive.panache.Panache;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
@@ -33,6 +34,8 @@ import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import io.vertx.core.Context;
+import io.vertx.core.Vertx;
 import org.jboss.logging.Logger;
 import org.opensearch.protobufs.BulkRequest;
 import org.opensearch.protobufs.BulkRequestBody;
@@ -362,6 +365,8 @@ public class OpenSearchIndexingService {
                             entity.resultSetName = "default";
                             entity.sourceCel = vset.getSourceFieldName();
                             entity.vectorDimensions = emc.dimensions;
+                            // Required NOT NULL column; same convention as VectorSetServiceEngine default for ad-hoc creates
+                            entity.provenance = "SEMANTIC_INDEXING";
 
                             return entity.<VectorSetEntity>persist().replaceWith(entity);
                         })
@@ -1003,6 +1008,14 @@ public class OpenSearchIndexingService {
     }
 
     public Uni<ListIndicesResponse> listIndices(ListIndicesRequest request) {
+        // OpenSearch async completion runs on an HTTP I/O thread without a Vert.x duplicated context.
+        // Hibernate Reactive requires the request context — capture it here while still on the gRPC/event-loop thread.
+        Context vertxContext = Vertx.currentContext();
+        if (vertxContext == null) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                    "listIndices must run on a Vert.x context (e.g. gRPC or HTTP worker with context)"));
+        }
+
         String prefix = request.hasPrefixFilter() ? request.getPrefixFilter() : null;
         LOG.debugf("Listing indices with prefix filter: %s", prefix);
 
@@ -1053,31 +1066,34 @@ public class OpenSearchIndexingService {
                         names.add(b.getName());
                     }
 
-                    return VectorSetIndexBindingEntity.findAllByIndexNames(names)
-                            .map(bindings -> {
-                                Map<String, List<VectorFieldSummary>> byIndex = new HashMap<>();
-                                for (VectorSetIndexBindingEntity binding : bindings) {
-                                    VectorSetEntity vs = binding.vectorSet;
-                                    if (vs == null) {
-                                        continue;
-                                    }
-                                    VectorFieldSummary vf = VectorFieldSummary.newBuilder()
-                                            .setVectorSetId(vs.id)
-                                            .setVectorSetName(vs.name)
-                                            .setFieldName(vs.fieldName)
-                                            .setResultSetName(vs.resultSetName)
-                                            .setDimensions(vs.vectorDimensions)
-                                            .build();
-                                    byIndex.computeIfAbsent(binding.indexName, k -> new ArrayList<>()).add(vf);
-                                }
-                                List<OpenSearchIndexInfo> indices = new ArrayList<>(builders.size());
-                                for (OpenSearchIndexInfo.Builder bb : builders) {
-                                    String n = bb.getName();
-                                    bb.addAllVectorFields(byIndex.getOrDefault(n, List.of()));
-                                    indices.add(bb.build());
-                                }
-                                return ListIndicesResponse.newBuilder().addAllIndices(indices).build();
-                            });
+                    return Uni.createFrom().<ListIndicesResponse>emitter(emitter ->
+                            vertxContext.runOnContext(v ->
+                                    Panache.withSession(() -> VectorSetIndexBindingEntity.findAllByIndexNames(names))
+                                            .map(bindings -> {
+                                                Map<String, List<VectorFieldSummary>> byIndex = new HashMap<>();
+                                                for (VectorSetIndexBindingEntity binding : bindings) {
+                                                    VectorSetEntity vs = binding.vectorSet;
+                                                    if (vs == null) {
+                                                        continue;
+                                                    }
+                                                    VectorFieldSummary vf = VectorFieldSummary.newBuilder()
+                                                            .setVectorSetId(vs.id)
+                                                            .setVectorSetName(vs.name)
+                                                            .setFieldName(vs.fieldName)
+                                                            .setResultSetName(vs.resultSetName)
+                                                            .setDimensions(vs.vectorDimensions)
+                                                            .build();
+                                                    byIndex.computeIfAbsent(binding.indexName, k -> new ArrayList<>()).add(vf);
+                                                }
+                                                List<OpenSearchIndexInfo> indices = new ArrayList<>(builders.size());
+                                                for (OpenSearchIndexInfo.Builder bb : builders) {
+                                                    String n = bb.getName();
+                                                    bb.addAllVectorFields(byIndex.getOrDefault(n, List.of()));
+                                                    indices.add(bb.build());
+                                                }
+                                                return ListIndicesResponse.newBuilder().addAllIndices(indices).build();
+                                            })
+                                            .subscribe().with(emitter::complete, emitter::fail)));
                 })
                 .onFailure().recoverWithItem(e -> {
                     LOG.warnf("Failed to list indices: %s", e.getMessage());
