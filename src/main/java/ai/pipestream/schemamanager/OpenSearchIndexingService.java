@@ -41,7 +41,9 @@ import org.opensearch.protobufs.BulkRequest;
 import org.opensearch.protobufs.BulkRequestBody;
 import org.opensearch.protobufs.BulkResponse;
 import org.opensearch.protobufs.IndexOperation;
+import org.opensearch.protobufs.Item;
 import org.opensearch.protobufs.OperationContainer;
+import org.opensearch.protobufs.ResponseItem;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -98,11 +100,21 @@ public class OpenSearchIndexingService {
                     jsonDoc = transformSemanticSetsToNestedFields(jsonDoc, document);
 
                     return indexDocumentToOpenSearch(indexName, documentId, jsonDoc, routing)
-                        .map(success -> IndexDocumentResponse.newBuilder()
-                            .setSuccess(success)
-                            .setDocumentId(documentId)
-                            .setMessage(success ? "Document indexed successfully" : "Failed to index document")
-                            .build());
+                        .map(outcome -> {
+                            String msg;
+                            if (outcome.success()) {
+                                msg = "Document indexed successfully";
+                            } else if (outcome.failureDetail() != null && !outcome.failureDetail().isBlank()) {
+                                msg = "Failed to index document: " + outcome.failureDetail();
+                            } else {
+                                msg = "Failed to index document";
+                            }
+                            return IndexDocumentResponse.newBuilder()
+                                .setSuccess(outcome.success())
+                                .setDocumentId(documentId)
+                                .setMessage(msg)
+                                .build();
+                        });
                 } catch (IOException e) {
                     LOG.errorf(e, "Failed to serialize or index document %s", documentId);
                     return Uni.createFrom().item(IndexDocumentResponse.newBuilder()
@@ -165,6 +177,58 @@ public class OpenSearchIndexingService {
         }
     }
 
+    /**
+     * Reverses the write-path transform: scans the raw OpenSearch source for vs_* nested fields
+     * and reconstructs SemanticVectorSet objects on the OpenSearchDocument builder.
+     */
+    @SuppressWarnings("unchecked")
+    private void reconstructSemanticSets(Map<String, Object> sourceMap, OpenSearchDocument.Builder docBuilder) {
+        for (Map.Entry<String, Object> entry : sourceMap.entrySet()) {
+            String key = entry.getKey();
+            if (!key.startsWith("vs_") || !(entry.getValue() instanceof List)) {
+                continue;
+            }
+
+            List<Map<String, Object>> nestedDocs = (List<Map<String, Object>>) entry.getValue();
+            SemanticVectorSet.Builder vsetBuilder = SemanticVectorSet.newBuilder()
+                    .setNestedFieldName(key);
+
+            // Parse the semantic ID from the field name: vs_{source}_{chunker}_{embedder}
+            String semanticId = key.substring(3); // strip "vs_"
+            // Extract chunk_config_id and embedding_id from the first nested doc if available
+            if (!nestedDocs.isEmpty()) {
+                Map<String, Object> first = nestedDocs.get(0);
+                if (first.containsKey("chunk_config_id")) {
+                    vsetBuilder.setChunkConfigId(String.valueOf(first.get("chunk_config_id")));
+                }
+                if (first.containsKey("embedding_id")) {
+                    vsetBuilder.setEmbeddingId(String.valueOf(first.get("embedding_id")));
+                }
+            }
+
+            for (Map<String, Object> nested : nestedDocs) {
+                OpenSearchEmbedding.Builder embBuilder = OpenSearchEmbedding.newBuilder();
+
+                if (nested.containsKey("source_text") && nested.get("source_text") != null) {
+                    embBuilder.setSourceText(String.valueOf(nested.get("source_text")));
+                }
+                if (nested.containsKey("is_primary") && nested.get("is_primary") instanceof Boolean) {
+                    embBuilder.setIsPrimary((Boolean) nested.get("is_primary"));
+                }
+                if (nested.containsKey("vector") && nested.get("vector") instanceof List) {
+                    List<Number> vectorNums = (List<Number>) nested.get("vector");
+                    for (Number n : vectorNums) {
+                        embBuilder.addVector(n.floatValue());
+                    }
+                }
+
+                vsetBuilder.addEmbeddings(embBuilder.build());
+            }
+
+            docBuilder.addSemanticSets(vsetBuilder.build());
+        }
+    }
+
     @WithTransaction
     public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
@@ -224,13 +288,24 @@ public class OpenSearchIndexingService {
                     .map(resp -> {
                         List<StreamIndexDocumentsResponse> responses = new ArrayList<>();
                         boolean overallErrors = resp.getErrors();
-                        
+                        String detail = overallErrors ? firstBulkErrorDetail(resp) : null;
+                        if (overallErrors && detail != null) {
+                            LOG.warnf("OpenSearch gRPC bulk batch failed: %s", detail);
+                        }
                         for (int i = 0; i < requestIds.size(); i++) {
+                            String batchMsg;
+                            if (!overallErrors) {
+                                batchMsg = "Streamed via Bulk API";
+                            } else if (detail != null && !detail.isBlank()) {
+                                batchMsg = "Batch contained errors: " + detail;
+                            } else {
+                                batchMsg = "Batch contained errors";
+                            }
                             responses.add(StreamIndexDocumentsResponse.newBuilder()
                                     .setRequestId(requestIds.get(i))
                                     .setDocumentId(documentIds.get(i))
-                                    .setSuccess(!overallErrors) // Simplification: in real scenario, check individual items
-                                    .setMessage(!overallErrors ? "Streamed via Bulk API" : "Batch contained errors")
+                                    .setSuccess(!overallErrors)
+                                    .setMessage(batchMsg)
                                     .build());
                         }
                         return responses;
@@ -249,12 +324,22 @@ public class OpenSearchIndexingService {
                 jsonDoc = transformSemanticSetsToNestedFields(jsonDoc, req.getDocument());
                 String docId = req.hasDocumentId() ? req.getDocumentId() : req.getDocument().getOriginalDocId();
                 return indexDocumentToOpenSearch(req.getIndexName(), docId, jsonDoc, req.hasRouting() ? req.getRouting() : null)
-                    .map(success -> StreamIndexDocumentsResponse.newBuilder()
-                        .setRequestId(req.getRequestId())
-                        .setDocumentId(docId)
-                        .setSuccess(success)
-                        .setMessage(success ? "Indexed via REST fallback" : "REST fallback failed")
-                        .build());
+                    .map(outcome -> {
+                        String msg;
+                        if (outcome.success()) {
+                            msg = "Indexed via REST fallback";
+                        } else if (outcome.failureDetail() != null && !outcome.failureDetail().isBlank()) {
+                            msg = "REST fallback failed: " + outcome.failureDetail();
+                        } else {
+                            msg = "REST fallback failed";
+                        }
+                        return StreamIndexDocumentsResponse.newBuilder()
+                            .setRequestId(req.getRequestId())
+                            .setDocumentId(docId)
+                            .setSuccess(outcome.success())
+                            .setMessage(msg)
+                            .build();
+                    });
             } catch (IOException e) {
                 return Uni.createFrom().item(StreamIndexDocumentsResponse.newBuilder()
                     .setRequestId(req.getRequestId())
@@ -438,20 +523,84 @@ public class OpenSearchIndexingService {
             });
     }
 
-    private Uni<Boolean> indexDocumentToOpenSearch(String indexName, String documentId, String jsonDoc, String routing) {
+    /**
+     * Result of a single-document index to OpenSearch (gRPC bulk or REST). When unsuccessful,
+     * {@code failureDetail} carries the first OpenSearch error (type/reason) when available.
+     */
+    private record BulkIndexOutcome(boolean success, String failureDetail) {
+        static BulkIndexOutcome ok() {
+            return new BulkIndexOutcome(true, null);
+        }
+    }
+
+    private Uni<BulkIndexOutcome> indexDocumentToOpenSearch(String indexName, String documentId, String jsonDoc, String routing) {
         var request = buildBulkIndexRequest(indexName, documentId, jsonDoc, routing);
         return openSearchGrpcClient.bulk(request)
-                .map(this::isGrpcBulkSuccess)
+                .map(this::interpretGrpcBulkResponse)
                 .onFailure(ServiceNotFoundException.class)
                 .recoverWithUni(throwable -> indexDocumentToOpenSearchViaRest(indexName, documentId, jsonDoc, routing));
     }
 
-    private Uni<Boolean> indexDocumentToOpenSearchViaRest(String indexName, String documentId, String jsonDoc, String routing) {
+    private BulkIndexOutcome interpretGrpcBulkResponse(BulkResponse response) {
+        if (!response.getErrors()) {
+            return BulkIndexOutcome.ok();
+        }
+        String detail = firstBulkErrorDetail(response);
+        if (detail != null) {
+            LOG.warnf("OpenSearch gRPC bulk reported errors: %s", detail);
+        }
+        return new BulkIndexOutcome(false, detail);
+    }
+
+    /**
+     * Extracts a short human-readable reason from the first failed bulk line item.
+     */
+    private static String firstBulkErrorDetail(BulkResponse response) {
+        if (response.getItemsCount() == 0) {
+            return "bulk errors=true but no response items";
+        }
+        for (Item item : response.getItemsList()) {
+            ResponseItem ri = responseItemFrom(item);
+            if (ri == null) {
+                continue;
+            }
+            if (ri.hasError()) {
+                var err = ri.getError();
+                String type = err.getType();
+                String reason = err.getReason();
+                String idx = ri.getXIndex();
+                String prefix = (idx != null && !idx.isEmpty()) ? "[" + idx + "] " : "";
+                String t = (type != null && !type.isEmpty()) ? type : "error";
+                String r = (reason != null && !reason.isEmpty()) ? reason : "unknown";
+                return prefix + t + ": " + r;
+            }
+            int st = ri.getStatus();
+            if (st >= 400) {
+                return String.format("[%s] HTTP %d", ri.getXIndex(), st);
+            }
+        }
+        return "OpenSearch bulk failed (no per-item error details)";
+    }
+
+    private static ResponseItem responseItemFrom(Item item) {
+        if (item == null) {
+            return null;
+        }
+        return switch (item.getItemCase()) {
+            case INDEX -> item.getIndex();
+            case CREATE -> item.getCreate();
+            case UPDATE -> item.getUpdate();
+            case DELETE -> item.getDelete();
+            case ITEM_NOT_SET -> null;
+        };
+    }
+
+    private Uni<BulkIndexOutcome> indexDocumentToOpenSearchViaRest(String indexName, String documentId, String jsonDoc, String routing) {
         Map<String, Object> docMap;
         try {
             docMap = objectMapper.readValue(jsonDoc, new TypeReference<>() {});
         } catch (IOException e) {
-            return Uni.createFrom().item(false);
+            return Uni.createFrom().item(new BulkIndexOutcome(false, "JSON parse: " + e.getMessage()));
         }
 
         var indexBuilder = new org.opensearch.client.opensearch.core.IndexRequest.Builder<Map<String, Object>>()
@@ -465,15 +614,16 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().item(() -> {
             try {
                 var response = openSearchAsyncClient.index(indexBuilder.build()).get();
-                return "created".equals(response.result().jsonValue()) || "updated".equals(response.result().jsonValue());
+                boolean ok = "created".equals(response.result().jsonValue()) || "updated".equals(response.result().jsonValue());
+                if (ok) {
+                    return BulkIndexOutcome.ok();
+                }
+                return new BulkIndexOutcome(false, "OpenSearch index result: " + response.result());
             } catch (IOException | InterruptedException | ExecutionException e) {
-                return false;
+                String m = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                return new BulkIndexOutcome(false, "REST index: " + m);
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
-    }
-
-    private boolean isGrpcBulkSuccess(BulkResponse response) {
-        return !response.getErrors();
     }
 
     private BulkRequest buildBulkIndexRequest(String indexName, String documentId, String jsonDoc, String routing) {
@@ -1191,9 +1341,14 @@ public class OpenSearchIndexingService {
                 }
 
                 // Parse the source back into OpenSearchDocument
-                String sourceJson = objectMapper.writeValueAsString(response.source());
+                @SuppressWarnings("unchecked")
+                Map<String, Object> sourceMap = (Map<String, Object>) response.source();
+                String sourceJson = objectMapper.writeValueAsString(sourceMap);
                 OpenSearchDocument.Builder docBuilder = OpenSearchDocument.newBuilder();
                 JsonFormat.parser().ignoringUnknownFields().merge(sourceJson, docBuilder);
+
+                // Reverse the write-path transform: reconstruct semantic_sets from vs_* nested fields
+                reconstructSemanticSets(sourceMap, docBuilder);
 
                 return GetOpenSearchDocumentResponse.newBuilder()
                         .setFound(true)
