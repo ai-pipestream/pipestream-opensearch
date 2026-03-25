@@ -1,12 +1,8 @@
 package ai.pipestream.schemamanager.kafka;
 
-import ai.pipestream.quarkus.dynamicgrpc.DynamicGrpcClientFactory;
 import org.eclipse.microprofile.reactive.messaging.Incoming;
 import ai.pipestream.repository.filesystem.v1.DriveUpdateNotification;
 import ai.pipestream.repository.filesystem.v1.RepositoryEvent;
-import ai.pipestream.repository.filesystem.v1.MutinyFilesystemServiceGrpc;
-import ai.pipestream.repository.filesystem.v1.GetFilesystemNodeRequest;
-import ai.pipestream.repository.filesystem.v1.GetFilesystemNodeResponse;
 import io.smallrye.reactive.messaging.kafka.Record;
 import ai.pipestream.events.v1.DocumentUploadedEvent;
 import ai.pipestream.repository.v1.ModuleUpdateNotification;
@@ -42,9 +38,6 @@ public class RepositoryUpdateConsumer {
     @Inject
     OpenSearchIndexingService indexingService;
 
-    @Inject
-    DynamicGrpcClientFactory grpcClientFactory;
-
     @Incoming("drive-updates-in")
     public Uni<Void> consumeDriveUpdate(Record<UUID, DriveUpdateNotification> record) {
         UUID key = record.key();
@@ -68,22 +61,13 @@ public class RepositoryUpdateConsumer {
     public Uni<Void> consumeDocumentEvent(Record<UUID, RepositoryEvent> record) {
         UUID key = record.key();
         RepositoryEvent event = record.value();
-        LOG.infof("Received repository event: documentId=%s, accountId=%s, key=%s",
-                event.getDocumentId(), event.getAccountId(), key);
+        String op = event.hasCreated() ? "CREATED" : event.hasUpdated() ? "UPDATED" : event.hasDeleted() ? "DELETED" : "UNKNOWN";
+        LOG.infof("Received repository event: op=%s, documentId=%s, accountId=%s, key=%s",
+                op, event.getDocumentId(), event.getAccountId(), key);
 
-        return grpcClientFactory.getClient("repository", MutinyFilesystemServiceGrpc::newMutinyStub)
-            .flatMap(repoClient -> {
-                GetFilesystemNodeRequest getNodeRequest = GetFilesystemNodeRequest.newBuilder()
-                    .setDrive(event.getAccountId())
-                    .setDocumentId(event.getDocumentId())
-                    .setIncludePayload(false)
-                    .build();
-                return repoClient.getFilesystemNode(getNodeRequest);
-            })
-            .map(GetFilesystemNodeResponse::getNode)
-            .flatMap(node -> indexingService.indexNode(node, event.getAccountId(), key))
+        return indexingService.indexRepositoryEvent(event, key)
             .onFailure().invoke(e ->
-                    LOG.errorf(e, "Failed to process repository event for documentId=%s", event.getDocumentId()))
+                    LOG.errorf(e, "Failed to index repository event for documentId=%s", event.getDocumentId()))
             .onFailure().recoverWithNull()
             .replaceWithVoid();
     }

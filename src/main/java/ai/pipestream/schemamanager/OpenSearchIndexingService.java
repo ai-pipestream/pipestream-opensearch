@@ -744,6 +744,65 @@ public class OpenSearchIndexingService {
     }
 
     /**
+     * Index a repository event directly from the Kafka event payload.
+     * No gRPC callback needed — the event carries enough data for the catalog entry.
+     */
+    public Uni<Void> indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
+        if (event.hasDeleted()) {
+            return deleteFilesystemNodeByKafkaKey(kafkaKey);
+        }
+
+        Map<String, Object> document = new HashMap<>();
+        document.put(NodeFields.NODE_ID.getFieldName(), kafkaKey.toString());
+        document.put("document_id", event.getDocumentId());
+        document.put("account_id", event.getAccountId());
+        if (!event.getDatasourceId().isEmpty()) {
+            document.put("datasource_id", event.getDatasourceId());
+        }
+        int retention = event.hasRetentionIntentDays() ? event.getRetentionIntentDays() : 30;
+        document.put("retention_intent_days", retention);
+
+        // Ownership context for document-level security
+        if (event.hasOwnership()) {
+            var ownership = event.getOwnership();
+            if (!ownership.getConnectorId().isEmpty()) {
+                document.put("connector_id", ownership.getConnectorId());
+            }
+            if (ownership.getAclsCount() > 0) {
+                document.put("acls", ownership.getAclsList());
+            }
+        }
+
+        if (event.hasCreated()) {
+            var created = event.getCreated();
+            if (!created.getStorageKey().isEmpty()) document.put("storage_key", created.getStorageKey());
+            if (created.getSize() > 0) document.put("size_bytes", created.getSize());
+            if (!created.getContentHash().isEmpty()) document.put("content_hash", created.getContentHash());
+            if (!created.getDriveName().isEmpty()) document.put("drive_name", created.getDriveName());
+            if (!created.getName().isEmpty()) document.put(CommonFields.NAME.getFieldName(), created.getName());
+            if (!created.getPath().isEmpty()) document.put("path", created.getPath());
+            if (!created.getContentType().isEmpty()) document.put("content_type", created.getContentType());
+        } else if (event.hasUpdated()) {
+            var updated = event.getUpdated();
+            if (!updated.getStorageKey().isEmpty()) document.put("storage_key", updated.getStorageKey());
+            if (updated.getSize() > 0) document.put("size_bytes", updated.getSize());
+            if (!updated.getContentHash().isEmpty()) document.put("content_hash", updated.getContentHash());
+            if (!updated.getDriveName().isEmpty()) document.put("drive_name", updated.getDriveName());
+            if (!updated.getName().isEmpty()) document.put(CommonFields.NAME.getFieldName(), updated.getName());
+            if (!updated.getPath().isEmpty()) document.put("path", updated.getPath());
+            if (!updated.getContentType().isEmpty()) document.put("content_type", updated.getContentType());
+        }
+
+        if (event.hasTimestamp()) {
+            document.put(CommonFields.CREATED_AT.getFieldName(), event.getTimestamp().getSeconds() * 1000);
+        }
+        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
+
+        queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), document);
+        return Uni.createFrom().voidItem();
+    }
+
+    /**
      * Index filesystem node metadata. OpenSearch document id is always {@code kafkaKey} (same as producer key).
      */
     public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey, String datasourceId, int retentionIntentDays) {
