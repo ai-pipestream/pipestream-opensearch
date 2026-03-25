@@ -7,7 +7,7 @@ import ai.pipestream.repository.filesystem.v1.RepositoryEvent;
 import ai.pipestream.repository.filesystem.v1.MutinyFilesystemServiceGrpc;
 import ai.pipestream.repository.filesystem.v1.GetFilesystemNodeRequest;
 import ai.pipestream.repository.filesystem.v1.GetFilesystemNodeResponse;
-import io.smallrye.reactive.messaging.kafka.api.IncomingKafkaRecordMetadata;
+import io.smallrye.reactive.messaging.kafka.Record;
 import ai.pipestream.events.v1.DocumentUploadedEvent;
 import ai.pipestream.repository.v1.ModuleUpdateNotification;
 import ai.pipestream.repository.v1.PipeDocUpdateNotification;
@@ -19,7 +19,6 @@ import ai.pipestream.schemamanager.OpenSearchIndexingService;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.reactive.messaging.Message;
 import org.jboss.logging.Logger;
 
 import java.util.UUID;
@@ -47,14 +46,9 @@ public class RepositoryUpdateConsumer {
     DynamicGrpcClientFactory grpcClientFactory;
 
     @Incoming("drive-updates-in")
-    public Uni<Void> consumeDriveUpdate(Message<DriveUpdateNotification> message) {
-        DriveUpdateNotification notification = message.getPayload();
-        // Need Message<> wrapper here to extract the UUID key for indexing
-        @SuppressWarnings("unchecked")
-        IncomingKafkaRecordMetadata<UUID, DriveUpdateNotification> metadata =
-                (IncomingKafkaRecordMetadata<UUID, DriveUpdateNotification>)
-                        message.getMetadata(IncomingKafkaRecordMetadata.class).orElse(null);
-        UUID key = metadata != null ? metadata.getKey() : UUID.randomUUID();
+    public Uni<Void> consumeDriveUpdate(Record<UUID, DriveUpdateNotification> record) {
+        UUID key = record.key();
+        DriveUpdateNotification notification = record.value();
         LOG.infof("Received drive update: type=%s, drive=%s, key=%s",
                 notification.getUpdateType(), notification.getDrive().getName(), key);
 
@@ -64,24 +58,16 @@ public class RepositoryUpdateConsumer {
                 () -> indexingService.deleteDrive(key),
                 "drive " + notification.getDrive().getName()
         )
-        .onItemOrFailure().transformToUni((result, error) -> {
-            if (error != null) {
-                LOG.errorf(error, "Failed to process drive update for %s", notification.getDrive().getName());
-            }
-            return Uni.createFrom().completionStage(message.ack());
-        });
+        .onFailure().invoke(e ->
+                LOG.errorf(e, "Failed to process drive update for %s", notification.getDrive().getName()))
+        .onFailure().recoverWithNull()
+        .replaceWithVoid();
     }
 
     @Incoming("repository-document-events-in")
-    public Uni<Void> consumeDocumentEvent(Message<RepositoryEvent> message) {
-        RepositoryEvent event = message.getPayload();
-        // Need Message<> wrapper here to extract the UUID key for indexing
-        @SuppressWarnings("unchecked")
-        IncomingKafkaRecordMetadata<UUID, RepositoryEvent> metadata =
-                (IncomingKafkaRecordMetadata<UUID, RepositoryEvent>)
-                        message.getMetadata(IncomingKafkaRecordMetadata.class).orElse(null);
-        UUID key = metadata != null ? metadata.getKey() : UUID.randomUUID();
-
+    public Uni<Void> consumeDocumentEvent(Record<UUID, RepositoryEvent> record) {
+        UUID key = record.key();
+        RepositoryEvent event = record.value();
         LOG.infof("Received repository event: documentId=%s, accountId=%s, key=%s",
                 event.getDocumentId(), event.getAccountId(), key);
 
@@ -96,12 +82,10 @@ public class RepositoryUpdateConsumer {
             })
             .map(GetFilesystemNodeResponse::getNode)
             .flatMap(node -> indexingService.indexNode(node, event.getAccountId(), key))
-            .onItemOrFailure().transformToUni((result, error) -> {
-                if (error != null) {
-                    LOG.errorf(error, "Failed to process repository event for documentId=%s", event.getDocumentId());
-                }
-                return Uni.createFrom().completionStage(message.ack());
-            });
+            .onFailure().invoke(e ->
+                    LOG.errorf(e, "Failed to process repository event for documentId=%s", event.getDocumentId()))
+            .onFailure().recoverWithNull()
+            .replaceWithVoid();
     }
 
     @Incoming("module-updates-in")
