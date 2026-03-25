@@ -748,57 +748,93 @@ public class OpenSearchIndexingService {
      * No gRPC callback needed — the event carries enough data for the catalog entry.
      */
     public Uni<Void> indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
+        String operation = event.hasCreated() ? "CREATED"
+                : event.hasUpdated() ? "UPDATED"
+                : event.hasDeleted() ? "DELETED" : "UNKNOWN";
+        long eventTimestamp = event.hasTimestamp() ? event.getTimestamp().getSeconds() * 1000 : System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+
+        // Build the common fields shared by catalog and history
+        Map<String, Object> commonFields = new HashMap<>();
+        commonFields.put("document_id", event.getDocumentId());
+        commonFields.put("account_id", event.getAccountId());
+        if (!event.getDatasourceId().isEmpty()) {
+            commonFields.put("datasource_id", event.getDatasourceId());
+        }
+        int retention = event.hasRetentionIntentDays() ? event.getRetentionIntentDays() : 30;
+        commonFields.put("retention_intent_days", retention);
+
+        if (event.hasOwnership()) {
+            var ownership = event.getOwnership();
+            if (!ownership.getConnectorId().isEmpty()) commonFields.put("connector_id", ownership.getConnectorId());
+            if (ownership.getAclsCount() > 0) commonFields.put("acls", ownership.getAclsList());
+        }
+
+        // Storage and catalog metadata from Created or Updated
+        if (event.hasCreated()) {
+            var created = event.getCreated();
+            if (!created.getStorageKey().isEmpty()) commonFields.put("storage_key", created.getStorageKey());
+            if (created.getSize() > 0) commonFields.put("size_bytes", created.getSize());
+            if (!created.getContentHash().isEmpty()) commonFields.put("content_hash", created.getContentHash());
+            if (!created.getDriveName().isEmpty()) commonFields.put("drive_name", created.getDriveName());
+            if (!created.getName().isEmpty()) commonFields.put(CommonFields.NAME.getFieldName(), created.getName());
+            if (!created.getPath().isEmpty()) commonFields.put("path", created.getPath());
+            if (!created.getContentType().isEmpty()) commonFields.put("content_type", created.getContentType());
+        } else if (event.hasUpdated()) {
+            var updated = event.getUpdated();
+            if (!updated.getStorageKey().isEmpty()) commonFields.put("storage_key", updated.getStorageKey());
+            if (updated.getSize() > 0) commonFields.put("size_bytes", updated.getSize());
+            if (!updated.getContentHash().isEmpty()) commonFields.put("content_hash", updated.getContentHash());
+            if (!updated.getDriveName().isEmpty()) commonFields.put("drive_name", updated.getDriveName());
+            if (!updated.getName().isEmpty()) commonFields.put(CommonFields.NAME.getFieldName(), updated.getName());
+            if (!updated.getPath().isEmpty()) commonFields.put("path", updated.getPath());
+            if (!updated.getContentType().isEmpty()) commonFields.put("content_type", updated.getContentType());
+        }
+
+        // --- Repository Catalog: last-write-wins, one row per document ---
+        Map<String, Object> catalogDoc = new HashMap<>(commonFields);
+        catalogDoc.put("status", event.hasDeleted() ? "INACTIVE" : "ACTIVE");
+        catalogDoc.put("operation", operation);
+        catalogDoc.put(CommonFields.CREATED_AT.getFieldName(), eventTimestamp);
+        catalogDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
+        queueForIndexing(Index.REPOSITORY_CATALOG.getIndexName(), kafkaKey.toString(), catalogDoc);
+
+        // --- Repository History: append-only, one row per event ---
+        Map<String, Object> historyDoc = new HashMap<>(commonFields);
+        historyDoc.put("event_id", event.getEventId());
+        historyDoc.put("operation", operation);
+        historyDoc.put("event_timestamp", eventTimestamp);
+        historyDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
+        if (event.hasSource()) {
+            var source = event.getSource();
+            historyDoc.put("source_component", source.getComponent());
+            historyDoc.put("source_operation", source.getOperation());
+            if (!source.getRequestId().isEmpty()) historyDoc.put("request_id", source.getRequestId());
+            if (!source.getConnectorId().isEmpty()) historyDoc.put("source_connector_id", source.getConnectorId());
+        }
+        if (event.hasDeleted()) {
+            var deleted = event.getDeleted();
+            if (!deleted.getReason().isEmpty()) historyDoc.put("delete_reason", deleted.getReason());
+            historyDoc.put("purged", deleted.getPurged());
+        }
+        // Monthly rollover index name
+        String historyIndex = Index.REPOSITORY_HISTORY.getIndexName() + "-"
+                + java.time.Instant.ofEpochMilli(eventTimestamp).atZone(java.time.ZoneOffset.UTC).format(
+                    java.time.format.DateTimeFormatter.ofPattern("yyyy.MM"));
+        queueForIndexing(historyIndex, event.getEventId(), historyDoc);
+
+        // --- Search index: delete if document removed ---
         if (event.hasDeleted()) {
             return deleteFilesystemNodeByKafkaKey(kafkaKey);
         }
 
-        Map<String, Object> document = new HashMap<>();
-        document.put(NodeFields.NODE_ID.getFieldName(), kafkaKey.toString());
-        document.put("document_id", event.getDocumentId());
-        document.put("account_id", event.getAccountId());
-        if (!event.getDatasourceId().isEmpty()) {
-            document.put("datasource_id", event.getDatasourceId());
-        }
-        int retention = event.hasRetentionIntentDays() ? event.getRetentionIntentDays() : 30;
-        document.put("retention_intent_days", retention);
+        // Filesystem nodes index — file browser search (name, path, type, drive, tree nav)
+        Map<String, Object> filesystemDoc = new HashMap<>(commonFields);
+        filesystemDoc.put(NodeFields.NODE_ID.getFieldName(), kafkaKey.toString());
+        filesystemDoc.put(CommonFields.CREATED_AT.getFieldName(), eventTimestamp);
+        filesystemDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
+        queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), filesystemDoc);
 
-        // Ownership context for document-level security
-        if (event.hasOwnership()) {
-            var ownership = event.getOwnership();
-            if (!ownership.getConnectorId().isEmpty()) {
-                document.put("connector_id", ownership.getConnectorId());
-            }
-            if (ownership.getAclsCount() > 0) {
-                document.put("acls", ownership.getAclsList());
-            }
-        }
-
-        if (event.hasCreated()) {
-            var created = event.getCreated();
-            if (!created.getStorageKey().isEmpty()) document.put("storage_key", created.getStorageKey());
-            if (created.getSize() > 0) document.put("size_bytes", created.getSize());
-            if (!created.getContentHash().isEmpty()) document.put("content_hash", created.getContentHash());
-            if (!created.getDriveName().isEmpty()) document.put("drive_name", created.getDriveName());
-            if (!created.getName().isEmpty()) document.put(CommonFields.NAME.getFieldName(), created.getName());
-            if (!created.getPath().isEmpty()) document.put("path", created.getPath());
-            if (!created.getContentType().isEmpty()) document.put("content_type", created.getContentType());
-        } else if (event.hasUpdated()) {
-            var updated = event.getUpdated();
-            if (!updated.getStorageKey().isEmpty()) document.put("storage_key", updated.getStorageKey());
-            if (updated.getSize() > 0) document.put("size_bytes", updated.getSize());
-            if (!updated.getContentHash().isEmpty()) document.put("content_hash", updated.getContentHash());
-            if (!updated.getDriveName().isEmpty()) document.put("drive_name", updated.getDriveName());
-            if (!updated.getName().isEmpty()) document.put(CommonFields.NAME.getFieldName(), updated.getName());
-            if (!updated.getPath().isEmpty()) document.put("path", updated.getPath());
-            if (!updated.getContentType().isEmpty()) document.put("content_type", updated.getContentType());
-        }
-
-        if (event.hasTimestamp()) {
-            document.put(CommonFields.CREATED_AT.getFieldName(), event.getTimestamp().getSeconds() * 1000);
-        }
-        document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
-
-        queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), document);
         return Uni.createFrom().voidItem();
     }
 
