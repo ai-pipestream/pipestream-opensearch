@@ -61,7 +61,7 @@ public class PipelineEventConsumer {
 
         if (step.hasErrorInfo()) {
             document.put("error_code", step.getErrorInfo().getErrorCode());
-            document.put("error_message", step.getErrorInfo().getMessage());
+            document.put("error_message", step.getErrorInfo().getErrorMessage());
         }
 
         if (step.getLogEntriesCount() > 0) {
