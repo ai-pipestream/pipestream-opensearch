@@ -95,10 +95,10 @@ RUN microdnf install -y \
 RUN mkdir -p /deployments && chown 185:185 /deployments
 
 # We make four distinct layers so if there are application changes the library layers can be re-used
-COPY --chown=185:185 build/quarkus-app/lib/ /deployments/lib/
-COPY --chown=185:185 build/quarkus-app/*.jar /deployments/
-COPY --chown=185:185 build/quarkus-app/app/ /deployments/app/
-COPY --chown=185:185 build/quarkus-app/quarkus/ /deployments/quarkus/
+COPY --chown=185:185 opensearch-manager/build/quarkus-app/lib/ /deployments/lib/
+COPY --chown=185:185 opensearch-manager/build/quarkus-app/*.jar /deployments/
+COPY --chown=185:185 opensearch-manager/build/quarkus-app/app/ /deployments/app/
+COPY --chown=185:185 opensearch-manager/build/quarkus-app/quarkus/ /deployments/quarkus/
 
 EXPOSE 8080
 USER 185
