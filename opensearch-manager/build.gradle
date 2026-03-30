@@ -1,0 +1,267 @@
+import org.gradle.plugins.signing.Sign
+
+plugins {
+    id 'pl.allegro.tech.build.axion-release' version '1.21.1'
+    alias(libs.plugins.java)
+    alias(libs.plugins.quarkus)
+    alias(libs.plugins.maven.publish)
+    id 'signing'
+    id 'com.gradleup.nmcp' version '1.4.4'
+    id 'ai.pipestream.proto-toolchain' version '0.7.21'
+}
+
+scmVersion {
+    tag {
+        prefix = 'v'
+    }
+    checks {
+        uncommittedChanges = false
+        aheadOfRemote = false
+        snapshotDependencies = false
+    }
+}
+
+def pipestreamBomVersion = findProperty('pipestreamBomVersion')
+
+// Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
+pipestreamProtos {
+    sourceMode = 'git-proto-workspace'
+    def localProtos = file("${rootDir}/../../pipestream-protos")
+    if (localProtos.directory && new File(localProtos, ".git").exists()) {
+        gitRepo = "file://${localProtos.absolutePath}"
+        gitRef = "main"
+    } else {
+        gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+        gitRef = "main"
+    }
+
+    modules {
+        // Register modules by name only - workspace mode handles cross-module imports
+        register("common")
+        register("pipeline-module")
+        register("engine")
+        register("schemamanager")
+        register("config")
+        register("opensearch")
+        register("repo")
+    }
+}
+
+// Disable Quarkus gRPC codegen - the proto-toolchain plugin handles code generation
+quarkus {
+    quarkusBuildProperties.put("quarkus.grpc.codegen.enabled", "false")
+}
+
+dependencies {
+    implementation 'io.quarkus:quarkus-container-image-docker'
+    implementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
+
+    // Core Quarkus dependencies
+    implementation libs.quarkus.arc
+    implementation libs.quarkus.rest.jackson
+    implementation libs.quarkus.grpc
+    implementation 'io.quarkus:quarkus-smallrye-stork'
+    implementation 'io.quarkus:quarkus-messaging-kafka'
+    implementation 'io.quarkus:quarkus-jdbc-postgresql'
+    implementation 'io.quarkus:quarkus-hibernate-reactive-panache'
+    implementation 'io.quarkus:quarkus-reactive-pg-client'
+    implementation 'io.quarkus:quarkus-flyway'
+    implementation 'org.flywaydb:flyway-database-postgresql'
+
+    // Quarkus Apicurio Registry Protobuf Extension (Zero-Config)
+    // Version managed by pipestream-bom
+    implementation 'ai.pipestream:quarkus-apicurio-registry-protobuf'
+    implementation "ai.pipestream:pipestream-descriptor-api:${pipestreamBomVersion}"
+    implementation "ai.pipestream:pipestream-descriptor-apicurio:${pipestreamBomVersion}"
+
+    // Service discovery with Consul (registration handled by pipestream-service-registration)
+    implementation 'io.smallrye.stork:stork-service-discovery-consul'
+    implementation 'io.smallrye.reactive:smallrye-mutiny-vertx-consul-client'
+
+    // Pipestream platform libraries (managed via BOM/catalog)
+    implementation 'ai.pipestream:pipestream-quarkus-devservices'
+    implementation 'ai.pipestream:quarkus-dynamic-grpc'
+    implementation 'ai.pipestream:pipestream-service-registration'
+    implementation 'ai.pipestream:pipestream-server'
+    // OpenSearch client extension — resolved via composite build (includeBuild)
+    implementation 'ai.pipestream:pipestream-opensearch-client'
+    // Service uses opensearch-java client APIs; keep explicit compile dependency
+    implementation libs.opensearch.java
+
+    implementation libs.commons.lang3
+
+    // Testing
+    testImplementation platform("ai.pipestream:pipestream-bom:${pipestreamBomVersion}")
+    testImplementation 'io.quarkus:quarkus-junit5-mockito'
+    testImplementation 'io.quarkus:quarkus-panache-mock'
+    testImplementation 'io.quarkus:quarkus-test-vertx'
+    testImplementation libs.rest.assured
+    testImplementation "ai.pipestream:pipestream-test-support:${pipestreamBomVersion}"
+    // Testcontainers - version managed by pipestream-bom
+    testImplementation 'org.testcontainers:testcontainers'
+    testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
+}
+
+// Always re-check SNAPSHOT dependencies (Gradle caches for 24h by default, causing stale artifacts in CI)
+configurations.all {
+    resolutionStrategy.cacheChangingModulesFor 0, 'seconds'
+}
+
+group = 'ai.pipestream'
+version = "${scmVersion.version}"
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+    withJavadocJar()
+    withSourcesJar()
+}
+
+test {
+    systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
+    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.52"
+}
+compileJava {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-parameters'
+    options.compilerArgs << '-Xlint:deprecation'
+}
+
+compileTestJava {
+    options.encoding = 'UTF-8'
+}
+
+// Configure Javadoc task
+tasks.withType(Javadoc).configureEach { task ->
+    def opts = task.options
+    opts.encoding = 'UTF-8'
+    opts.charSet = 'UTF-8'
+    opts.locale = 'en'
+    // Suppress missing Javadoc warnings for now
+    opts.addStringOption('Xdoclint:-missing', '-quiet')
+    // Exclude internal packages
+    task.exclude('**/internal/**', '**/impl/**', '**/test/**')
+}
+
+
+// Publishing configuration
+publishing {
+    publications {
+        // Use a named publication to match signing configuration below
+        create('maven', MavenPublication) {
+            from components.java
+            pom {
+                name.set('OpenSearch Manager')
+                description.set('OpenSearch indexing and schema management service for the Pipestream platform')
+                url.set('https://github.com/ai-pipestream/opensearch-manager')
+
+                licenses {
+                    license {
+                        name.set('MIT License')
+                        url.set('https://opensource.org/license/mit')
+                    }
+                }
+
+                developers {
+                    developer {
+                        id.set('krickert')
+                        name.set('Pipestream Platform Team')
+                    }
+                }
+
+                scm {
+                    connection.set('scm:git:git://github.com/ai-pipestream/opensearch-manager.git')
+                    developerConnection.set('scm:git:ssh://github.com/ai-pipestream/opensearch-manager.git')
+                    url.set('https://github.com/ai-pipestream/opensearch-manager')
+                }
+
+                // Ensure BOM/platform dependency is included in dependencyManagement
+                // This ensures Maven Central can resolve dependency versions from the BOM
+                withXml {
+                    def projectNode = asNode()
+                    def dependencyManagementNodes = projectNode.get('dependencyManagement')
+                    def dmNode
+                    def depsNode
+
+                    if (dependencyManagementNodes.isEmpty()) {
+                        // Create dependencyManagement and dependencies nodes
+                        dmNode = projectNode.appendNode('dependencyManagement')
+                        depsNode = dmNode.appendNode('dependencies')
+                    } else {
+                        // Get the first dependencyManagement node
+                        dmNode = dependencyManagementNodes[0]
+                        // Check if it has a dependencies child
+                        def dependenciesNodes = dmNode.get('dependencies')
+                        if (dependenciesNodes.isEmpty()) {
+                            depsNode = dmNode.appendNode('dependencies')
+                        } else {
+                            depsNode = dependenciesNodes[0]
+                        }
+                    }
+
+                    // Check if pipestream-bom already exists
+                    def existingBom = depsNode.children().find { dep ->
+                        dep.groupId?.text() == 'ai.pipestream' &&
+                        dep.artifactId?.text() == 'pipestream-bom'
+                    }
+
+                    if (!existingBom) {
+                        def bomDependency = depsNode.appendNode('dependency')
+                        bomDependency.appendNode('groupId', 'ai.pipestream')
+                        bomDependency.appendNode('artifactId', 'pipestream-bom')
+                        bomDependency.appendNode('version', pipestreamBomVersion)
+                        bomDependency.appendNode('type', 'pom')
+                        bomDependency.appendNode('scope', 'import')
+                    }
+                }
+            }
+        }
+    }
+
+    repositories {
+        // Publish to Maven Local for development
+        mavenLocal()
+
+        // Conditionally add GitHub Packages repository when credentials are available
+        def ghRepo = System.getenv('GITHUB_REPOSITORY') ?: 'ai-pipestream/opensearch-manager'
+        def ghActor = System.getenv('GITHUB_ACTOR') ?: (project.findProperty('gpr.user') ?: System.getenv('GPR_USER'))
+        def ghToken = System.getenv('GITHUB_TOKEN') ?: (project.findProperty('gpr.key') ?: System.getenv('GPR_TOKEN'))
+        if (ghActor && ghToken) {
+            maven {
+                name = 'GitHubPackages'
+                url = uri("https://maven.pkg.github.com/${ghRepo}")
+                credentials {
+                    username = ghActor
+                    password = ghToken
+                }
+            }
+        }
+    }
+}
+
+signing {
+    // Read org-level GPG secrets directly, so runnable apps don't need extra env mapping
+    def signingKey = System.getenv("GPG_PRIVATE_KEY")
+    def signingPassword = System.getenv("GPG_PASSPHRASE")
+
+    if (signingKey && signingPassword) {
+        useInMemoryPgpKeys(signingKey, signingPassword)
+        sign publishing.publications.maven
+    }
+}
+
+// Ensure all signing tasks run before nmcp bundles and publishes artifacts
+afterEvaluate {
+    tasks.matching { it.name.startsWith("nmcpZipAllPublications") || it.name.startsWith("nmcpPublishAllPublicationsToCentralPortal") }
+        .configureEach { nmcpTask ->
+            nmcpTask.dependsOn(tasks.withType(Sign))
+        }
+}
+
+nmcp {
+    publishAllPublicationsToCentralPortal {
+        username = providers.environmentVariable("MAVEN_CENTRAL_USERNAME")
+        password = providers.environmentVariable("MAVEN_CENTRAL_PASSWORD")
+        publishingType = "AUTOMATIC"
+    }
+}

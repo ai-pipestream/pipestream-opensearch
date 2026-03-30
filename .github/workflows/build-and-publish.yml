@@ -11,5 +11,5 @@ jobs:
     uses: ai-pipestream/.github/.github/workflows/reusable-service-build.yml@main
     with:
       docker-image-name: opensearch-manager
-      dockerfile-path: src/main/docker/Dockerfile.jvm
+      dockerfile-path: opensearch-manager/src/main/docker/Dockerfile.jvm
     secrets: inherit

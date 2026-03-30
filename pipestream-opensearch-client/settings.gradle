@@ -1,0 +1,45 @@
+pluginManagement {
+    repositories {
+        mavenLocal {
+            content {
+                includeGroupByRegex "ai\\.pipestream(\\..*)?"
+            }
+        }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'pipestream-opensearch-client-parent'
+
+dependencyResolutionManagement {
+    versionCatalogs {
+        libs {
+            from("ai.pipestream:pipestream-bom-catalog:${pipestreamBomVersion}")
+        }
+    }
+
+    repositories {
+        mavenLocal {
+            content {
+                includeGroupByRegex "ai\\.pipestream(\\..*)?"
+            }
+        }
+        mavenCentral()
+        maven {
+            url = uri('https://central.sonatype.com/repository/maven-snapshots/')
+            mavenContent {
+                snapshotsOnly()
+            }
+            content {
+                includeGroupByRegex "ai\\.pipestream(\\..*)?"
+            }
+        }
+    }
+}
+
+include 'pipestream-opensearch-client'
+project(':pipestream-opensearch-client').projectDir = file('runtime')
+
+include 'pipestream-opensearch-client-deployment'
+project(':pipestream-opensearch-client-deployment').projectDir = file('deployment')

@@ -1,0 +1,20 @@
+// Root build for pipestream-opensearch-client composite build.
+// Sets group for all subprojects so Gradle composite builds can
+// resolve ai.pipestream:pipestream-opensearch-client automatically.
+
+allprojects {
+    group = 'ai.pipestream'
+}
+
+subprojects {
+    apply plugin: 'java-library'
+
+    java {
+        sourceCompatibility = JavaVersion.VERSION_25
+        targetCompatibility = JavaVersion.VERSION_25
+    }
+
+    compileJava {
+        options.encoding = 'UTF-8'
+    }
+}

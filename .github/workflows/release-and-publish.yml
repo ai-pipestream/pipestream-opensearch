@@ -21,5 +21,5 @@ jobs:
       custom_version: ${{ inputs.custom_version }}
       docker-image-name: opensearch-manager
       maven-artifact-id: opensearch-manager
-      dockerfile-path: src/main/docker/Dockerfile.jvm
+      dockerfile-path: opensearch-manager/src/main/docker/Dockerfile.jvm
     secrets: inherit

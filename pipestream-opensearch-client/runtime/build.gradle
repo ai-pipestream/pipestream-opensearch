@@ -1,0 +1,71 @@
+plugins {
+    id 'java-library'
+    alias(libs.plugins.quarkus.extension)
+    alias(libs.plugins.proto.toolchain)
+}
+
+description = 'Pipestream OpenSearch Client Extension - Runtime'
+
+quarkusExtension {
+    deploymentModule = 'pipestream-opensearch-client-deployment'
+}
+
+// ============================================================
+// PROTOBUF CONFIGURATION - OpenSearch gRPC APIs (Mutiny stubs)
+// ============================================================
+
+pipestreamProtos {
+    sourceMode = 'git-proto-workspace'
+
+    gitRepo = "https://github.com/opensearch-project/opensearch-protobufs.git"
+    gitRef = "1.2.0"
+
+    modules {
+        register("opensearch-protobufs") {
+            gitSubdir = "protos"  // Only protos/ - excludes tools/ test fixtures
+        }
+    }
+}
+
+// ============================================================
+// END PROTOBUF CONFIGURATION
+// ============================================================
+
+dependencies {
+    // Quarkus BOM provides platform properties
+    implementation platform(libs.quarkus.bom)
+
+    // Quarkus core
+    implementation 'io.quarkus:quarkus-core'
+    implementation 'io.quarkus:quarkus-arc'
+    implementation 'io.quarkus:quarkus-mutiny'
+    implementation 'io.quarkus:quarkus-smallrye-health'
+    implementation 'io.quarkus:quarkus-grpc'
+
+    // OpenSearch Java Client
+    implementation libs.opensearch.java
+    implementation libs.httpclient5
+
+    // gRPC and Protobuf runtime (generated code depends on these)
+    implementation libs.grpc.stub
+    implementation libs.grpc.protobuf
+    implementation libs.protobuf.java
+
+    // Dynamic gRPC for OpenSearch gRPC client (published from pipestream-platform)
+    api "ai.pipestream:quarkus-dynamic-grpc:${pipestreamBomVersion}"
+
+    // Annotation processor for extension metadata
+    annotationProcessor 'io.quarkus:quarkus-extension-processor'
+
+    // Test dependencies
+    testImplementation 'io.quarkus:quarkus-test-common'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
+    testImplementation 'org.hamcrest:hamcrest'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Workaround for Gradle 9: disable validateExtension which performs unsafe configuration resolution
+tasks.matching { it.name == 'validateExtension' }.configureEach {
+    enabled = false
+}

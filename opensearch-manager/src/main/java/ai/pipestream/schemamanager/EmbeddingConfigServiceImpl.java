@@ -62,6 +62,14 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
             return entity.persist()
                     .replaceWith(entity);
         })
+                // If a model with the same name already exists, return the existing one
+                .onFailure().recoverWithUni(err -> {
+                    if (isConstraintViolation(err)) {
+                        LOG.infof("Embedding model config '%s' already exists — returning existing", request.getName());
+                        return EmbeddingModelConfig.findByName(request.getName());
+                    }
+                    return Uni.createFrom().failure(err);
+                })
                 .onItem().transform(this::toEmbeddingModelConfigProto)
                 .call(config -> eventProducer.publishEmbeddingModelConfigCreated(config))
                 .map(config -> CreateEmbeddingModelConfigResponse.newBuilder().setConfig(config).build());
@@ -278,6 +286,17 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                         .addAllBindings(entities.stream().map(this::toIndexEmbeddingBindingProto).toList())
                         .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
                         .build());
+    }
+
+    private static boolean isConstraintViolation(Throwable t) {
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     // --- Proto conversion helpers ---

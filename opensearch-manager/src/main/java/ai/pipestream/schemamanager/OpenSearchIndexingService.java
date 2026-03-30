@@ -450,16 +450,22 @@ public class OpenSearchIndexingService {
                             entity.resultSetName = "default";
                             entity.sourceCel = vset.getSourceFieldName();
                             entity.vectorDimensions = emc.dimensions;
-                            // Required NOT NULL column; same convention as VectorSetServiceEngine default for ad-hoc creates
                             entity.provenance = "SEMANTIC_INDEXING";
 
                             return entity.<VectorSetEntity>persist().replaceWith(entity);
                         })
                     )
-                    .onFailure().invoke(err -> {
+                    // Race condition: another thread may have created the same VectorSet
+                    // between our findByName and persist. On constraint violation, re-fetch.
+                    .onFailure().recoverWithUni(err -> {
+                        if (isConstraintViolation(err)) {
+                            LOG.infof("VectorSet '%s' created by concurrent request — re-fetching", semanticId);
+                            return VectorSetEntity.findByName(semanticId);
+                        }
                         LOG.errorf(err, "VectorSet resolution failed for '%s' — chunker or embedding config not found in DB. "
                                 + "This document will NOT be indexed with correct vector mappings. "
                                 + "Ensure the semantic-manager has registered its configs before indexing.", semanticId);
+                        return Uni.createFrom().failure(err);
                     });
             });
     }
@@ -520,6 +526,16 @@ public class OpenSearchIndexingService {
                 binding.status = "ACTIVE";
 
                 return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
+            })
+            // Race condition: concurrent request may have created the same binding.
+            // Constraint violation is harmless — the binding exists, which is what we wanted.
+            .onFailure().recoverWithUni(err -> {
+                if (isConstraintViolation(err)) {
+                    LOG.debugf("Index binding for vectorSet=%s, index=%s created by concurrent request — safe to continue",
+                            vs.id, indexName);
+                    return Uni.createFrom().voidItem();
+                }
+                return Uni.createFrom().failure(err);
             });
     }
 
@@ -527,6 +543,17 @@ public class OpenSearchIndexingService {
      * Result of a single-document index to OpenSearch (gRPC bulk or REST). When unsuccessful,
      * {@code failureDetail} carries the first OpenSearch error (type/reason) when available.
      */
+    private static boolean isConstraintViolation(Throwable t) {
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
+    }
+
     private record BulkIndexOutcome(boolean success, String failureDetail) {
         static BulkIndexOutcome ok() {
             return new BulkIndexOutcome(true, null);

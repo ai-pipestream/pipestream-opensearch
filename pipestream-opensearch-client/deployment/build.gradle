@@ -1,0 +1,38 @@
+plugins {
+    id 'java-library'
+}
+
+description = 'Pipestream OpenSearch Client Extension - Deployment'
+
+dependencies {
+    // Quarkus BOM provides platform properties
+    implementation platform(libs.quarkus.bom)
+
+    // Runtime module dependency
+    implementation project(':pipestream-opensearch-client')
+
+    // Dynamic gRPC deployment (published from pipestream-platform)
+    implementation "ai.pipestream:quarkus-dynamic-grpc-deployment:${pipestreamBomVersion}"
+
+    // Quarkus deployment dependencies
+    implementation 'io.quarkus:quarkus-arc-deployment'
+    implementation 'io.quarkus:quarkus-core-deployment'
+    implementation 'io.quarkus:quarkus-smallrye-health-deployment'
+
+    // DevServices common utilities
+    implementation 'io.quarkus:quarkus-devservices-common'
+
+    // OpenSearch testcontainers for DevServices
+    implementation libs.opensearch.testcontainers
+    implementation libs.testcontainers.core
+
+    // Annotation processor for extension metadata
+    annotationProcessor 'io.quarkus:quarkus-extension-processor'
+
+    // Test dependencies
+    testImplementation 'io.quarkus:quarkus-junit5-internal'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
+    testImplementation 'org.hamcrest:hamcrest'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}

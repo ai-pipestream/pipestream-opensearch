@@ -73,6 +73,14 @@ public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.Chu
             return entity.persist()
                     .replaceWith(entity);
         })
+                // If a config with the same name/configId already exists, return the existing one
+                .onFailure().recoverWithUni(err -> {
+                    if (isConstraintViolation(err)) {
+                        LOG.infof("Chunker config '%s' already exists — returning existing", request.getName());
+                        return ChunkerConfigEntity.findByName(request.getName());
+                    }
+                    return Uni.createFrom().failure(err);
+                })
                 .onItem().transform(this::toChunkerConfigProto)
                 .call(config -> eventProducer.publishChunkerConfigCreated(config))
                 .map(config -> CreateChunkerConfigResponse.newBuilder().setConfig(config).build());
@@ -162,6 +170,17 @@ public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.Chu
                         .addAllConfigs(entities.stream().map(this::toChunkerConfigProto).toList())
                         .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
                         .build());
+    }
+
+    private static boolean isConstraintViolation(Throwable t) {
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     // --- Proto conversion helpers ---

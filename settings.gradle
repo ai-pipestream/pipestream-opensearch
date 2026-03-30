@@ -1,7 +1,12 @@
 pluginManagement {
     repositories {
+        mavenLocal {
+            content {
+                includeGroupByRegex "ai\\.pipestream(\\..*)?"
+            }
+        }
         gradlePluginPortal()
-        mavenLocal()
+        mavenCentral()
         maven {
             url = uri('https://central.sonatype.com/repository/maven-snapshots/')
             mavenContent {
@@ -11,47 +16,8 @@ pluginManagement {
     }
 }
 
-rootProject.name = 'opensearch-manager'
+rootProject.name = 'pipestream-opensearch'
 
-dependencyResolutionManagement {
-    def isPipestreamSnapshot = (pipestreamBomVersion ?: "").endsWith("-SNAPSHOT")
-
-    versionCatalogs {
-        libs {
-            from("ai.pipestream:pipestream-bom-catalog:${pipestreamBomVersion}")
-        }
-    }
-
-    repositories {
-        // Maven Local for local development (releases only for ai.pipestream)
-        mavenLocal {
-            content {
-                includeGroupByRegex "ai\\.pipestream(\\..*)?"
-            }
-        }
-        mavenCentral()
-
-        // Resolve ai.pipestream snapshots in CI when the BOM catalog version is a SNAPSHOT.
-        if (isPipestreamSnapshot) {
-            maven {
-                url = uri('https://central.sonatype.com/repository/maven-snapshots/')
-                mavenContent {
-                    snapshotsOnly()
-                    includeGroupByRegex "ai\\.pipestream(\\..*)?"
-                }
-            }
-        }
-
-        // Apache snapshots for Tika artifacts used by parsing stack.
-
-        if (System.getenv('CI_ENV') != 'internal') {
-            maven {
-                url = uri('https://repository.apache.org/content/repositories/snapshots/')
-                allowInsecureProtocol = false
-                content {
-                    includeGroupByRegex "org\\.apache\\.tika(\\..*)?"
-                }
-            }
-        }
-    }
-}
+// Composite builds — each subproject is independently buildable
+includeBuild('pipestream-opensearch-client')
+includeBuild('opensearch-manager')
