@@ -133,13 +133,18 @@ public class OpenSearchIndexingService {
      * that have knn_vector mappings with the correct dimensions.
      */
     private String transformSemanticSetsToNestedFields(String jsonDoc, OpenSearchDocument document) {
-        if (document.getSemanticSetsCount() == 0) {
-            return jsonDoc;
-        }
-
         try {
             @SuppressWarnings("unchecked")
             Map<String, Object> docMap = objectMapper.readValue(jsonDoc, Map.class);
+
+            // Sanitize analytics: remove punctuation_counts maps — their keys
+            // (e.g. ".", ",") contain dots that OpenSearch interprets as path separators,
+            // causing mapper_parsing_exception.
+            sanitizePunctuationCounts(docMap);
+
+            if (document.getSemanticSetsCount() == 0) {
+                return objectMapper.writeValueAsString(docMap);
+            }
 
             // Remove the raw semantic_sets array (vectors would be stored without KNN indexing there)
             Object semanticSetsRaw = docMap.remove("semantic_sets");
@@ -167,6 +172,8 @@ public class OpenSearchIndexingService {
                             String analyticsJson = JsonFormat.printer().print(embedding.getChunkAnalytics());
                             @SuppressWarnings("unchecked")
                             Map<String, Object> analyticsMap = objectMapper.readValue(analyticsJson, Map.class);
+                            analyticsMap.remove("punctuationCounts");
+                            analyticsMap.remove("punctuation_counts");
                             nestedDoc.put("chunk_analytics", analyticsMap);
                         } catch (Exception e) {
                             LOG.warnf("Failed to serialize chunk_analytics for embedding in %s: %s",
@@ -186,6 +193,31 @@ public class OpenSearchIndexingService {
             LOG.warnf("Failed to transform semantic_sets to nested fields, indexing with original structure: %s", e.getMessage());
             return jsonDoc;
         }
+    }
+
+    /**
+     * Removes {@code punctuation_counts} maps from analytics objects in the document.
+     * These maps have punctuation characters as keys (e.g. ".", ",", "!") and OpenSearch
+     * interprets dots in field names as nested path separators, causing mapper_parsing_exception.
+     */
+    @SuppressWarnings("unchecked")
+    private void sanitizePunctuationCounts(Map<String, Object> docMap) {
+        // source_field_analytics[].document_analytics.punctuation_counts
+        Object sfaRaw = docMap.get("source_field_analytics");
+        if (sfaRaw instanceof List) {
+            for (Object entry : (List<?>) sfaRaw) {
+                if (entry instanceof Map) {
+                    Map<String, Object> sfa = (Map<String, Object>) entry;
+                    Object daRaw = sfa.get("document_analytics");
+                    if (daRaw instanceof Map) {
+                        ((Map<String, Object>) daRaw).remove("punctuation_counts");
+                        ((Map<String, Object>) daRaw).remove("punctuationCounts");
+                    }
+                }
+            }
+        }
+
+        // nlp_analysis doesn't have punctuation_counts, but guard against future additions
     }
 
     /**

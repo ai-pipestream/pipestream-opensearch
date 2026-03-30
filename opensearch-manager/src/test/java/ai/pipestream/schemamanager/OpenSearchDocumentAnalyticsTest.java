@@ -438,4 +438,110 @@ class OpenSearchDocumentAnalyticsTest {
         assertThat(emb.getChunkAnalytics().getNounDensity()).as("chunk noun density").isEqualTo(0.25f);
         assertThat(emb.getChunkAnalytics().getIsFirstChunk()).as("chunk is first").isTrue();
     }
+
+    // =========================================================================
+    // Punctuation counts sanitization tests
+    // =========================================================================
+
+    @Test
+    void punctuationCounts_inDocumentAnalytics_strippedFromJson() throws Exception {
+        // punctuation_counts has keys like ".", "," which OpenSearch interprets as
+        // path separators, causing mapper_parsing_exception. Must be stripped before indexing.
+        OpenSearchDocument doc = OpenSearchDocument.newBuilder()
+                .setOriginalDocId("punct-test")
+                .addSourceFieldAnalytics(SourceFieldAnalytics.newBuilder()
+                        .setSourceField("body")
+                        .setChunkConfigId("c1")
+                        .setDocumentAnalytics(DocumentAnalytics.newBuilder()
+                                .setWordCount(100)
+                                .setDetectedLanguage("eng")
+                                .putPunctuationCounts(".", 15)
+                                .putPunctuationCounts(",", 8)
+                                .putPunctuationCounts("!", 2)
+                                .build())
+                        .build())
+                .build();
+
+        // Serialize with preserving field names (what the indexing service does)
+        String json = JsonFormat.printer().preservingProtoFieldNames().print(doc);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> docMap = objectMapper.readValue(json, Map.class);
+
+        // Verify punctuation_counts IS present in the raw proto JSON
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> sfaList = (List<Map<String, Object>>) docMap.get("source_field_analytics");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> da = (Map<String, Object>) sfaList.get(0).get("document_analytics");
+        assertThat(da).as("raw JSON has punctuation_counts before sanitization")
+                .containsKey("punctuation_counts");
+
+        // Now simulate the sanitization the indexing service performs
+        da.remove("punctuation_counts");
+
+        // Verify it's gone
+        assertThat(da).as("punctuation_counts removed after sanitization")
+                .doesNotContainKey("punctuation_counts");
+        // But other fields are preserved
+        assertThat(da.get("word_count")).as("word_count preserved").isEqualTo(100);
+        assertThat(da.get("detected_language")).as("detected_language preserved").isEqualTo("eng");
+    }
+
+    @Test
+    void punctuationCounts_inChunkAnalytics_strippedFromJson() throws Exception {
+        ChunkAnalytics ca = ChunkAnalytics.newBuilder()
+                .setWordCount(45)
+                .setNounDensity(0.30f)
+                .putPunctuationCounts(".", 3)
+                .putPunctuationCounts(",", 2)
+                .build();
+
+        // Serialize (default printer uses camelCase)
+        String analyticsJson = JsonFormat.printer().print(ca);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> analyticsMap = objectMapper.readValue(analyticsJson, Map.class);
+
+        assertThat(analyticsMap).as("raw JSON has punctuationCounts before sanitization")
+                .containsKey("punctuationCounts");
+
+        // Simulate sanitization
+        analyticsMap.remove("punctuationCounts");
+        analyticsMap.remove("punctuation_counts");
+
+        assertThat(analyticsMap).as("punctuationCounts removed")
+                .doesNotContainKey("punctuationCounts")
+                .doesNotContainKey("punctuation_counts");
+        assertThat(analyticsMap.get("wordCount")).as("wordCount preserved").isEqualTo(45);
+    }
+
+    @Test
+    void punctuationCounts_dotKeysWouldCauseOpenSearchFailure() throws Exception {
+        // Demonstrate the problem: "." as a map key in an object field
+        // OpenSearch would interpret this as a nested path with empty segments
+        DocumentAnalytics da = DocumentAnalytics.newBuilder()
+                .setWordCount(50)
+                .putPunctuationCounts(".", 10)
+                .putPunctuationCounts(",", 5)
+                .putPunctuationCounts("...", 1)  // triple dot — even worse
+                .build();
+
+        String json = JsonFormat.printer().preservingProtoFieldNames().print(da);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> daMap = objectMapper.readValue(json, Map.class);
+
+        @SuppressWarnings("unchecked")
+        Map<String, Object> punctCounts = (Map<String, Object>) daMap.get("punctuation_counts");
+
+        // These keys contain dots which OpenSearch treats as path separators
+        assertThat(punctCounts).as("dot key present").containsKey(".");
+        assertThat(punctCounts).as("triple dot key present").containsKey("...");
+
+        // After sanitization, the whole map is removed
+        daMap.remove("punctuation_counts");
+        assertThat(daMap).as("sanitized — no punctuation_counts")
+                .doesNotContainKey("punctuation_counts");
+        assertThat(daMap.get("word_count")).as("other fields untouched").isEqualTo(50);
+    }
 }
