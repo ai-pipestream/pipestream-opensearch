@@ -162,6 +162,17 @@ public class OpenSearchIndexingService {
                     nestedDoc.put("chunk_config_id", vset.getChunkConfigId());
                     nestedDoc.put("embedding_id", vset.getEmbeddingId());
                     nestedDoc.put("is_primary", embedding.getIsPrimary());
+                    if (embedding.hasChunkAnalytics()) {
+                        try {
+                            String analyticsJson = JsonFormat.printer().print(embedding.getChunkAnalytics());
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> analyticsMap = objectMapper.readValue(analyticsJson, Map.class);
+                            nestedDoc.put("chunk_analytics", analyticsMap);
+                        } catch (Exception e) {
+                            LOG.warnf("Failed to serialize chunk_analytics for embedding in %s: %s",
+                                    fieldName, e.getMessage());
+                        }
+                    }
                     nestedDocs.add(nestedDoc);
                 }
 
@@ -219,6 +230,17 @@ public class OpenSearchIndexingService {
                     List<Number> vectorNums = (List<Number>) nested.get("vector");
                     for (Number n : vectorNums) {
                         embBuilder.addVector(n.floatValue());
+                    }
+                }
+                if (nested.containsKey("chunk_analytics") && nested.get("chunk_analytics") instanceof Map) {
+                    try {
+                        String analyticsJson = objectMapper.writeValueAsString(nested.get("chunk_analytics"));
+                        ai.pipestream.data.v1.ChunkAnalytics.Builder caBuilder =
+                                ai.pipestream.data.v1.ChunkAnalytics.newBuilder();
+                        JsonFormat.parser().ignoringUnknownFields().merge(analyticsJson, caBuilder);
+                        embBuilder.setChunkAnalytics(caBuilder.build());
+                    } catch (Exception e) {
+                        LOG.warnf("Failed to deserialize chunk_analytics: %s", e.getMessage());
                     }
                 }
 
