@@ -35,6 +35,13 @@ tasks.register('publishToMavenLocal') {
     dependsOn gradle.includedBuild('pipestream-opensearch-client').task(':pipestream-opensearch-client-deployment:publishToMavenLocal')
 }
 
+// Publish all artifacts (used by CI for GitHub Packages)
+tasks.register('publish') {
+    description = 'Publish all artifacts'
+    group = 'publishing'
+    dependsOn gradle.includedBuild('opensearch-manager').task(':publish')
+}
+
 // CI publish tasks — delegate to opensearch-manager's NMCP plugin
 tasks.register('publishAllPublicationsToCentralPortalSnapshots') {
     description = 'Publish snapshots to Maven Central (CI)'
