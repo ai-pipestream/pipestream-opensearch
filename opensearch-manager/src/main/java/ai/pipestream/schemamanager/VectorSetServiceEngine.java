@@ -88,12 +88,7 @@ public class VectorSetServiceEngine {
 
                                     return entity.<VectorSetEntity>persist().onItem().transformToUni(saved -> {
                                         if (request.getIndexName() != null && !request.getIndexName().isBlank()) {
-                                            VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
-                                            binding.id = UUID.randomUUID().toString();
-                                            binding.vectorSet = saved;
-                                            binding.indexName = request.getIndexName();
-                                            binding.status = "ACTIVE";
-                                            return binding.persist().replaceWith(saved);
+                                            return ensureIndexBindingForCreate(saved, request.getIndexName());
                                         }
                                         return Uni.createFrom().item(saved);
                                     });
@@ -374,6 +369,66 @@ public class VectorSetServiceEngine {
     /** Public hook for components that already have a loaded {@link VectorSetEntity}. */
     public VectorSet entityToProto(VectorSetEntity e, String indexName) {
         return toVectorSetProto(e, indexName);
+    }
+
+    /**
+     * Creates an index binding for a newly-created VectorSet, gracefully handling the case
+     * where the binding already exists (e.g., duplicate create request with same explicit id).
+     * The binding insert runs inside the caller's transaction since both the VectorSet and
+     * binding are being created together. If a constraint violation occurs, the binding already
+     * exists and we simply log and continue.
+     */
+    private Uni<VectorSetEntity> ensureIndexBindingForCreate(VectorSetEntity saved, String indexName) {
+        return VectorSetIndexBindingEntity.findBinding(saved.id, indexName)
+                .onItem().transformToUni(existing -> {
+                    if (existing != null) {
+                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — binding exists, skipping create",
+                                saved.id, indexName);
+                        return Uni.createFrom().item(saved);
+                    }
+                    VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+                    binding.id = UUID.randomUUID().toString();
+                    binding.vectorSet = saved;
+                    binding.indexName = indexName;
+                    binding.status = "ACTIVE";
+                    return binding.<VectorSetIndexBindingEntity>persist().replaceWith(saved);
+                })
+                .onFailure().recoverWithUni(err -> {
+                    if (isUniqueVsIndexBindingViolation(err)) {
+                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — concurrent create race resolved, continuing normally",
+                                saved.id, indexName);
+                        return Uni.createFrom().item(saved);
+                    }
+                    return Uni.createFrom().failure(err);
+                });
+    }
+
+    /**
+     * Checks for the unique_vs_index_binding constraint violation specifically.
+     * Falls back to general unique-violation check (23505) since the persist only
+     * targets the vector_set_index_binding table.
+     */
+    private static boolean isUniqueVsIndexBindingViolation(Throwable t) {
+        Throwable original = t;
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && msg.contains("unique_vs_index_binding")) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return isConstraintViolation(original);
+    }
+
+    private static boolean isConstraintViolation(Throwable t) {
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     // --- Proto conversion ---

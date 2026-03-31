@@ -571,31 +571,35 @@ public class OpenSearchIndexingService {
                     return Uni.createFrom().voidItem();
                 }
 
-                VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
-                binding.id = UUID.randomUUID().toString();
-                binding.vectorSet = vs;
-                binding.indexName = indexName;
-                binding.accountId = accountId;
-                binding.datasourceId = datasourceId;
-                binding.status = "ACTIVE";
+                // Run the insert in its own transaction so that a constraint violation
+                // (from a concurrent insert) does not corrupt the caller's Hibernate session.
+                return Panache.<Void>withTransaction(() -> {
+                    VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+                    binding.id = UUID.randomUUID().toString();
+                    binding.vectorSet = vs;
+                    binding.indexName = indexName;
+                    binding.accountId = accountId;
+                    binding.datasourceId = datasourceId;
+                    binding.status = "ACTIVE";
 
-                return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
-            })
-            // Race condition: concurrent request may have created the same binding.
-            // Constraint violation is harmless — the binding exists, which is what we wanted.
-            .onFailure().recoverWithUni(err -> {
-                if (isConstraintViolation(err)) {
-                    LOG.debugf("Index binding for vectorSet=%s, index=%s created by concurrent request — safe to continue",
-                            vs.id, indexName);
-                    return Uni.createFrom().voidItem();
-                }
-                return Uni.createFrom().failure(err);
+                    return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
+                })
+                // Race condition: concurrent request may have created the same binding.
+                // Constraint violation is harmless — the binding already exists, which is what we wanted.
+                .onFailure().recoverWithUni(err -> {
+                    if (isUniqueVsIndexBindingViolation(err)) {
+                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — concurrent insert race resolved, continuing normally",
+                                vs.id, indexName);
+                        return Uni.createFrom().voidItem();
+                    }
+                    return Uni.createFrom().failure(err);
+                });
             });
     }
 
     /**
-     * Result of a single-document index to OpenSearch (gRPC bulk or REST). When unsuccessful,
-     * {@code failureDetail} carries the first OpenSearch error (type/reason) when available.
+     * Checks whether the given throwable chain contains a unique constraint violation
+     * (PostgreSQL SQLSTATE 23505). Used for general race-condition recovery (e.g., VectorSet creation).
      */
     private static boolean isConstraintViolation(Throwable t) {
         while (t != null) {
@@ -606,6 +610,30 @@ public class OpenSearchIndexingService {
             t = t.getCause();
         }
         return false;
+    }
+
+    /**
+     * Specifically checks for the unique_vs_index_binding constraint violation.
+     * This is more targeted than {@link #isConstraintViolation(Throwable)} to avoid
+     * accidentally swallowing unrelated constraint violations during index binding creation.
+     * <p>
+     * First tries to match the specific constraint name. Falls back to the general 23505
+     * unique-violation check in case the driver omits the constraint name from the message.
+     * This is safe here because ensureIndexBinding only inserts into vector_set_index_binding,
+     * so a unique violation from that persist can only be from that one table.
+     */
+    private static boolean isUniqueVsIndexBindingViolation(Throwable t) {
+        Throwable original = t;
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && msg.contains("unique_vs_index_binding")) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        // Fallback: the persist only targets vector_set_index_binding, so any 23505
+        // from this path must be from the same table's unique constraint
+        return isConstraintViolation(original);
     }
 
     private record BulkIndexOutcome(boolean success, String failureDetail) {
