@@ -570,7 +570,7 @@ public class OpenSearchIndexingService {
 
         // Native SQL upsert: never throws on concurrent insert. One wins, other is a no-op.
         String sql = "INSERT INTO vector_set_index_binding (id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
-                + "VALUES ($1, $2, $3, $4, $5, $6, now(), now()) "
+                + "VALUES (?1, ?2, ?3, ?4, ?5, ?6, now(), now()) "
                 + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
 
         return Panache.getSession()
