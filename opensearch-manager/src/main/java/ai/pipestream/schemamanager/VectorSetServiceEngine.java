@@ -4,6 +4,7 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.config.SemanticVectorSetConfig;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
+import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
@@ -46,14 +47,23 @@ public class VectorSetServiceEngine {
     @WithTransaction
     public Uni<CreateVectorSetResponse> createVectorSet(CreateVectorSetRequest request) {
         return Panache.withTransaction(() -> {
-            return ChunkerConfigEntity.<ChunkerConfigEntity>findById(request.getChunkerConfigId())
-                    .onItem().transformToUni(cc -> {
-                        if (cc == null) {
-                            return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
-                                    .withDescription("Chunker config not found: " + request.getChunkerConfigId())
-                                    .asRuntimeException());
-                        }
-                        return EmbeddingModelConfig.<EmbeddingModelConfig>findById(request.getEmbeddingModelConfigId())
+            // Semantic path: skip chunker config lookup; standard path: require it
+            Uni<ChunkerConfigEntity> chunkerLookup;
+            if (request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank()) {
+                chunkerLookup = Uni.createFrom().nullItem();
+            } else {
+                chunkerLookup = ChunkerConfigEntity.<ChunkerConfigEntity>findById(request.getChunkerConfigId())
+                        .onItem().transformToUni(cc -> {
+                            if (cc == null) {
+                                return Uni.createFrom().<ChunkerConfigEntity>failure(Status.NOT_FOUND
+                                        .withDescription("Chunker config not found: " + request.getChunkerConfigId())
+                                        .asRuntimeException());
+                            }
+                            return Uni.createFrom().item(cc);
+                        });
+            }
+            return chunkerLookup.onItem().transformToUni(cc ->
+                        EmbeddingModelConfig.<EmbeddingModelConfig>findById(request.getEmbeddingModelConfigId())
                                 .onItem().transformToUni(emc -> {
                                     if (emc == null) {
                                         return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
@@ -71,7 +81,7 @@ public class VectorSetServiceEngine {
                                     VectorSetEntity entity = new VectorSetEntity();
                                     entity.id = id;
                                     entity.name = request.getName();
-                                    entity.chunkerConfig = cc;
+                                    if (cc != null) entity.chunkerConfig = cc;
                                     entity.embeddingModelConfig = emc;
                                     entity.fieldName = request.getFieldName();
                                     entity.resultSetName = normalizeResultSetName(
@@ -86,14 +96,25 @@ public class VectorSetServiceEngine {
                                     entity.ownerId = request.hasOwnerId() ? request.getOwnerId() : null;
                                     entity.contentSignature = request.hasContentSignature() ? request.getContentSignature() : null;
 
-                                    return entity.<VectorSetEntity>persist().onItem().transformToUni(saved -> {
-                                        if (request.getIndexName() != null && !request.getIndexName().isBlank()) {
-                                            return ensureIndexBindingForCreate(saved, request.getIndexName());
-                                        }
-                                        return Uni.createFrom().item(saved);
-                                    });
-                                });
-                    });
+                                    if (request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank()) {
+                                        return SemanticConfigEntity.<SemanticConfigEntity>findById(request.getSemanticConfigId())
+                                                .onItem().transformToUni(sc -> {
+                                                    if (sc == null) {
+                                                        return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
+                                                                .withDescription("Semantic config not found: " + request.getSemanticConfigId())
+                                                                .asRuntimeException());
+                                                    }
+                                                    entity.semanticConfig = sc;
+                                                    if (request.hasGranularity()
+                                                            && request.getGranularity() != SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED) {
+                                                        entity.granularity = request.getGranularity().name()
+                                                                .replace("SEMANTIC_GRANULARITY_", "");
+                                                    }
+                                                    return persistAndBind(entity, request.getIndexName());
+                                                });
+                                    }
+                                    return persistAndBind(entity, request.getIndexName());
+                                }));
         })
                 .onItem().transform(saved -> toVectorSetProto(saved, request.getIndexName()))
                 .call(vs -> eventProducer.publishVectorSetCreated(vs))
@@ -435,6 +456,15 @@ public class VectorSetServiceEngine {
         return false;
     }
 
+    private Uni<VectorSetEntity> persistAndBind(VectorSetEntity entity, String indexName) {
+        return entity.<VectorSetEntity>persist().onItem().transformToUni(saved -> {
+            if (indexName != null && !indexName.isBlank()) {
+                return ensureIndexBindingForCreate(saved, indexName);
+            }
+            return Uni.createFrom().item(saved);
+        });
+    }
+
     // --- Proto conversion ---
 
     private VectorSet toVectorSetProto(VectorSetEntity e) {
@@ -468,7 +498,24 @@ public class VectorSetServiceEngine {
                 LOG.warnf("Could not parse metadata for VectorSet %s: %s", e.id, ex.getMessage());
             }
         }
+        if (e.semanticConfig != null) {
+            b.setSemanticConfigId(e.semanticConfig.id);
+        }
+        if (e.granularity != null && !e.granularity.isBlank()) {
+            b.setGranularity(mapGranularity(e.granularity));
+        }
         return b.build();
+    }
+
+    private static SemanticGranularity mapGranularity(String g) {
+        return switch (g) {
+            case "SEMANTIC_CHUNK" -> SemanticGranularity.SEMANTIC_GRANULARITY_SEMANTIC_CHUNK;
+            case "SENTENCE" -> SemanticGranularity.SEMANTIC_GRANULARITY_SENTENCE;
+            case "PARAGRAPH" -> SemanticGranularity.SEMANTIC_GRANULARITY_PARAGRAPH;
+            case "SECTION" -> SemanticGranularity.SEMANTIC_GRANULARITY_SECTION;
+            case "DOCUMENT" -> SemanticGranularity.SEMANTIC_GRANULARITY_DOCUMENT;
+            default -> SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED;
+        };
     }
 
     private static VectorSetProvenance storageToProvenance(String s) {

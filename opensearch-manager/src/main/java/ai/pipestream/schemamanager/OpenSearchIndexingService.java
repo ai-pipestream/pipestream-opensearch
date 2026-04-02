@@ -1,6 +1,7 @@
 package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
+import ai.pipestream.opensearch.v1.SemanticGranularity;
 import ai.pipestream.schemamanager.api.AdminSearchService;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.events.v1.DocumentUploadedEvent;
@@ -444,6 +445,24 @@ public class OpenSearchIndexingService {
                                 return ensureIndexBinding(indexName, entity, accountId, datasourceId);
                             });
                 }
+                // Path: Semantic config — lookup by (semantic_config_id, granularity)
+                if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
+                        && vset.hasGranularity()
+                        && vset.getGranularity() != SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED) {
+                    String granStr = vset.getGranularity().name().replace("SEMANTIC_GRANULARITY_", "");
+                    return VectorSetEntity.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr)
+                            .onItem().transformToUni(entity -> {
+                                if (entity == null) {
+                                    LOG.warnf("No VectorSet for semantic_config=%s granularity=%s — skipping",
+                                            vset.getSemanticConfigId(), granStr);
+                                    return Uni.createFrom().voidItem();
+                                }
+                                String nested = vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank()
+                                        ? vset.getNestedFieldName() : entity.fieldName;
+                                mappings.add(new VectorSetMapping(nested, entity.vectorDimensions));
+                                return ensureIndexBinding(indexName, entity, accountId, datasourceId);
+                            });
+                }
                 return resolveOrCreateVectorSet(semanticId, vset)
                         .onItem().transformToUni(vs -> {
                             mappings.add(new VectorSetMapping(vs.fieldName, vs.vectorDimensions));
@@ -574,6 +593,10 @@ public class OpenSearchIndexingService {
                 + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
 
         return Panache.getSession()
+                // Flush pending Hibernate inserts (e.g. the VectorSetEntity) to the DB
+                // before the native SQL runs — native queries bypass the persistence context
+                // so FK references to unflushed entities would fail with 23503.
+                .flatMap(session -> session.flush().replaceWith(session))
                 .flatMap(session -> session.createNativeQuery(sql)
                         .setParameter(1, id)
                         .setParameter(2, vs.id)

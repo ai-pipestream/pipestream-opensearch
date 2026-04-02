@@ -33,8 +33,15 @@ public class VectorSetEntity extends PanacheEntityBase {
     public String name;
 
     @ManyToOne(fetch = FetchType.EAGER)
-    @JoinColumn(name = "chunker_config_id", nullable = false)
+    @JoinColumn(name = "chunker_config_id")
     public ChunkerConfigEntity chunkerConfig;
+
+    @ManyToOne(fetch = FetchType.EAGER)
+    @JoinColumn(name = "semantic_config_id")
+    public SemanticConfigEntity semanticConfig;
+
+    @Column(name = "granularity")
+    public String granularity;
 
     @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "embedding_model_config_id", nullable = false)
@@ -94,6 +101,14 @@ public class VectorSetEntity extends PanacheEntityBase {
 
     public static Uni<List<VectorSetEntity>> findByEmbeddingModelConfigId(String embeddingModelConfigId) {
         return list("embeddingModelConfig.id", embeddingModelConfigId);
+    }
+
+    public static Uni<VectorSetEntity> findBySemanticConfigAndGranularity(String semanticConfigId, String granularity) {
+        return find("semanticConfig.id = ?1 and granularity = ?2", semanticConfigId, granularity).firstResult();
+    }
+
+    public static Uni<List<VectorSetEntity>> findBySemanticConfigId(String semanticConfigId) {
+        return list("semanticConfig.id", semanticConfigId);
     }
 
     public static Uni<List<VectorSetEntity>> listOrderedByCreatedDesc(int page, int pageSize) {
