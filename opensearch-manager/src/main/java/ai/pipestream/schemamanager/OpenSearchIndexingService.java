@@ -565,15 +565,15 @@ public class OpenSearchIndexingService {
     }
 
     private Uni<Void> ensureIndexBinding(String indexName, VectorSetEntity vs, String accountId, String datasourceId) {
-        return VectorSetIndexBindingEntity.findBinding(vs.id, indexName)
-            .onItem().transformToUni(existing -> {
-                if (existing != null) {
-                    return Uni.createFrom().voidItem();
-                }
-
-                // Run the insert in its own transaction so that a constraint violation
-                // (from a concurrent insert) does not corrupt the caller's Hibernate session.
-                return Panache.<Void>withTransaction(() -> {
+        // Entire method wrapped in its own transaction + top-level recovery.
+        // Two concurrent documents with the same VectorSet both try to create the binding.
+        // One wins, the other gets a constraint violation — which is harmless.
+        return Panache.<Void>withTransaction(() ->
+            VectorSetIndexBindingEntity.findBinding(vs.id, indexName)
+                .onItem().transformToUni(existing -> {
+                    if (existing != null) {
+                        return Uni.createFrom().voidItem();
+                    }
                     VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
                     binding.id = UUID.randomUUID().toString();
                     binding.vectorSet = vs;
@@ -581,20 +581,17 @@ public class OpenSearchIndexingService {
                     binding.accountId = accountId;
                     binding.datasourceId = datasourceId;
                     binding.status = "ACTIVE";
-
                     return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
                 })
-                // Race condition: concurrent request may have created the same binding.
-                // Constraint violation is harmless — the binding already exists, which is what we wanted.
-                .onFailure().recoverWithUni(err -> {
-                    if (isUniqueVsIndexBindingViolation(err)) {
-                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — concurrent insert race resolved, continuing normally",
-                                vs.id, indexName);
-                        return Uni.createFrom().voidItem();
-                    }
-                    return Uni.createFrom().failure(err);
-                });
-            });
+        ).onFailure().recoverWithUni(err -> {
+            // Constraint violation = concurrent insert won the race. The binding exists. Move on.
+            if (isUniqueVsIndexBindingViolation(err)) {
+                LOG.infof("Concurrent binding creation for vectorSet=%s index=%s — already exists, continuing",
+                        vs.id, indexName);
+                return Uni.createFrom().voidItem();
+            }
+            return Uni.createFrom().failure(err);
+        });
     }
 
     /**
