@@ -79,7 +79,7 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
                         .build();
 
                 return client.indices().create(createRequest).acknowledged();
-            } catch (IOException e) {
+            } catch (IOException | org.opensearch.client.opensearch._types.OpenSearchException e) {
                 if (isIndexExistsError(e)) {
                     try {
                         return putNestedFieldMapping(indexName, buildNestedFieldMapping(nestedFieldName, vectorFieldDefinition));
