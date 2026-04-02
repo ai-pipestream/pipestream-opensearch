@@ -104,11 +104,11 @@ public class VectorSetEntity extends PanacheEntityBase {
     }
 
     public static Uni<VectorSetEntity> findBySemanticConfigAndGranularity(String semanticConfigId, String granularity) {
-        return find("semanticConfig.id = ?1 and granularity = ?2", semanticConfigId, granularity).firstResult();
+        return find("semanticConfig.configId = ?1 and granularity = ?2", semanticConfigId, granularity).firstResult();
     }
 
     public static Uni<List<VectorSetEntity>> findBySemanticConfigId(String semanticConfigId) {
-        return list("semanticConfig.id", semanticConfigId);
+        return list("semanticConfig.configId", semanticConfigId);
     }
 
     public static Uni<List<VectorSetEntity>> listOrderedByCreatedDesc(int page, int pageSize) {
