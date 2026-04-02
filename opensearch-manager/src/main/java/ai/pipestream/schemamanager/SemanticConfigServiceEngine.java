@@ -44,13 +44,8 @@ public class SemanticConfigServiceEngine {
     @WithTransaction
     public Uni<CreateSemanticConfigResponse> createSemanticConfig(CreateSemanticConfigRequest request) {
         return Panache.withTransaction(() ->
-                EmbeddingModelConfig.<EmbeddingModelConfig>findById(request.getEmbeddingModelId())
+                resolveEmbeddingModel(request.getEmbeddingModelId())
                         .onItem().transformToUni(emc -> {
-                            if (emc == null) {
-                                return Uni.createFrom().failure(Status.NOT_FOUND
-                                        .withDescription("Embedding model config not found: " + request.getEmbeddingModelId())
-                                        .asRuntimeException());
-                            }
 
                             String id = request.hasId() && !request.getId().isBlank()
                                     ? request.getId()
@@ -281,6 +276,20 @@ public class SemanticConfigServiceEngine {
         if (e.createdAt != null) b.setCreatedAt(toTimestamp(e.createdAt));
         if (e.updatedAt != null) b.setUpdatedAt(toTimestamp(e.updatedAt));
         return b.build();
+    }
+
+    private Uni<EmbeddingModelConfig> resolveEmbeddingModel(String embeddingModelId) {
+        return EmbeddingModelConfig.<EmbeddingModelConfig>findById(embeddingModelId)
+                .onItem().transformToUni(found -> {
+                    if (found != null) return Uni.createFrom().item(found);
+                    return EmbeddingModelConfig.findByName(embeddingModelId)
+                            .onItem().transformToUni(byName -> {
+                                if (byName != null) return Uni.createFrom().item(byName);
+                                return Uni.createFrom().failure(Status.NOT_FOUND
+                                        .withDescription("Embedding model config not found: " + embeddingModelId)
+                                        .asRuntimeException());
+                            });
+                });
     }
 
     private String deriveConfigId(CreateSemanticConfigRequest request, EmbeddingModelConfig emc) {
