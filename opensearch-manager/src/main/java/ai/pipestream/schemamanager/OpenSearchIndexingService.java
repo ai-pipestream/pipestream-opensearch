@@ -565,33 +565,31 @@ public class OpenSearchIndexingService {
     }
 
     private Uni<Void> ensureIndexBinding(String indexName, VectorSetEntity vs, String accountId, String datasourceId) {
-        // Entire method wrapped in its own transaction + top-level recovery.
-        // Two concurrent documents with the same VectorSet both try to create the binding.
-        // One wins, the other gets a constraint violation — which is harmless.
-        return Panache.<Void>withTransaction(() ->
-            VectorSetIndexBindingEntity.findBinding(vs.id, indexName)
-                .onItem().transformToUni(existing -> {
-                    if (existing != null) {
-                        return Uni.createFrom().voidItem();
-                    }
-                    VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
-                    binding.id = UUID.randomUUID().toString();
-                    binding.vectorSet = vs;
-                    binding.indexName = indexName;
-                    binding.accountId = accountId;
-                    binding.datasourceId = datasourceId;
-                    binding.status = "ACTIVE";
-                    return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
-                })
-        ).onFailure().recoverWithUni(err -> {
-            // Constraint violation = concurrent insert won the race. The binding exists. Move on.
-            if (isUniqueVsIndexBindingViolation(err)) {
-                LOG.infof("Concurrent binding creation for vectorSet=%s index=%s — already exists, continuing",
-                        vs.id, indexName);
-                return Uni.createFrom().voidItem();
-            }
-            return Uni.createFrom().failure(err);
-        });
+        // Deterministic ID from the unique key — concurrent inserts produce the same ID.
+        String id = UUID.nameUUIDFromBytes((vs.id + "|" + indexName).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+
+        // Native SQL upsert: never throws on concurrent insert. One wins, other is a no-op.
+        String sql = "INSERT INTO vector_set_index_binding (id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
+                + "VALUES ($1, $2, $3, $4, $5, $6, now(), now()) "
+                + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
+
+        return Panache.getSession()
+                .flatMap(session -> session.createNativeQuery(sql)
+                        .setParameter(1, id)
+                        .setParameter(2, vs.id)
+                        .setParameter(3, indexName)
+                        .setParameter(4, accountId != null ? accountId : "")
+                        .setParameter(5, datasourceId != null ? datasourceId : "")
+                        .setParameter(6, "ACTIVE")
+                        .executeUpdate()
+                        .invoke(rowCount -> {
+                            if (rowCount > 0) {
+                                LOG.infof("Created index binding: vectorSet=%s index=%s", vs.id, indexName);
+                            } else {
+                                LOG.debugf("Index binding already exists: vectorSet=%s index=%s", vs.id, indexName);
+                            }
+                        })
+                        .replaceWithVoid());
     }
 
     /**
