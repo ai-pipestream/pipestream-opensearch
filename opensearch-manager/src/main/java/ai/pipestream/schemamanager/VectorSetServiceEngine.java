@@ -386,12 +386,16 @@ public class VectorSetServiceEngine {
                                 saved.id, indexName);
                         return Uni.createFrom().item(saved);
                     }
-                    VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
-                    binding.id = UUID.randomUUID().toString();
-                    binding.vectorSet = saved;
-                    binding.indexName = indexName;
-                    binding.status = "ACTIVE";
-                    return binding.<VectorSetIndexBindingEntity>persist().replaceWith(saved);
+                    // Isolated transaction: a constraint violation from a concurrent insert
+                    // must not corrupt the caller's Hibernate session.
+                    return Panache.<VectorSetEntity>withTransaction(() -> {
+                        VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+                        binding.id = UUID.randomUUID().toString();
+                        binding.vectorSet = saved;
+                        binding.indexName = indexName;
+                        binding.status = "ACTIVE";
+                        return binding.<VectorSetIndexBindingEntity>persist().replaceWith(saved);
+                    });
                 })
                 .onFailure().recoverWithUni(err -> {
                     if (isUniqueVsIndexBindingViolation(err)) {
