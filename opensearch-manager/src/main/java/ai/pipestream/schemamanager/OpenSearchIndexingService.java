@@ -5,6 +5,7 @@ import ai.pipestream.schemamanager.api.AdminSearchService;
 import ai.pipestream.schemamanager.indexing.ChunkCombinedIndexingStrategy;
 import ai.pipestream.schemamanager.indexing.IndexingStrategyHandler;
 import ai.pipestream.schemamanager.indexing.NestedIndexingStrategy;
+import ai.pipestream.schemamanager.indexing.SeparateIndicesIndexingStrategy;
 import ai.pipestream.config.v1.ModuleDefinition;
 import ai.pipestream.events.v1.DocumentUploadedEvent;
 import ai.pipestream.repository.filesystem.v1.Drive;
@@ -66,6 +67,9 @@ public class OpenSearchIndexingService {
     @Inject
     ChunkCombinedIndexingStrategy chunkCombinedStrategy;
 
+    @Inject
+    SeparateIndicesIndexingStrategy separateIndicesStrategy;
+
     private volatile MultiEmitter<? super EntityIndexRequest> entityEmitter;
 
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -82,17 +86,14 @@ public class OpenSearchIndexingService {
     /**
      * Resolves the strategy handler for a given indexing strategy enum value.
      * UNSPECIFIED uses the nested strategy (backward compatible).
-     * CHUNK_COMBINED uses the chunk-combined strategy (flat chunk indices).
-     * SEPARATE_INDICES is not yet implemented.
+     * CHUNK_COMBINED uses the chunk-combined strategy (flat chunk indices, multiple em_* KNN fields).
+     * SEPARATE_INDICES uses one flat index per (chunk config x embedding model), single "vector" KNN field.
      */
     private IndexingStrategyHandler resolveStrategy(IndexingStrategy strategy) {
         return switch (strategy) {
             case INDEXING_STRATEGY_UNSPECIFIED -> nestedStrategy;
             case INDEXING_STRATEGY_CHUNK_COMBINED -> chunkCombinedStrategy;
-            case INDEXING_STRATEGY_SEPARATE_INDICES ->
-                throw io.grpc.Status.UNIMPLEMENTED
-                    .withDescription("SEPARATE_INDICES indexing strategy is not yet implemented")
-                    .asRuntimeException();
+            case INDEXING_STRATEGY_SEPARATE_INDICES -> separateIndicesStrategy;
             default -> nestedStrategy;
         };
     }
