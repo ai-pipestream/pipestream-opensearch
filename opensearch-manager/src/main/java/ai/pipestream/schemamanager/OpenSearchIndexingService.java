@@ -16,11 +16,8 @@ import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
-import ai.pipestream.quarkus.dynamicgrpc.exception.ServiceNotFoundException;
-import ai.pipestream.quarkus.opensearch.grpc.OpenSearchGrpcClientProducer;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
 import io.quarkus.hibernate.reactive.panache.Panache;
@@ -38,13 +35,6 @@ import jakarta.inject.Inject;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
 import org.jboss.logging.Logger;
-import org.opensearch.protobufs.BulkRequest;
-import org.opensearch.protobufs.BulkRequestBody;
-import org.opensearch.protobufs.BulkResponse;
-import org.opensearch.protobufs.IndexOperation;
-import org.opensearch.protobufs.Item;
-import org.opensearch.protobufs.OperationContainer;
-import org.opensearch.protobufs.ResponseItem;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -67,9 +57,6 @@ public class OpenSearchIndexingService {
 
     @Inject
     org.opensearch.client.opensearch.OpenSearchAsyncClient openSearchAsyncClient;
-
-    @Inject
-    OpenSearchGrpcClientProducer openSearchGrpcClient;
 
     @Inject
     ObjectMapper objectMapper;
@@ -284,7 +271,6 @@ public class OpenSearchIndexingService {
         }
     }
 
-    @WithTransaction
     public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
             return Uni.createFrom().item(Collections.emptyList());
@@ -309,67 +295,7 @@ public class OpenSearchIndexingService {
         }
 
         return Uni.combine().all().unis(schemaTasks).discardItems()
-            .flatMap(v -> {
-                // 2. Prepare bulk indexing request
-                BulkRequest.Builder bulkBuilder = BulkRequest.newBuilder();
-                List<String> requestIds = new ArrayList<>();
-                List<String> documentIds = new ArrayList<>();
-
-                for (var req : batch) {
-                    try {
-                        String jsonDoc = JsonFormat.printer()
-                                .preservingProtoFieldNames()
-                                .print(req.getDocument());
-                        jsonDoc = transformSemanticSetsToNestedFields(jsonDoc, req.getDocument());
-                        String docId = req.hasDocumentId() ? req.getDocumentId() : req.getDocument().getOriginalDocId();
-
-                        var indexOp = IndexOperation.newBuilder().setXIndex(req.getIndexName()).setXId(docId);
-                        if (req.hasRouting()) indexOp.setRouting(req.getRouting());
-
-                        bulkBuilder.addBulkRequestBody(BulkRequestBody.newBuilder()
-                                .setOperationContainer(OperationContainer.newBuilder().setIndex(indexOp.build()).build())
-                                .setObject(ByteString.copyFromUtf8(jsonDoc))
-                                .build());
-                        
-                        requestIds.add(req.getRequestId());
-                        documentIds.add(docId);
-                    } catch (IOException e) {
-                        LOG.errorf(e, "Failed to serialize document in batch: %s", req.getRequestId());
-                    }
-                }
-
-                // 3. Execute bulk request (priority to gRPC, fallback to REST if needed)
-                return openSearchGrpcClient.bulk(bulkBuilder.build())
-                    .map(resp -> {
-                        List<StreamIndexDocumentsResponse> responses = new ArrayList<>();
-                        boolean overallErrors = resp.getErrors();
-                        String detail = overallErrors ? firstBulkErrorDetail(resp) : null;
-                        if (overallErrors && detail != null) {
-                            LOG.warnf("OpenSearch gRPC bulk batch failed: %s", detail);
-                        }
-                        for (int i = 0; i < requestIds.size(); i++) {
-                            String batchMsg;
-                            if (!overallErrors) {
-                                batchMsg = "Streamed via Bulk API";
-                            } else if (detail != null && !detail.isBlank()) {
-                                batchMsg = "Batch contained errors: " + detail;
-                            } else {
-                                batchMsg = "Batch contained errors";
-                            }
-                            responses.add(StreamIndexDocumentsResponse.newBuilder()
-                                    .setRequestId(requestIds.get(i))
-                                    .setDocumentId(documentIds.get(i))
-                                    .setSuccess(!overallErrors)
-                                    .setMessage(batchMsg)
-                                    .build());
-                        }
-                        return responses;
-                    })
-                    .onFailure().recoverWithUni(err -> {
-                        LOG.warnf("gRPC Bulk failed, batch-of-%d documents will be indexed individually via REST fallback", batch.size());
-                        return indexDocumentsIndividuallyFallback(batch);
-                    });
-            });
+            .flatMap(v -> indexDocumentsIndividuallyFallback(batch));
     }
 
     private Uni<List<StreamIndexDocumentsResponse>> indexDocumentsIndividuallyFallback(List<StreamIndexDocumentsRequest> batch) {
@@ -382,11 +308,11 @@ public class OpenSearchIndexingService {
                     .map(outcome -> {
                         String msg;
                         if (outcome.success()) {
-                            msg = "Indexed via REST fallback";
+                            msg = "Indexed via REST";
                         } else if (outcome.failureDetail() != null && !outcome.failureDetail().isBlank()) {
-                            msg = "REST fallback failed: " + outcome.failureDetail();
+                            msg = "REST index failed: " + outcome.failureDetail();
                         } else {
-                            msg = "REST fallback failed";
+                            msg = "REST index failed";
                         }
                         return StreamIndexDocumentsResponse.newBuilder()
                             .setRequestId(req.getRequestId())
@@ -403,11 +329,11 @@ public class OpenSearchIndexingService {
                     .build());
             }
         }).toList();
-        
+
         if (tasks.isEmpty()) {
             return Uni.createFrom().item(Collections.emptyList());
         }
-        
+
         return Uni.join().all(tasks).andCollectFailures();
     }
 
@@ -661,65 +587,7 @@ public class OpenSearchIndexingService {
     }
 
     private Uni<BulkIndexOutcome> indexDocumentToOpenSearch(String indexName, String documentId, String jsonDoc, String routing) {
-        var request = buildBulkIndexRequest(indexName, documentId, jsonDoc, routing);
-        return openSearchGrpcClient.bulk(request)
-                .map(this::interpretGrpcBulkResponse)
-                .onFailure(ServiceNotFoundException.class)
-                .recoverWithUni(throwable -> indexDocumentToOpenSearchViaRest(indexName, documentId, jsonDoc, routing));
-    }
-
-    private BulkIndexOutcome interpretGrpcBulkResponse(BulkResponse response) {
-        if (!response.getErrors()) {
-            return BulkIndexOutcome.ok();
-        }
-        String detail = firstBulkErrorDetail(response);
-        if (detail != null) {
-            LOG.warnf("OpenSearch gRPC bulk reported errors: %s", detail);
-        }
-        return new BulkIndexOutcome(false, detail);
-    }
-
-    /**
-     * Extracts a short human-readable reason from the first failed bulk line item.
-     */
-    private static String firstBulkErrorDetail(BulkResponse response) {
-        if (response.getItemsCount() == 0) {
-            return "bulk errors=true but no response items";
-        }
-        for (Item item : response.getItemsList()) {
-            ResponseItem ri = responseItemFrom(item);
-            if (ri == null) {
-                continue;
-            }
-            if (ri.hasError()) {
-                var err = ri.getError();
-                String type = err.getType();
-                String reason = err.getReason();
-                String idx = ri.getXIndex();
-                String prefix = (idx != null && !idx.isEmpty()) ? "[" + idx + "] " : "";
-                String t = (type != null && !type.isEmpty()) ? type : "error";
-                String r = (reason != null && !reason.isEmpty()) ? reason : "unknown";
-                return prefix + t + ": " + r;
-            }
-            int st = ri.getStatus();
-            if (st >= 400) {
-                return String.format("[%s] HTTP %d", ri.getXIndex(), st);
-            }
-        }
-        return "OpenSearch bulk failed (no per-item error details)";
-    }
-
-    private static ResponseItem responseItemFrom(Item item) {
-        if (item == null) {
-            return null;
-        }
-        return switch (item.getItemCase()) {
-            case INDEX -> item.getIndex();
-            case CREATE -> item.getCreate();
-            case UPDATE -> item.getUpdate();
-            case DELETE -> item.getDelete();
-            case ITEM_NOT_SET -> null;
-        };
+        return indexDocumentToOpenSearchViaRest(indexName, documentId, jsonDoc, routing);
     }
 
     private Uni<BulkIndexOutcome> indexDocumentToOpenSearchViaRest(String indexName, String documentId, String jsonDoc, String routing) {
@@ -751,20 +619,6 @@ public class OpenSearchIndexingService {
                 return new BulkIndexOutcome(false, "REST index: " + m);
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
-    }
-
-    private BulkRequest buildBulkIndexRequest(String indexName, String documentId, String jsonDoc, String routing) {
-        var indexOperationBuilder = IndexOperation.newBuilder().setXIndex(indexName).setXId(documentId);
-        if (routing != null && !routing.isBlank()) {
-            indexOperationBuilder.setRouting(routing);
-        }
-        return BulkRequest.newBuilder()
-                .setIndex(indexName)
-                .addBulkRequestBody(BulkRequestBody.newBuilder()
-                        .setOperationContainer(OperationContainer.newBuilder().setIndex(indexOperationBuilder.build()).build())
-                        .setObject(ByteString.copyFromUtf8(jsonDoc))
-                        .build())
-                .build();
     }
 
     // ===== Entity batching infrastructure =====

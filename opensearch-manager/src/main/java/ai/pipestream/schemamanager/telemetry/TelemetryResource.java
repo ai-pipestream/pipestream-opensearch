@@ -31,7 +31,7 @@ import java.util.Optional;
 @Produces(MediaType.APPLICATION_JSON)
 public class TelemetryResource {
     private static final Logger LOG = Logger.getLogger(TelemetryResource.class);
-    private static final List<String> DEFAULT_DISCOVERY_SERVICES = List.of("opensearch-grpc", "opensearch-manager", "registration-service");
+    private static final List<String> DEFAULT_DISCOVERY_SERVICES = List.of("opensearch-manager", "registration-service");
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
 
     @ConfigProperty(name = "telemetry.rest.enabled", defaultValue = "false")

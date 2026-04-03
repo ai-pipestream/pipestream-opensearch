@@ -73,11 +73,12 @@ public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.Chu
             return entity.persist()
                     .replaceWith(entity);
         })
-                // If a config with the same name/configId already exists, return the existing one
+                // If a config with the same name/configId already exists, return the existing one.
+                // Recovery needs its own session — the original session is corrupted after constraint violation.
                 .onFailure().recoverWithUni(err -> {
                     if (isConstraintViolation(err)) {
                         LOG.infof("Chunker config '%s' already exists — returning existing", request.getName());
-                        return ChunkerConfigEntity.findByName(request.getName());
+                        return Panache.withSession(() -> ChunkerConfigEntity.findByName(request.getName()));
                     }
                     return Uni.createFrom().failure(err);
                 })

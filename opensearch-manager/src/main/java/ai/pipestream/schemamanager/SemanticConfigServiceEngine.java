@@ -153,11 +153,13 @@ public class SemanticConfigServiceEngine {
                     if (isConstraintViolation(err)) {
                         LOG.infof("Child VectorSet already exists for granularity=%s semanticConfig=%s — skipping",
                                 granularity, saved.id);
-                        return VectorSetEntity.findBySemanticConfigAndGranularity(saved.id, granularity)
-                                .onItem().transformToUni(existing ->
-                                        existing != null
-                                                ? Uni.createFrom().item(existing)
-                                                : Uni.createFrom().failure(err));
+                        // Need fresh session — original is corrupted after constraint violation
+                        return Panache.withSession(() ->
+                                VectorSetEntity.findBySemanticConfigAndGranularity(saved.configId, granularity)
+                                        .onItem().transformToUni(existing ->
+                                                existing != null
+                                                        ? Uni.createFrom().item(existing)
+                                                        : Uni.createFrom().failure(err)));
                     }
                     return Uni.createFrom().failure(err);
                 })
