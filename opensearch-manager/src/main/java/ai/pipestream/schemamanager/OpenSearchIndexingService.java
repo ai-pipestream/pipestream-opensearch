@@ -2,6 +2,7 @@ package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.api.AdminSearchService;
+import ai.pipestream.schemamanager.indexing.ChunkCombinedIndexingStrategy;
 import ai.pipestream.schemamanager.indexing.IndexingStrategyHandler;
 import ai.pipestream.schemamanager.indexing.NestedIndexingStrategy;
 import ai.pipestream.config.v1.ModuleDefinition;
@@ -62,6 +63,9 @@ public class OpenSearchIndexingService {
     @Inject
     NestedIndexingStrategy nestedStrategy;
 
+    @Inject
+    ChunkCombinedIndexingStrategy chunkCombinedStrategy;
+
     private volatile MultiEmitter<? super EntityIndexRequest> entityEmitter;
 
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -77,12 +81,14 @@ public class OpenSearchIndexingService {
 
     /**
      * Resolves the strategy handler for a given indexing strategy enum value.
-     * UNSPECIFIED and CHUNK_COMBINED both use the nested strategy (CHUNK_COMBINED is the
-     * default nested layout). SEPARATE_INDICES is not yet implemented.
+     * UNSPECIFIED uses the nested strategy (backward compatible).
+     * CHUNK_COMBINED uses the chunk-combined strategy (flat chunk indices).
+     * SEPARATE_INDICES is not yet implemented.
      */
     private IndexingStrategyHandler resolveStrategy(IndexingStrategy strategy) {
         return switch (strategy) {
-            case INDEXING_STRATEGY_UNSPECIFIED, INDEXING_STRATEGY_CHUNK_COMBINED -> nestedStrategy;
+            case INDEXING_STRATEGY_UNSPECIFIED -> nestedStrategy;
+            case INDEXING_STRATEGY_CHUNK_COMBINED -> chunkCombinedStrategy;
             case INDEXING_STRATEGY_SEPARATE_INDICES ->
                 throw io.grpc.Status.UNIMPLEMENTED
                     .withDescription("SEPARATE_INDICES indexing strategy is not yet implemented")
