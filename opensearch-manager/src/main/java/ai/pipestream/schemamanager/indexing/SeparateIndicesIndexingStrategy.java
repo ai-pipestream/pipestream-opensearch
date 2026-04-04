@@ -11,6 +11,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * SEPARATE_INDICES indexing strategy: stores the base document (metadata only, no vectors)
@@ -26,6 +27,9 @@ import java.util.*;
 public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler {
 
     private static final Logger LOG = Logger.getLogger(SeparateIndicesIndexingStrategy.class);
+
+    // Cache of already-ensured vs index names to avoid repeated mapping checks
+    private final Set<String> ensuredIndices = ConcurrentHashMap.newKeySet();
 
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
@@ -237,7 +241,11 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
      * Ensures the vs index exists with a single KNN-enabled "vector" field.
      */
     private Uni<Void> ensureVsIndex(String vsIndexName, int dimension) {
-        return ensureFlatKnnField(vsIndexName, "vector", dimension);
+        if (ensuredIndices.contains(vsIndexName)) {
+            return Uni.createFrom().voidItem();
+        }
+        return ensureFlatKnnField(vsIndexName, "vector", dimension)
+                .invoke(() -> ensuredIndices.add(vsIndexName));
     }
 
     /**

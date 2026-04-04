@@ -11,9 +11,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.io.IOException;
 import java.util.*;
-import java.util.stream.Collectors;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * CHUNK_COMBINED indexing strategy: stores the base document (metadata only, no vectors)
@@ -24,6 +23,9 @@ import java.util.stream.Collectors;
 public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     private static final Logger LOG = Logger.getLogger(ChunkCombinedIndexingStrategy.class);
+
+    // Cache of already-ensured (indexName + fieldName) pairs to avoid repeated mapping checks
+    private final Set<String> ensuredFields = ConcurrentHashMap.newKeySet();
 
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
@@ -242,19 +244,22 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
             String fieldName = sanitizeEmbeddingFieldName(entry.getKey());
             int dimensions = entry.getValue();
+            String cacheKey = chunkIndexName + "|" + fieldName;
+
+            // Skip if we've already ensured this field exists in this JVM lifetime
+            if (ensuredFields.contains(cacheKey)) {
+                continue;
+            }
 
             chain = chain.flatMap(v ->
                     openSearchSchemaClient.nestedMappingExists(chunkIndexName, fieldName)
                             .flatMap(exists -> {
                                 if (exists) {
-                                    LOG.debugf("KNN field %s already exists in %s", fieldName, chunkIndexName);
+                                    ensuredFields.add(cacheKey);
                                     return Uni.createFrom().voidItem();
                                 }
-                                // Create index with a KNN vector field (not nested — flat top-level field)
-                                // We reuse createIndexWithNestedMapping which creates the index if needed
-                                // and adds the mapping. For chunk indices we need flat knn_vector fields,
-                                // so we'll use the REST client directly.
-                                return ensureFlatKnnField(chunkIndexName, fieldName, dimensions);
+                                return ensureFlatKnnField(chunkIndexName, fieldName, dimensions)
+                                        .invoke(() -> ensuredFields.add(cacheKey));
                             })
             );
         }
