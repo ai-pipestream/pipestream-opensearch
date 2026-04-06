@@ -46,18 +46,24 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                     .setMessage("CHUNK_COMBINED strategy requires document_map")
                     .build());
         }
-        if (request.getChunkDocumentsList().isEmpty()) {
-            return Uni.createFrom().item(IndexDocumentResponse.newBuilder()
-                    .setSuccess(false)
-                    .setDocumentId(request.getDocumentMap().getOriginalDocId())
-                    .setMessage("CHUNK_COMBINED strategy requires at least one chunk_document")
-                    .build());
-        }
-
         String baseIndex = request.getIndexName();
         OpenSearchDocumentMap docMap = request.getDocumentMap();
         String documentId = docMap.getOriginalDocId();
         List<OpenSearchChunkDocument> chunkDocs = request.getChunkDocumentsList();
+
+        if (chunkDocs.isEmpty()) {
+            // No chunks (e.g., document had no body text for semantic processing).
+            // Index just the base document metadata without chunk indices.
+            LOG.infof("No chunk documents for CHUNK_COMBINED strategy (doc %s) — indexing base document only", documentId);
+            return indexBaseDocument(baseIndex, documentId, docMap)
+                    .map(baseOutcome -> IndexDocumentResponse.newBuilder()
+                            .setSuccess(baseOutcome.success())
+                            .setDocumentId(documentId)
+                            .setMessage(baseOutcome.success()
+                                    ? "Indexed base document only (no chunks available)"
+                                    : "Failed to index base document: " + baseOutcome.failureDetail())
+                            .build());
+        }
 
         // Step 1: Index the base document
         return indexBaseDocument(baseIndex, documentId, docMap)
