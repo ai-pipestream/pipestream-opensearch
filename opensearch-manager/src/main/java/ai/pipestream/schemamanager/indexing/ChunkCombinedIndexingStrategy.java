@@ -144,6 +144,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     private Uni<IndexOutcome> indexBaseDocument(String indexName, String documentId, OpenSearchDocumentMap docMap) {
         return Uni.createFrom().item(() -> {
             try {
+                // Ensure base index exists with correct NLP field mappings
+                ensureBaseIndex(indexName);
+
                 String jsonDoc = JsonFormat.printer()
                         .preservingProtoFieldNames()
                         .print(docMap);
@@ -173,6 +176,85 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 return new IndexOutcome(false, msg);
             }
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    // ===== Index creation helpers =====
+
+    /** Cache of base indices already ensured to avoid repeated existence checks. */
+    private final Set<String> ensuredBaseIndices = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Ensures the base document index exists with pre-mapped NLP analysis fields.
+     * This prevents OpenSearch from auto-mapping text fields as dates.
+     */
+    private void ensureBaseIndex(String indexName) throws Exception {
+        if (ensuredBaseIndices.contains(indexName)) return;
+        try {
+            var exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get();
+            if (!exists.value()) {
+                LOG.infof("CHUNK_COMBINED: creating base index %s with NLP mappings", indexName);
+                openSearchAsyncClient.indices().create(c -> c
+                        .index(indexName)
+                        .mappings(m -> buildNlpAnalysisMappings(m))
+                ).get();
+            }
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("resource_already_exists_exception")) {
+                // Race condition — another thread created it. That's fine.
+            } else {
+                throw e;
+            }
+        }
+        ensuredBaseIndices.add(indexName);
+    }
+
+    /**
+     * Adds explicit NLP analysis field mappings to prevent OpenSearch dynamic mapping
+     * from inferring wrong types (e.g., mapping "text" as "date" for sentence content).
+     */
+    private org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder buildNlpAnalysisMappings(
+            org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder m) {
+        return m
+            .properties("nlp_analysis", nlp -> nlp
+                .object(obj -> obj
+                    .properties("sentences", sent -> sent
+                        .object(sentObj -> sentObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("tokens", tok -> tok
+                        .object(tokObj -> tokObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("lemma", l -> l.text(tt -> tt))
+                            .properties("pos", p -> p.keyword(kk -> kk))
+                            .properties("tag", tg -> tg.keyword(kk -> kk))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("entities", ent -> ent
+                        .object(entObj -> entObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("type", tp -> tp.keyword(kk -> kk))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
+                    .properties("token_count", tc -> tc.integer(ii -> ii))
+                    .properties("word_count", wc -> wc.integer(ii -> ii))
+                    .properties("character_count", cc -> cc.integer(ii -> ii))
+                )
+            )
+            .properties("chunk_analytics", ca -> ca
+                .object(obj -> obj
+                    .properties("word_count", wc -> wc.integer(ii -> ii))
+                    .properties("character_count", cc -> cc.integer(ii -> ii))
+                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
+                )
+            );
     }
 
     // ===== Chunk grouping =====
@@ -290,11 +372,12 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 }
 
                 if (!indexExists) {
-                    // Create the index with KNN enabled
+                    // Create the index with KNN enabled and pre-mapped NLP analysis fields
                     LOG.infof("CHUNK_COMBINED: creating chunk index %s with KNN enabled", chunkIndexName);
                     openSearchAsyncClient.indices().create(c -> c
                             .index(chunkIndexName)
                             .settings(s -> s.knn(true))
+                            .mappings(m -> buildNlpAnalysisMappings(m))
                     ).get();
                 }
 
