@@ -59,6 +59,13 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
             entity.modelIdentifier = request.getModelIdentifier();
             entity.dimensions = request.getDimensions();
             entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
+            if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
+            if (request.hasServingName()) entity.servingName = request.getServingName();
+            if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
+            if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
+            if (request.hasEnabled()) entity.enabled = request.getEnabled();
+            if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
+            if (request.hasProvider()) entity.provider = request.getProvider();
             return entity.persist()
                     .replaceWith(entity);
         })
@@ -107,6 +114,13 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                     if (request.hasModelIdentifier()) entity.modelIdentifier = request.getModelIdentifier();
                     if (request.hasDimensions()) entity.dimensions = request.getDimensions();
                     if (request.hasMetadata()) entity.metadata = structToJson(request.getMetadata());
+                    if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
+                    if (request.hasServingName()) entity.servingName = request.getServingName();
+                    if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
+                    if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
+                    if (request.hasEnabled()) entity.enabled = request.getEnabled();
+                    if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
+                    if (request.hasProvider()) entity.provider = request.getProvider();
                     return entity.persist()
                             .replaceWith(Uni.createFrom().item(new Object[] { previous, entity }));
                 }))
@@ -319,6 +333,14 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                 LOG.warnf("Could not parse metadata JSON for config %s: %s", e.id, ex.getMessage());
             }
         }
+        // Serving configuration fields
+        if (e.endpointUrl != null) b.setEndpointUrl(e.endpointUrl);
+        if (e.servingName != null) b.setServingName(e.servingName);
+        if (e.queryPrefix != null) b.setQueryPrefix(e.queryPrefix);
+        if (e.indexPrefix != null) b.setIndexPrefix(e.indexPrefix);
+        b.setEnabled(e.enabled);
+        if (e.tlsConfigName != null) b.setTlsConfigName(e.tlsConfigName);
+        if (e.provider != null) b.setProvider(e.provider);
         return b.build();
     }
 

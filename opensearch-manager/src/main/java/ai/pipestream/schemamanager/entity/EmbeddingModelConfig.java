@@ -43,7 +43,32 @@ public class EmbeddingModelConfig extends PanacheEntityBase {
     @JdbcTypeCode(SqlTypes.JSON)
     public String metadata;
 
+    @Column(name = "endpoint_url", nullable = false)
+    public String endpointUrl = "";
+
+    @Column(name = "serving_name", nullable = false)
+    public String servingName = "";
+
+    @Column(name = "query_prefix", nullable = false)
+    public String queryPrefix = "";
+
+    @Column(name = "index_prefix", nullable = false)
+    public String indexPrefix = "";
+
+    @Column(name = "enabled", nullable = false)
+    public boolean enabled = true;
+
+    @Column(name = "tls_config_name")
+    public String tlsConfigName;
+
+    @Column(name = "provider", nullable = false)
+    public String provider = "djl-serving";
+
     public static Uni<EmbeddingModelConfig> findByName(String name) {
         return find("name", name).firstResult();
+    }
+
+    public static Uni<java.util.List<EmbeddingModelConfig>> findAllEnabled() {
+        return find("enabled", true).list();
     }
 }
