@@ -29,10 +29,10 @@ pipestreamProtos {
     def localProtos = file("${rootDir}/../../pipestream-protos")
     if (localProtos.directory && new File(localProtos, ".git").exists()) {
         gitRepo = "file://${localProtos.absolutePath}"
-        gitRef = "main"
+        gitRef = "feature/dual-drive-s3-layout"
     } else {
         gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-        gitRef = "main"
+        gitRef = "feature/dual-drive-s3-layout"
     }
 
     modules {

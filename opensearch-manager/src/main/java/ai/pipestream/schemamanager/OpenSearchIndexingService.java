@@ -391,6 +391,15 @@ public class OpenSearchIndexingService {
         if (notification.hasRetentionIntentDays()) {
             document.put("retention_intent_days", notification.getRetentionIntentDays());
         }
+        if (!notification.getDriveType().isEmpty()) {
+            document.put("drive_type", notification.getDriveType());
+        }
+        if (!notification.getGraphId().isEmpty()) {
+            document.put("graph_id", notification.getGraphId());
+        }
+        if (!notification.getClusterId().isEmpty()) {
+            document.put("cluster_id", notification.getClusterId());
+        }
         document.put(CommonFields.CREATED_AT.getFieldName(), notification.getCreatedAt().getSeconds() * 1000);
         document.put(CommonFields.UPDATED_AT.getFieldName(), notification.getUpdatedAt().getSeconds() * 1000);
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
