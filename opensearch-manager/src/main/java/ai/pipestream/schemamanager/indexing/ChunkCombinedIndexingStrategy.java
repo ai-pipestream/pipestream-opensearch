@@ -36,6 +36,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     @Inject
     ObjectMapper objectMapper;
 
+    @Inject
+    ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         // Validate required fields for CHUNK_COMBINED strategy
@@ -144,7 +147,6 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     private Uni<IndexOutcome> indexBaseDocument(String indexName, String documentId, OpenSearchDocumentMap docMap) {
         return Uni.createFrom().item(() -> {
             try {
-                // Ensure base index exists with correct NLP field mappings
                 ensureBaseIndex(indexName);
 
                 String jsonDoc = JsonFormat.printer()
@@ -153,29 +155,27 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
                 @SuppressWarnings("unchecked")
                 Map<String, Object> docAsMap = objectMapper.readValue(jsonDoc, Map.class);
-
-                // Sanitize: remove punctuation_counts from analytics
                 sanitizePunctuationCounts(docAsMap);
-
-                var response = openSearchAsyncClient.index(i -> i
-                        .index(indexName)
-                        .id(documentId)
-                        .document(docAsMap)
-                ).get();
-
-                boolean ok = "created".equals(response.result().jsonValue())
-                        || "updated".equals(response.result().jsonValue());
-                if (ok) {
-                    LOG.infof("CHUNK_COMBINED: base document indexed to %s/%s", indexName, documentId);
-                    return IndexOutcome.ok();
-                }
-                return new IndexOutcome(false, "OpenSearch result: " + response.result());
+                return docAsMap;
             } catch (Exception e) {
-                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                LOG.errorf(e, "CHUNK_COMBINED: failed to index base document %s/%s", indexName, documentId);
-                return new IndexOutcome(false, msg);
+                LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", indexName, documentId);
+                return null;
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+          .flatMap(docAsMap -> {
+              if (docAsMap == null) {
+                  return Uni.createFrom().item(new IndexOutcome(false, "Failed to serialize base document"));
+              }
+              return Uni.createFrom().completionStage(
+                      bulkQueueSet.submitWithFuture(indexName, documentId, docAsMap, null)
+              ).map(result -> {
+                  if (result.success()) {
+                      LOG.infof("CHUNK_COMBINED: base document queued for bulk index to %s/%s", indexName, documentId);
+                      return IndexOutcome.ok();
+                  }
+                  return new IndexOutcome(false, result.failureDetail());
+              });
+          });
     }
 
     // ===== Index creation helpers =====
@@ -428,36 +428,26 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     // ===== Bulk indexing =====
 
     private Uni<Boolean> bulkIndexChunkDocs(String chunkIndexName, List<OpenSearchChunkDocument> chunks) {
-        return Uni.createFrom().item(() -> {
-            try {
-                var bulkBuilder = new org.opensearch.client.opensearch.core.BulkRequest.Builder();
+        List<java.util.concurrent.CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> futures = new ArrayList<>();
+        for (OpenSearchChunkDocument chunk : chunks) {
+            Map<String, Object> docMap = serializeChunkDocument(chunk);
+            String docId = generateChunkDocId(chunk);
+            futures.add(bulkQueueSet.submitWithFuture(chunkIndexName, docId, docMap, null));
+        }
 
-                for (OpenSearchChunkDocument chunk : chunks) {
-                    Map<String, Object> docMap = serializeChunkDocument(chunk);
-                    String docId = generateChunkDocId(chunk);
-
-                    bulkBuilder.operations(op -> op.index(idx -> idx
-                            .index(chunkIndexName)
-                            .id(docId)
-                            .document(docMap)
-                    ));
-                }
-
-                var response = openSearchAsyncClient.bulk(bulkBuilder.build()).get();
-                if (response.errors()) {
-                    long errorCount = response.items().stream()
-                            .filter(item -> item.error() != null).count();
-                    LOG.warnf("CHUNK_COMBINED: bulk index to %s had %d errors out of %d items",
-                            chunkIndexName, errorCount, chunks.size());
-                    // Partial success: log but return true if at least some succeeded
-                    return errorCount < chunks.size();
-                }
-                return true;
-            } catch (Exception e) {
-                LOG.errorf(e, "CHUNK_COMBINED: bulk index failed for %s", chunkIndexName);
-                return false;
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        return Uni.createFrom().completionStage(
+                java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                        .thenApply(v -> {
+                            long failCount = futures.stream()
+                                    .map(java.util.concurrent.CompletableFuture::join)
+                                    .filter(r -> !r.success())
+                                    .count();
+                            if (failCount > 0) {
+                                LOG.warnf("CHUNK_COMBINED: %d/%d chunks failed for %s", failCount, chunks.size(), chunkIndexName);
+                            }
+                            return failCount < chunks.size();
+                        })
+        );
     }
 
     // ===== Chunk document serialization =====
