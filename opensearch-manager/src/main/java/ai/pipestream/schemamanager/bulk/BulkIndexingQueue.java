@@ -29,6 +29,7 @@ public class BulkIndexingQueue {
 
     private volatile ScheduledFuture<?> timerHandle;
     private volatile boolean running;
+    private ScheduledExecutorService scheduler;
     private ScheduledExecutorService ownedScheduler;
 
     /**
@@ -53,6 +54,7 @@ public class BulkIndexingQueue {
      * Start the periodic flush timer using the provided scheduler.
      */
     public void start(ScheduledExecutorService scheduler) {
+        this.scheduler = scheduler;
         running = true;
         timerHandle = scheduler.scheduleAtFixedRate(() -> {
             if (running && !queue.isEmpty()) {
@@ -76,12 +78,14 @@ public class BulkIndexingQueue {
     }
 
     /**
-     * Submit an item to the queue. If the queue size reaches capacity, flush immediately.
+     * Submit an item to the queue. If the queue size reaches capacity, schedule a flush
+     * on the executor thread — never flush inline, because the caller may be a Vert.x
+     * event loop thread and the flush handler does blocking I/O.
      */
     public void submit(BulkIndexItem item) {
         queue.offer(item);
-        if (queue.size() >= capacity) {
-            flush();
+        if (queue.size() >= capacity && scheduler != null) {
+            scheduler.execute(this::flush);
         }
     }
 
