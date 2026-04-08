@@ -13,14 +13,12 @@ import com.google.protobuf.util.JsonFormat;
 import io.quarkus.hibernate.reactive.panache.Panache;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.ExecutionException;
 
 /**
  * NESTED indexing strategy: stores all vector sets as nested fields (vs_*) on the parent
@@ -39,6 +37,9 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
 
     @Inject
     ObjectMapper objectMapper;
+
+    @Inject
+    ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -516,27 +517,14 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
             return Uni.createFrom().item(new BulkIndexOutcome(false, "JSON parse: " + e.getMessage()));
         }
 
-        var indexBuilder = new org.opensearch.client.opensearch.core.IndexRequest.Builder<Map<String, Object>>()
-                .index(indexName)
-                .id(documentId)
-                .document(docMap);
-        if (routing != null && !routing.isBlank()) {
-            indexBuilder.routing(routing);
-        }
-
-        return Uni.createFrom().item(() -> {
-            try {
-                var response = openSearchAsyncClient.index(indexBuilder.build()).get();
-                boolean ok = "created".equals(response.result().jsonValue()) || "updated".equals(response.result().jsonValue());
-                if (ok) {
-                    return BulkIndexOutcome.ok();
-                }
-                return new BulkIndexOutcome(false, "OpenSearch index result: " + response.result());
-            } catch (IOException | InterruptedException | ExecutionException e) {
-                String m = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                return new BulkIndexOutcome(false, "REST index: " + m);
+        return Uni.createFrom().completionStage(
+                bulkQueueSet.submitWithFuture(indexName, documentId, docMap, routing)
+        ).map(result -> {
+            if (result.success()) {
+                return BulkIndexOutcome.ok();
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+            return new BulkIndexOutcome(false, result.failureDetail());
+        });
     }
 
     // ===== Constraint violation helpers =====
