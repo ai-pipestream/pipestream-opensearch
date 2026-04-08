@@ -40,6 +40,9 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     @Inject
     VectorSetResolutionMetrics vectorSetResolutionMetrics;
 
+    @Inject
+    ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         return indexingService.indexDocument(request);
@@ -197,6 +200,63 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
                                         .setSchemaExisted(false)
                                         .build());
                     });
+        });
+    }
+
+    @Override
+    public Uni<GetBulkConfigResponse> getBulkConfig(GetBulkConfigRequest request) {
+        return Uni.createFrom().item(() ->
+                GetBulkConfigResponse.newBuilder()
+                        .setConfig(BulkIndexingConfig.newBuilder()
+                                .setQueueCount(bulkQueueSet.getQueueCount())
+                                .setQueueCapacity(bulkQueueSet.getCapacity())
+                                .setFlushIntervalMs(bulkQueueSet.getFlushIntervalMs())
+                                .build())
+                        .build());
+    }
+
+    @Override
+    public Uni<UpdateBulkConfigResponse> updateBulkConfig(UpdateBulkConfigRequest request) {
+        return Uni.createFrom().item(() -> {
+            var cfg = request.getConfig();
+            int queueCount = cfg.getQueueCount();
+            int capacity = cfg.getQueueCapacity();
+            int flushMs = cfg.getFlushIntervalMs();
+
+            // Validate ranges
+            if (queueCount < 2 || queueCount > 10) {
+                return UpdateBulkConfigResponse.newBuilder()
+                        .setSuccess(false)
+                        .setMessage("queue_count must be between 2 and 10, got " + queueCount)
+                        .build();
+            }
+            if (capacity < 10 || capacity > 5000) {
+                return UpdateBulkConfigResponse.newBuilder()
+                        .setSuccess(false)
+                        .setMessage("queue_capacity must be between 10 and 5000, got " + capacity)
+                        .build();
+            }
+            if (flushMs < 100 || flushMs > 30000) {
+                return UpdateBulkConfigResponse.newBuilder()
+                        .setSuccess(false)
+                        .setMessage("flush_interval_ms must be between 100 and 30000, got " + flushMs)
+                        .build();
+            }
+
+            bulkQueueSet.resize(queueCount, capacity, flushMs);
+
+            LOG.infof("Bulk indexing config updated: queues=%d, capacity=%d, flushMs=%d",
+                    queueCount, capacity, flushMs);
+
+            return UpdateBulkConfigResponse.newBuilder()
+                    .setSuccess(true)
+                    .setActiveConfig(BulkIndexingConfig.newBuilder()
+                            .setQueueCount(bulkQueueSet.getQueueCount())
+                            .setQueueCapacity(bulkQueueSet.getCapacity())
+                            .setFlushIntervalMs(bulkQueueSet.getFlushIntervalMs())
+                            .build())
+                    .setMessage("Bulk indexing config updated successfully")
+                    .build();
         });
     }
 }
