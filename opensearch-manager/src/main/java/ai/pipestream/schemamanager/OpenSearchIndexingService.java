@@ -20,22 +20,15 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
 import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.runtime.ShutdownEvent;
-import io.quarkus.runtime.StartupEvent;
-import io.smallrye.mutiny.Multi;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
-import io.smallrye.mutiny.subscription.BackPressureStrategy;
-import io.smallrye.mutiny.subscription.MultiEmitter;
 import jakarta.enterprise.context.ApplicationScoped;
-import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import io.vertx.core.Context;
 import io.vertx.core.Vertx;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
-import java.time.Duration;
 import java.util.*;
 import java.util.LinkedHashMap;
 
@@ -70,7 +63,8 @@ public class OpenSearchIndexingService {
     @Inject
     SeparateIndicesIndexingStrategy separateIndicesStrategy;
 
-    private volatile MultiEmitter<? super EntityIndexRequest> entityEmitter;
+    @Inject
+    ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         IndexingStrategyHandler strategy = resolveStrategy(request.getIndexingStrategy());
@@ -98,82 +92,12 @@ public class OpenSearchIndexingService {
         };
     }
 
-    // ===== Entity batching infrastructure =====
-
-    record EntityIndexRequest(String indexName, String docId, Map<String, Object> document) {}
-
-    void onStartup(@Observes StartupEvent event) {
-        Multi.createFrom().<EntityIndexRequest>emitter(em -> {
-            this.entityEmitter = em;
-        }, BackPressureStrategy.BUFFER)
-        .group().intoLists().of(500, Duration.ofMillis(500))
-        .onItem().transformToUniAndConcatenate(batch ->
-            processEntityBatch(batch)
-                .onFailure().recoverWithItem((Void) null)
-        )
-        .subscribe().with(
-            v -> {},
-            failure -> LOG.errorf(failure, "Entity batch processor terminated unexpectedly")
-        );
-        LOG.info("Entity batch processor started (batch size=500, flush interval=500ms)");
-    }
-
-    void onShutdown(@Observes ShutdownEvent event) {
-        if (entityEmitter != null) {
-            entityEmitter.complete();
-        }
-    }
-
     /**
      * Queue a document for batched indexing into OpenSearch.
      * Fire-and-forget: the document will be included in the next bulk request.
      */
     public void queueForIndexing(String indexName, String docId, Map<String, Object> document) {
-        if (entityEmitter != null) {
-            entityEmitter.emit(new EntityIndexRequest(indexName, docId, document));
-        } else {
-            LOG.warnf("Entity batch emitter not ready, indexing %s/%s individually", indexName, docId);
-            indexEntityDirect(indexName, docId, document);
-        }
-    }
-
-    private Uni<Void> processEntityBatch(List<EntityIndexRequest> batch) {
-        if (batch.isEmpty()) return Uni.createFrom().voidItem();
-        LOG.infof("Bulk indexing %d entity documents", batch.size());
-
-        try {
-            var br = new org.opensearch.client.opensearch.core.BulkRequest.Builder();
-            for (EntityIndexRequest req : batch) {
-                br.operations(op -> op.index(idx -> idx
-                    .index(req.indexName())
-                    .id(req.docId())
-                    .document(req.document())
-                ));
-            }
-            return Uni.createFrom().completionStage(openSearchAsyncClient.bulk(br.build()))
-                .invoke(response -> {
-                    if (response.errors()) {
-                        long errors = response.items().stream()
-                            .filter(item -> item.error() != null).count();
-                        LOG.warnf("Bulk entity batch had %d errors out of %d items", errors, batch.size());
-                    } else {
-                        LOG.debugf("Successfully bulk indexed %d entity documents", batch.size());
-                    }
-                })
-                .replaceWithVoid()
-                .onFailure().invoke(e -> LOG.errorf(e, "Bulk entity indexing failed for batch of %d", batch.size()));
-        } catch (Exception e) {
-            LOG.errorf(e, "Failed to build bulk request for %d entity documents", batch.size());
-            return Uni.createFrom().voidItem();
-        }
-    }
-
-    private void indexEntityDirect(String indexName, String docId, Map<String, Object> document) {
-        try {
-            openSearchAsyncClient.index(r -> r.index(indexName).id(docId).document(document));
-        } catch (Exception e) {
-            LOG.errorf(e, "Direct entity indexing failed for %s/%s", indexName, docId);
-        }
+        bulkQueueSet.submitFireAndForget(indexName, docId, document);
     }
 
     // ===== Entity indexing methods (drives, nodes, modules, pipedocs, etc.) =====
