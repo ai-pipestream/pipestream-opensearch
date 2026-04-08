@@ -36,6 +36,12 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     @Inject
     ObjectMapper objectMapper;
 
+    @Inject
+    ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
+
+    @Inject
+    KnnIndexConfig knnConfig;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         // Validate required fields for CHUNK_COMBINED strategy
@@ -144,7 +150,6 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     private Uni<IndexOutcome> indexBaseDocument(String indexName, String documentId, OpenSearchDocumentMap docMap) {
         return Uni.createFrom().item(() -> {
             try {
-                // Ensure base index exists with correct NLP field mappings
                 ensureBaseIndex(indexName);
 
                 String jsonDoc = JsonFormat.printer()
@@ -153,29 +158,27 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
                 @SuppressWarnings("unchecked")
                 Map<String, Object> docAsMap = objectMapper.readValue(jsonDoc, Map.class);
-
-                // Sanitize: remove punctuation_counts from analytics
                 sanitizePunctuationCounts(docAsMap);
-
-                var response = openSearchAsyncClient.index(i -> i
-                        .index(indexName)
-                        .id(documentId)
-                        .document(docAsMap)
-                ).get();
-
-                boolean ok = "created".equals(response.result().jsonValue())
-                        || "updated".equals(response.result().jsonValue());
-                if (ok) {
-                    LOG.infof("CHUNK_COMBINED: base document indexed to %s/%s", indexName, documentId);
-                    return IndexOutcome.ok();
-                }
-                return new IndexOutcome(false, "OpenSearch result: " + response.result());
+                return docAsMap;
             } catch (Exception e) {
-                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                LOG.errorf(e, "CHUNK_COMBINED: failed to index base document %s/%s", indexName, documentId);
-                return new IndexOutcome(false, msg);
+                LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", indexName, documentId);
+                return null;
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+          .flatMap(docAsMap -> {
+              if (docAsMap == null) {
+                  return Uni.createFrom().item(new IndexOutcome(false, "Failed to serialize base document"));
+              }
+              return Uni.createFrom().completionStage(
+                      bulkQueueSet.submitWithFuture(indexName, documentId, docAsMap, null)
+              ).map(result -> {
+                  if (result.success()) {
+                      LOG.infof("CHUNK_COMBINED: base document queued for bulk index to %s/%s", indexName, documentId);
+                      return IndexOutcome.ok();
+                  }
+                  return new IndexOutcome(false, result.failureDetail());
+              });
+          });
     }
 
     // ===== Index creation helpers =====
@@ -192,9 +195,15 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         try {
             var exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get();
             if (!exists.value()) {
-                LOG.infof("CHUNK_COMBINED: creating base index %s with NLP mappings", indexName);
+                LOG.infof("CHUNK_COMBINED: creating base index %s (shards=%d, replicas=%d, refresh=%s)",
+                        indexName, knnConfig.numberOfShards(), knnConfig.numberOfReplicas(), knnConfig.refreshInterval());
                 openSearchAsyncClient.indices().create(c -> c
                         .index(indexName)
+                        .settings(s -> s
+                                .numberOfShards(knnConfig.numberOfShards())
+                                .numberOfReplicas(knnConfig.numberOfReplicas())
+                                .refreshInterval(ri -> ri.time(knnConfig.refreshInterval()))
+                        )
                         .mappings(m -> buildNlpAnalysisMappings(m))
                 ).get();
             }
@@ -372,11 +381,16 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 }
 
                 if (!indexExists) {
-                    // Create the index with KNN enabled and pre-mapped NLP analysis fields
-                    LOG.infof("CHUNK_COMBINED: creating chunk index %s with KNN enabled", chunkIndexName);
+                    LOG.infof("CHUNK_COMBINED: creating chunk index %s (shards=%d, replicas=%d, refresh=%s)",
+                            chunkIndexName, knnConfig.numberOfShards(), knnConfig.numberOfReplicas(), knnConfig.refreshInterval());
                     openSearchAsyncClient.indices().create(c -> c
                             .index(chunkIndexName)
-                            .settings(s -> s.knn(true))
+                            .settings(s -> s
+                                    .knn(true)
+                                    .numberOfShards(knnConfig.numberOfShards())
+                                    .numberOfReplicas(knnConfig.numberOfReplicas())
+                                    .refreshInterval(ri -> ri.time(knnConfig.refreshInterval()))
+                            )
                             .mappings(m -> buildNlpAnalysisMappings(m))
                     ).get();
                 }
@@ -392,6 +406,10 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                                                 .name("hnsw")
                                                 .engine("lucene")
                                                 .spaceType("cosinesimil")
+                                                .parameters(Map.of(
+                                                        "ef_construction", org.opensearch.client.json.JsonData.of(knnConfig.efConstruction()),
+                                                        "m", org.opensearch.client.json.JsonData.of(knnConfig.hnswM())
+                                                ))
                                         )
                                 )
                         )
@@ -399,8 +417,14 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
                 return (Void) null;
             } catch (Exception e) {
-                // If it's an "already exists" error for index creation, that's fine — just add the mapping
-                if (e.getMessage() != null && e.getMessage().contains("resource_already_exists_exception")) {
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                // KNN field already exists with same method — safe to ignore
+                if (msg.contains("Cannot update parameter [method]")) {
+                    LOG.debugf("CHUNK_COMBINED: KNN field %s already exists on %s, skipping", fieldName, chunkIndexName);
+                    return (Void) null;
+                }
+                // Index race condition — another thread created it, retry the putMapping
+                if (msg.contains("resource_already_exists_exception")) {
                     try {
                         openSearchAsyncClient.indices().putMapping(m -> m
                                 .index(chunkIndexName)
@@ -411,12 +435,21 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                                                         .name("hnsw")
                                                         .engine("lucene")
                                                         .spaceType("cosinesimil")
+                                                        .parameters(Map.of(
+                                                                "ef_construction", org.opensearch.client.json.JsonData.of(knnConfig.efConstruction()),
+                                                                "m", org.opensearch.client.json.JsonData.of(knnConfig.hnswM())
+                                                        ))
                                                 )
                                         )
                                 )
                         ).get();
                         return (Void) null;
                     } catch (Exception inner) {
+                        String innerMsg = inner.getMessage() != null ? inner.getMessage() : "";
+                        if (innerMsg.contains("Cannot update parameter [method]")) {
+                            LOG.debugf("CHUNK_COMBINED: KNN field %s already exists on %s, skipping", fieldName, chunkIndexName);
+                            return (Void) null;
+                        }
                         throw new RuntimeException("Failed to add KNN mapping to " + chunkIndexName, inner);
                     }
                 }
@@ -428,36 +461,26 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     // ===== Bulk indexing =====
 
     private Uni<Boolean> bulkIndexChunkDocs(String chunkIndexName, List<OpenSearchChunkDocument> chunks) {
-        return Uni.createFrom().item(() -> {
-            try {
-                var bulkBuilder = new org.opensearch.client.opensearch.core.BulkRequest.Builder();
+        List<java.util.concurrent.CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> futures = new ArrayList<>();
+        for (OpenSearchChunkDocument chunk : chunks) {
+            Map<String, Object> docMap = serializeChunkDocument(chunk);
+            String docId = generateChunkDocId(chunk);
+            futures.add(bulkQueueSet.submitWithFuture(chunkIndexName, docId, docMap, null));
+        }
 
-                for (OpenSearchChunkDocument chunk : chunks) {
-                    Map<String, Object> docMap = serializeChunkDocument(chunk);
-                    String docId = generateChunkDocId(chunk);
-
-                    bulkBuilder.operations(op -> op.index(idx -> idx
-                            .index(chunkIndexName)
-                            .id(docId)
-                            .document(docMap)
-                    ));
-                }
-
-                var response = openSearchAsyncClient.bulk(bulkBuilder.build()).get();
-                if (response.errors()) {
-                    long errorCount = response.items().stream()
-                            .filter(item -> item.error() != null).count();
-                    LOG.warnf("CHUNK_COMBINED: bulk index to %s had %d errors out of %d items",
-                            chunkIndexName, errorCount, chunks.size());
-                    // Partial success: log but return true if at least some succeeded
-                    return errorCount < chunks.size();
-                }
-                return true;
-            } catch (Exception e) {
-                LOG.errorf(e, "CHUNK_COMBINED: bulk index failed for %s", chunkIndexName);
-                return false;
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        return Uni.createFrom().completionStage(
+                java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
+                        .thenApply(v -> {
+                            long failCount = futures.stream()
+                                    .map(java.util.concurrent.CompletableFuture::join)
+                                    .filter(r -> !r.success())
+                                    .count();
+                            if (failCount > 0) {
+                                LOG.warnf("CHUNK_COMBINED: %d/%d chunks failed for %s", failCount, chunks.size(), chunkIndexName);
+                            }
+                            return failCount < chunks.size();
+                        })
+        );
     }
 
     // ===== Chunk document serialization =====
