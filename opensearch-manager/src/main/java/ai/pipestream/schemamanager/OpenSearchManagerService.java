@@ -224,10 +224,10 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
             int flushMs = cfg.getFlushIntervalMs();
 
             // Validate ranges
-            if (queueCount < 2 || queueCount > 10) {
+            if (queueCount < 2 || queueCount > 32) {
                 return UpdateBulkConfigResponse.newBuilder()
                         .setSuccess(false)
-                        .setMessage("queue_count must be between 2 and 10, got " + queueCount)
+                        .setMessage("queue_count must be between 2 and 32, got " + queueCount)
                         .build();
             }
             if (capacity < 10 || capacity > 5000) {
