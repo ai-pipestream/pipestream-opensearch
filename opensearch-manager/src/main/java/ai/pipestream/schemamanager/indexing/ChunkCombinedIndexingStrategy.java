@@ -417,8 +417,14 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
                 return (Void) null;
             } catch (Exception e) {
-                // If it's an "already exists" error for index creation, that's fine — just add the mapping
-                if (e.getMessage() != null && e.getMessage().contains("resource_already_exists_exception")) {
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                // KNN field already exists with same method — safe to ignore
+                if (msg.contains("Cannot update parameter [method]")) {
+                    LOG.debugf("CHUNK_COMBINED: KNN field %s already exists on %s, skipping", fieldName, chunkIndexName);
+                    return (Void) null;
+                }
+                // Index race condition — another thread created it, retry the putMapping
+                if (msg.contains("resource_already_exists_exception")) {
                     try {
                         openSearchAsyncClient.indices().putMapping(m -> m
                                 .index(chunkIndexName)
@@ -429,12 +435,21 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                                                         .name("hnsw")
                                                         .engine("lucene")
                                                         .spaceType("cosinesimil")
+                                                        .parameters(Map.of(
+                                                                "ef_construction", org.opensearch.client.json.JsonData.of(knnConfig.efConstruction()),
+                                                                "m", org.opensearch.client.json.JsonData.of(knnConfig.hnswM())
+                                                        ))
                                                 )
                                         )
                                 )
                         ).get();
                         return (Void) null;
                     } catch (Exception inner) {
+                        String innerMsg = inner.getMessage() != null ? inner.getMessage() : "";
+                        if (innerMsg.contains("Cannot update parameter [method]")) {
+                            LOG.debugf("CHUNK_COMBINED: KNN field %s already exists on %s, skipping", fieldName, chunkIndexName);
+                            return (Void) null;
+                        }
                         throw new RuntimeException("Failed to add KNN mapping to " + chunkIndexName, inner);
                     }
                 }
