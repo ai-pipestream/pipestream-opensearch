@@ -39,6 +39,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     @Inject
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
+    @Inject
+    KnnIndexConfig knnConfig;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         // Validate required fields for CHUNK_COMBINED strategy
@@ -192,9 +195,15 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         try {
             var exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get();
             if (!exists.value()) {
-                LOG.infof("CHUNK_COMBINED: creating base index %s with NLP mappings", indexName);
+                LOG.infof("CHUNK_COMBINED: creating base index %s (shards=%d, replicas=%d, refresh=%s)",
+                        indexName, knnConfig.numberOfShards(), knnConfig.numberOfReplicas(), knnConfig.refreshInterval());
                 openSearchAsyncClient.indices().create(c -> c
                         .index(indexName)
+                        .settings(s -> s
+                                .numberOfShards(knnConfig.numberOfShards())
+                                .numberOfReplicas(knnConfig.numberOfReplicas())
+                                .refreshInterval(ri -> ri.time(knnConfig.refreshInterval()))
+                        )
                         .mappings(m -> buildNlpAnalysisMappings(m))
                 ).get();
             }
@@ -372,11 +381,16 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 }
 
                 if (!indexExists) {
-                    // Create the index with KNN enabled and pre-mapped NLP analysis fields
-                    LOG.infof("CHUNK_COMBINED: creating chunk index %s with KNN enabled", chunkIndexName);
+                    LOG.infof("CHUNK_COMBINED: creating chunk index %s (shards=%d, replicas=%d, refresh=%s)",
+                            chunkIndexName, knnConfig.numberOfShards(), knnConfig.numberOfReplicas(), knnConfig.refreshInterval());
                     openSearchAsyncClient.indices().create(c -> c
                             .index(chunkIndexName)
-                            .settings(s -> s.knn(true))
+                            .settings(s -> s
+                                    .knn(true)
+                                    .numberOfShards(knnConfig.numberOfShards())
+                                    .numberOfReplicas(knnConfig.numberOfReplicas())
+                                    .refreshInterval(ri -> ri.time(knnConfig.refreshInterval()))
+                            )
                             .mappings(m -> buildNlpAnalysisMappings(m))
                     ).get();
                 }
@@ -392,6 +406,10 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                                                 .name("hnsw")
                                                 .engine("lucene")
                                                 .spaceType("cosinesimil")
+                                                .parameters(Map.of(
+                                                        "ef_construction", org.opensearch.client.json.JsonData.of(knnConfig.efConstruction()),
+                                                        "m", org.opensearch.client.json.JsonData.of(knnConfig.hnswM())
+                                                ))
                                         )
                                 )
                         )
