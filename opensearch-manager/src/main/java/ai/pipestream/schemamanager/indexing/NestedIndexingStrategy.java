@@ -1,7 +1,7 @@
 package ai.pipestream.schemamanager.indexing;
 
+import ai.pipestream.data.v1.GranularityLevel;
 import ai.pipestream.opensearch.v1.*;
-import ai.pipestream.opensearch.v1.SemanticGranularity;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
@@ -342,8 +342,8 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                 // Path: Semantic config — lookup by (semantic_config_id, granularity)
                 if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
                         && vset.hasGranularity()
-                        && vset.getGranularity() != SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED) {
-                    String granStr = vset.getGranularity().name().replace("SEMANTIC_GRANULARITY_", "");
+                        && vset.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
+                    String granStr = vset.getGranularity().name().replace("GRANULARITY_LEVEL_", "");
                     return VectorSetEntity.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr)
                             .onItem().transformToUni(entity -> {
                                 if (entity == null) {

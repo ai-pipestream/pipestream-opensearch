@@ -1,5 +1,6 @@
 package ai.pipestream.schemamanager;
 
+import ai.pipestream.data.v1.GranularityLevel;
 import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.config.SemanticVectorSetConfig;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
@@ -106,9 +107,9 @@ public class VectorSetServiceEngine {
                                                     }
                                                     entity.semanticConfig = sc;
                                                     if (request.hasGranularity()
-                                                            && request.getGranularity() != SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED) {
+                                                            && request.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
                                                         entity.granularity = request.getGranularity().name()
-                                                                .replace("SEMANTIC_GRANULARITY_", "");
+                                                                .replace("GRANULARITY_LEVEL_", "");
                                                     }
                                                     return persistAndBind(entity, request.getIndexName());
                                                 });
@@ -507,14 +508,14 @@ public class VectorSetServiceEngine {
         return b.build();
     }
 
-    private static SemanticGranularity mapGranularity(String g) {
+    private static GranularityLevel mapGranularity(String g) {
         return switch (g) {
-            case "SEMANTIC_CHUNK" -> SemanticGranularity.SEMANTIC_GRANULARITY_SEMANTIC_CHUNK;
-            case "SENTENCE" -> SemanticGranularity.SEMANTIC_GRANULARITY_SENTENCE;
-            case "PARAGRAPH" -> SemanticGranularity.SEMANTIC_GRANULARITY_PARAGRAPH;
-            case "SECTION" -> SemanticGranularity.SEMANTIC_GRANULARITY_SECTION;
-            case "DOCUMENT" -> SemanticGranularity.SEMANTIC_GRANULARITY_DOCUMENT;
-            default -> SemanticGranularity.SEMANTIC_GRANULARITY_UNSPECIFIED;
+            case "SEMANTIC_CHUNK" -> GranularityLevel.GRANULARITY_LEVEL_SEMANTIC_CHUNK;
+            case "SENTENCE" -> GranularityLevel.GRANULARITY_LEVEL_SENTENCE;
+            case "PARAGRAPH" -> GranularityLevel.GRANULARITY_LEVEL_PARAGRAPH;
+            case "SECTION" -> GranularityLevel.GRANULARITY_LEVEL_SECTION;
+            case "DOCUMENT" -> GranularityLevel.GRANULARITY_LEVEL_DOCUMENT;
+            default -> GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED;
         };
     }
 

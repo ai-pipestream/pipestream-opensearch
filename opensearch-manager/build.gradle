@@ -27,12 +27,15 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     def localProtos = file("${rootDir}/../../pipestream-protos")
+    // Temporarily pinned to proto/quality-and-classification until the
+    // GranularityLevel migration (PR #31) merges to main and is republished.
+    // Revert both gitRef lines to "main" after the cross-repo rollout completes.
     if (localProtos.directory && new File(localProtos, ".git").exists()) {
         gitRepo = "file://${localProtos.absolutePath}"
-        gitRef = "main"
+        gitRef = "proto/quality-and-classification"
     } else {
         gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-        gitRef = "main"
+        gitRef = "proto/quality-and-classification"
     }
 
     modules {
