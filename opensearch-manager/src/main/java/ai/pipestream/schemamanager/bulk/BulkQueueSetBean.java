@@ -13,6 +13,7 @@ import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 @ApplicationScoped
@@ -74,6 +75,10 @@ public class BulkQueueSetBean {
 
     /**
      * Flush handler: builds a BulkRequest, sends to OpenSearch, completes per-item futures.
+     * Uses blocking {@code .get()} so completion runs before {@code flush()} returns — required so
+     * per-item {@link CompletableFuture}s are finished on the bulk scheduler thread (not the HTTP
+     * client I/O thread), avoiding stalls when multiple {@code indexDocument} calls run Mutiny chains
+     * off bulk completions.
      */
     private void handleFlush(List<BulkIndexItem> batch) {
         try {
@@ -100,17 +105,29 @@ public class BulkQueueSetBean {
                 LOG.debugf("Bulk flush succeeded: %d items", batch.size());
             }
 
-            // Complete per-item futures
             List<BulkResponseItem> items = response.items();
-            for (int i = 0; i < items.size() && i < batch.size(); i++) {
+            int n = Math.min(items.size(), batch.size());
+            for (int i = 0; i < n; i++) {
                 BulkResponseItem responseItem = items.get(i);
                 CompletableFuture<BulkItemResult> future = batch.get(i).resultFuture();
+                var opError = responseItem.error();
                 if (future != null) {
-                    if (responseItem.error() != null) {
-                        future.complete(BulkItemResult.failed(responseItem.error().reason()));
+                    if (opError != null) {
+                        future.complete(BulkItemResult.failed(
+                                Objects.toString(opError.reason(), "bulk item error")));
                     } else {
                         future.complete(BulkItemResult.ok());
                     }
+                }
+            }
+            if (items.size() != batch.size()) {
+                LOG.errorf("Bulk response size mismatch: ops=%d batch=%d — completing missing futures as failed",
+                        items.size(), batch.size());
+            }
+            for (int i = n; i < batch.size(); i++) {
+                CompletableFuture<BulkItemResult> future = batch.get(i).resultFuture();
+                if (future != null && !future.isDone()) {
+                    future.complete(BulkItemResult.failed("missing bulk response item"));
                 }
             }
         } catch (Exception e) {
