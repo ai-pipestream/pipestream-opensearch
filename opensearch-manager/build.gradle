@@ -26,17 +26,8 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 // Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
-    def localProtos = file("${rootDir}/../../pipestream-protos")
-    // Temporarily pinned to proto/quality-and-classification until the
-    // GranularityLevel migration (PR #31) merges to main and is republished.
-    // Revert both gitRef lines to "main" after the cross-repo rollout completes.
-    if (localProtos.directory && new File(localProtos, ".git").exists()) {
-        gitRepo = "file://${localProtos.absolutePath}"
-        gitRef = "proto/quality-and-classification"
-    } else {
-        gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-        gitRef = "proto/quality-and-classification"
-    }
+    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+    gitRef = "main"
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
