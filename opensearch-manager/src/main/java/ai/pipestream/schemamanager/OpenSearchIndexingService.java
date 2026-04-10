@@ -22,6 +22,7 @@ import com.google.protobuf.util.JsonFormat;
 import io.quarkus.hibernate.reactive.panache.Panache;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
+import ai.pipestream.schemamanager.config.OpenSearchManagerRuntimeConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import io.vertx.core.Context;
@@ -65,6 +66,9 @@ public class OpenSearchIndexingService {
 
     @Inject
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
+
+    @Inject
+    OpenSearchManagerRuntimeConfig managerRuntimeConfig;
 
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         IndexingStrategyHandler strategy = resolveStrategy(request.getIndexingStrategy());
@@ -743,6 +747,13 @@ public class OpenSearchIndexingService {
 
         return Uni.createFrom().item(() -> {
             try {
+                if (managerRuntimeConfig.indexStats().refreshBeforeRead()) {
+                    try {
+                        openSearchAsyncClient.indices().refresh(r -> r.index(indexName)).get();
+                    } catch (Exception e) {
+                        LOG.warnf("Refresh before stats failed for index '%s': %s", indexName, e.getMessage());
+                    }
+                }
                 var statsResponse = openSearchAsyncClient.indices()
                         .stats(b -> b.index(indexName)).get();
 

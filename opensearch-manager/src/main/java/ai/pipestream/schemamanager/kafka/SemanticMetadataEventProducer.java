@@ -2,9 +2,11 @@ package ai.pipestream.schemamanager.kafka;
 
 import ai.pipestream.opensearch.v1.*;
 import com.google.protobuf.Timestamp;
+import ai.pipestream.schemamanager.config.OpenSearchManagerRuntimeConfig;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.reactive.messaging.MutinyEmitter;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.eclipse.microprofile.reactive.messaging.Channel;
 import org.jboss.logging.Logger;
 
@@ -21,8 +23,14 @@ public class SemanticMetadataEventProducer {
 
     private final MutinyEmitter<SemanticMetadataEvent> emitter;
 
-    public SemanticMetadataEventProducer(@Channel("semantic-metadata-events") MutinyEmitter<SemanticMetadataEvent> emitter) {
+    private final boolean failOpenPublish;
+
+    @Inject
+    public SemanticMetadataEventProducer(
+            @Channel("semantic-metadata-events") MutinyEmitter<SemanticMetadataEvent> emitter,
+            OpenSearchManagerRuntimeConfig runtimeConfig) {
         this.emitter = emitter;
+        this.failOpenPublish = runtimeConfig.semanticMetadata().failOpenPublish();
     }
 
     public Uni<Void> publishChunkerConfigCreated(ChunkerConfig config) {
@@ -110,7 +118,12 @@ public class SemanticMetadataEventProducer {
                 .build();
         SemanticMetadataEvent.Builder b = event != null ? event.toBuilder() : SemanticMetadataEvent.newBuilder();
         SemanticMetadataEvent full = b.setEventType(eventType).setEntityId(entityId).setOccurredAt(now).build();
-        return emitter.send(full).replaceWithVoid().onFailure().invoke(e ->
-                LOG.warnf(e, "Failed to publish semantic metadata event %s for %s", eventType, entityId));
+        Uni<Void> send = emitter.send(full).replaceWithVoid()
+                .onFailure().invoke(e ->
+                        LOG.warnf(e, "Failed to publish semantic metadata event %s for %s", eventType, entityId));
+        if (failOpenPublish) {
+            return send.onFailure().recoverWithUni(() -> Uni.createFrom().voidItem());
+        }
+        return send;
     }
 }

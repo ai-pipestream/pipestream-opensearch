@@ -10,7 +10,7 @@ import io.smallrye.config.WithDefault;
 @ConfigMapping(prefix = "bulk-indexing")
 public interface BulkIndexingConfig {
 
-    /** Number of concurrent draining queues. Range: 2-10. */
+    /** Number of concurrent draining queues. Runtime updates must stay within 2–32 (see UpdateBulkConfig). */
     @WithDefault("4")
     int queueCount();
 

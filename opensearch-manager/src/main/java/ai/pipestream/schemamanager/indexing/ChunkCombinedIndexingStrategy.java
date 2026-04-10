@@ -2,7 +2,6 @@ package ai.pipestream.schemamanager.indexing;
 
 import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
-import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
 import io.smallrye.mutiny.Uni;
@@ -468,6 +467,8 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
             futures.add(bulkQueueSet.submitWithFuture(chunkIndexName, docId, docMap, null));
         }
 
+        // Run subscription on worker pool so bulk CompletableFuture completion (from BulkQueueSetBean)
+        // does not drive downstream Mutiny operators on the HTTP client I/O thread under concurrent indexDocument.
         return Uni.createFrom().completionStage(
                 java.util.concurrent.CompletableFuture.allOf(futures.toArray(new java.util.concurrent.CompletableFuture[0]))
                         .thenApply(v -> {
@@ -480,7 +481,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                             }
                             return failCount < chunks.size();
                         })
-        );
+        ).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
     // ===== Chunk document serialization =====

@@ -2,7 +2,6 @@ package ai.pipestream.schemamanager.kafka;
 
 import ai.pipestream.data.v1.StepExecutionRecord;
 import ai.pipestream.schemamanager.OpenSearchIndexingService;
-import ai.pipestream.schemamanager.opensearch.IndexConstants.Index;
 import io.smallrye.mutiny.Uni;
 import io.smallrye.reactive.messaging.kafka.Record;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -13,7 +12,9 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -26,6 +27,10 @@ public class PipelineEventConsumer {
 
     private static final Logger LOG = Logger.getLogger(PipelineEventConsumer.class);
     private static final DateTimeFormatter MONTH_FORMAT = DateTimeFormatter.ofPattern("yyyy.MM");
+    private static final String SEMANTIC_TELEMETRY_PREFIX = "telemetry semantic_manager ";
+    private static final int MAX_STORED_LOG_ENTRIES = 40;
+    private static final int MAX_TOTAL_LOG_CHARS = 12_000;
+    private static final int MAX_LOG_MESSAGE_CHARS = 1_000;
 
     @Inject
     OpenSearchIndexingService indexingService;
@@ -66,6 +71,11 @@ public class PipelineEventConsumer {
 
         if (step.getLogEntriesCount() > 0) {
             document.put("log_entry_count", step.getLogEntriesCount());
+            document.putAll(extractCappedLogEntries(step));
+        }
+        Map<String, Object> semanticTelemetry = extractSemanticTelemetry(step);
+        if (!semanticTelemetry.isEmpty()) {
+            document.put("semantic_manager_telemetry", semanticTelemetry);
         }
 
         // Monthly rollover index
@@ -75,5 +85,117 @@ public class PipelineEventConsumer {
 
         indexingService.queueForIndexing(indexName, key.toString(), document);
         return Uni.createFrom().voidItem();
+    }
+
+    private Map<String, Object> extractSemanticTelemetry(StepExecutionRecord step) {
+        for (int i = step.getLogEntriesCount() - 1; i >= 0; i--) {
+            String message = step.getLogEntries(i).getMessage();
+            if (message == null || !message.startsWith(SEMANTIC_TELEMETRY_PREFIX)) {
+                continue;
+            }
+            String payload = message.substring(SEMANTIC_TELEMETRY_PREFIX.length()).trim();
+            if (payload.isEmpty()) {
+                return Map.of();
+            }
+            Map<String, Object> parsed = new HashMap<>();
+            String[] tokens = payload.split("\\s+");
+            for (String token : tokens) {
+                int separator = token.indexOf('=');
+                if (separator <= 0 || separator == token.length() - 1) {
+                    continue;
+                }
+                String key = token.substring(0, separator);
+                String rawValue = token.substring(separator + 1);
+                Object value = rawValue;
+                if (rawValue.matches("-?\\d+")) {
+                    try {
+                        value = Long.parseLong(rawValue);
+                    } catch (NumberFormatException ignored) {
+                        // Keep original string if parsing fails.
+                    }
+                }
+                parsed.put(key, value);
+            }
+            return parsed;
+        }
+        return Map.of();
+    }
+
+    private Map<String, Object> extractCappedLogEntries(StepExecutionRecord step) {
+        List<Map<String, Object>> storedLogs = new ArrayList<>();
+        int totalStoredChars = 0;
+        int droppedCount = 0;
+        boolean anyTruncated = false;
+
+        for (int i = 0; i < step.getLogEntriesCount(); i++) {
+            if (storedLogs.size() >= MAX_STORED_LOG_ENTRIES) {
+                droppedCount += (step.getLogEntriesCount() - i);
+                break;
+            }
+
+            var entry = step.getLogEntries(i);
+            String message = entry.getMessage();
+            if (message == null) {
+                message = "";
+            }
+
+            boolean messageTruncated = false;
+            if (message.length() > MAX_LOG_MESSAGE_CHARS) {
+                message = truncateWithSuffix(message, MAX_LOG_MESSAGE_CHARS);
+                messageTruncated = true;
+                anyTruncated = true;
+            }
+
+            int remainingChars = MAX_TOTAL_LOG_CHARS - totalStoredChars;
+            if (remainingChars <= 0) {
+                droppedCount += (step.getLogEntriesCount() - i);
+                anyTruncated = true;
+                break;
+            }
+
+            if (message.length() > remainingChars) {
+                message = truncateWithSuffix(message, remainingChars);
+                messageTruncated = true;
+                anyTruncated = true;
+            }
+
+            Map<String, Object> indexedLog = new HashMap<>();
+            indexedLog.put("timestamp_epoch_ms", entry.getTimestampEpochMs());
+            indexedLog.put("level", entry.getLevel().name());
+            indexedLog.put("source", entry.getSource().name());
+            indexedLog.put("message", message);
+            if (messageTruncated) {
+                indexedLog.put("message_truncated", true);
+            }
+            if (entry.hasModule()) {
+                indexedLog.put("module_name", entry.getModule().getModuleName());
+            }
+            if (entry.hasEngine()) {
+                indexedLog.put("engine_node_id", entry.getEngine().getNodeId());
+            }
+
+            storedLogs.add(indexedLog);
+            totalStoredChars += message.length();
+        }
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("log_entries", storedLogs);
+        result.put("log_entries_stored_count", storedLogs.size());
+        result.put("log_entries_dropped_count", droppedCount);
+        result.put("log_entries_total_chars", totalStoredChars);
+        if (anyTruncated) {
+            result.put("log_entries_truncated", true);
+        }
+        return result;
+    }
+
+    private String truncateWithSuffix(String value, int maxChars) {
+        if (value.length() <= maxChars) {
+            return value;
+        }
+        if (maxChars <= 3) {
+            return value.substring(0, Math.max(0, maxChars));
+        }
+        return value.substring(0, maxChars - 3) + "...";
     }
 }
