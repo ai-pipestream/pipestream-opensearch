@@ -39,4 +39,16 @@ public class SemanticConfigServiceImpl extends MutinySemanticConfigServiceGrpc.S
     public Uni<DeleteSemanticConfigResponse> deleteSemanticConfig(DeleteSemanticConfigRequest request) {
         return engine.deleteSemanticConfig(request);
     }
+
+    @Override
+    public Uni<AssignSemanticConfigToIndexResponse> assignSemanticConfigToIndex(
+            AssignSemanticConfigToIndexRequest request) {
+        return engine.assignToIndex(request.getSemanticConfigId(), request.getBaseIndexName())
+                .map(count -> AssignSemanticConfigToIndexResponse.newBuilder()
+                        .setBindingsProvisioned(count)
+                        .setMessage(count == 0
+                                ? "No VectorSets to provision"
+                                : "Provisioned " + count + " binding(s) for index " + request.getBaseIndexName())
+                        .build());
+    }
 }

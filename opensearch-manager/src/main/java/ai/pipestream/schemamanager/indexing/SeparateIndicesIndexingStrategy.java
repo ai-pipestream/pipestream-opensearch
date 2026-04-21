@@ -40,6 +40,9 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
     @Inject
     ObjectMapper objectMapper;
 
+    @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         // Validate required fields for SEPARATE_INDICES strategy
@@ -216,7 +219,7 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
      * Replaces non-alphanumeric characters (except _ and -) with _.
      */
     static String sanitizeForIndexName(String input) {
-        return input.replaceAll("[^a-zA-Z0-9_\\-]", "_").toLowerCase();
+        return IndexKnnProvisioner.sanitizeForIndexName(input);
     }
 
     // ===== VS index processing =====
@@ -244,13 +247,12 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
 
     /**
      * Ensures the vs index exists with a single KNN-enabled "vector" field.
+     * Delegates to {@link IndexKnnProvisioner} which owns the shared cache and
+     * is warmed eagerly at VectorSet-create time. On the hot path this is a
+     * single ConcurrentHashMap.contains() check in the common case.
      */
     private Uni<Void> ensureVsIndex(String vsIndexName, int dimension) {
-        if (ensuredIndices.contains(vsIndexName)) {
-            return Uni.createFrom().voidItem();
-        }
-        return ensureFlatKnnField(vsIndexName, "vector", dimension)
-                .invoke(() -> ensuredIndices.add(vsIndexName));
+        return indexKnnProvisioner.ensureKnnField(vsIndexName, "vector", dimension);
     }
 
     /**

@@ -41,6 +41,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     @Inject
     KnnIndexConfig knnConfig;
 
+    @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         // Validate required fields for CHUNK_COMBINED strategy
@@ -293,7 +296,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
      * Replaces non-alphanumeric characters (except _ and -) with _.
      */
     static String sanitizeForIndexName(String input) {
-        return input.replaceAll("[^a-zA-Z0-9_\\-]", "_").toLowerCase();
+        return IndexKnnProvisioner.sanitizeForIndexName(input);
     }
 
     // ===== Chunk index processing =====
@@ -333,31 +336,15 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     /**
      * Ensures the chunk index exists with KNN-enabled vector fields for each embedding model.
+     * Delegates to {@link IndexKnnProvisioner} — on the hot path this is O(1) cache
+     * lookups because eager provisioning at VectorSet-create time already populated the cache.
      */
     private Uni<Void> ensureChunkIndex(String chunkIndexName, Map<String, Integer> embeddingDimensions) {
         Uni<Void> chain = Uni.createFrom().voidItem();
-
         for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
             String fieldName = sanitizeEmbeddingFieldName(entry.getKey());
             int dimensions = entry.getValue();
-            String cacheKey = chunkIndexName + "|" + fieldName;
-
-            // Skip if we've already ensured this field exists in this JVM lifetime
-            if (ensuredFields.contains(cacheKey)) {
-                continue;
-            }
-
-            chain = chain.flatMap(v ->
-                    openSearchSchemaClient.nestedMappingExists(chunkIndexName, fieldName)
-                            .flatMap(exists -> {
-                                if (exists) {
-                                    ensuredFields.add(cacheKey);
-                                    return Uni.createFrom().voidItem();
-                                }
-                                return ensureFlatKnnField(chunkIndexName, fieldName, dimensions)
-                                        .invoke(() -> ensuredFields.add(cacheKey));
-                            })
-            );
+            chain = chain.flatMap(v -> indexKnnProvisioner.ensureKnnField(chunkIndexName, fieldName, dimensions));
         }
         return chain;
     }

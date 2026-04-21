@@ -4,6 +4,8 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
+import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
+import ai.pipestream.schemamanager.indexing.IndexKnnProvisioner;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
@@ -13,6 +15,7 @@ import io.quarkus.hibernate.reactive.panache.common.WithSession;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
@@ -40,6 +43,150 @@ public class SemanticConfigServiceEngine {
 
     private static final String PROVENANCE_SEMANTIC_CONFIG = "SEMANTIC_CONFIG";
     private static final String DEFAULT_RESULT_SET_NAME = "default";
+
+    @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
+    /**
+     * Single-path assignment flow.
+     *
+     * <p>Admin defines a SemanticConfig (shape: which granularities, which embedder),
+     * then calls this method to bind the config to a specific base index. This is
+     * where OpenSearch child indices are eagerly created — NOT on per-doc index
+     * time, and NOT on per-VectorSet create time.
+     *
+     * <p>For each child VectorSet under the SemanticConfig:
+     * <ul>
+     *   <li>Upsert a {@link VectorSetIndexBindingEntity} row (vectorSet ↔ indexName)</li>
+     *   <li>Call {@link IndexKnnProvisioner#ensureKnnField} to create the child
+     *       OpenSearch index + put the KNN vector field mapping for both
+     *       possible naming conventions (CHUNK_COMBINED and SEPARATE_INDICES)</li>
+     * </ul>
+     *
+     * <p>After this returns successfully, the hot path does zero OpenSearch
+     * metadata calls — every index and field is already in place.
+     *
+     * @param semanticConfigId the SemanticConfig to assign
+     * @param baseIndexName    the base OpenSearch index to provision child indices under
+     * @return Uni emitting the number of bindings provisioned
+     */
+    @WithTransaction
+    public Uni<Integer> assignToIndex(String semanticConfigId, String baseIndexName) {
+        if (baseIndexName == null || baseIndexName.isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("baseIndexName is required for assignment")
+                    .asRuntimeException());
+        }
+        return Panache.withTransaction(() ->
+                SemanticConfigEntity.<SemanticConfigEntity>findById(semanticConfigId)
+                        .onItem().transformToUni(sc -> {
+                            if (sc == null) {
+                                return Uni.createFrom().<Integer>failure(Status.NOT_FOUND
+                                        .withDescription("SemanticConfig not found: " + semanticConfigId)
+                                        .asRuntimeException());
+                            }
+                            return VectorSetEntity.findBySemanticConfigId(sc.id)
+                                    .onItem().transformToUni(vsList -> {
+                                        if (vsList.isEmpty()) {
+                                            LOG.warnf("SemanticConfig %s has no child VectorSets — nothing to bind", sc.id);
+                                            return Uni.createFrom().item(0);
+                                        }
+                                        LOG.infof("Assigning SemanticConfig %s to index %s: %d child VectorSets",
+                                                sc.id, baseIndexName, vsList.size());
+                                        return bindAllAndProvision(vsList, baseIndexName);
+                                    });
+                        }));
+    }
+
+    /**
+     * Binds + provisions every child VectorSet under a SemanticConfig.
+     *
+     * <p>All-or-nothing: a failure on any VectorSet throws, which rolls back
+     * the enclosing {@code @WithTransaction} so we never leave the DB with a
+     * binding row for an OpenSearch index that doesn't actually exist. Callers
+     * retry — the operation is idempotent (existing bindings are skipped,
+     * existing OpenSearch indices are cache hits).
+     */
+    private Uni<Integer> bindAllAndProvision(List<VectorSetEntity> vsList, String baseIndexName) {
+        Uni<Integer> chain = Uni.createFrom().item(0);
+        for (VectorSetEntity vs : vsList) {
+            // Do NOT swallow. A provisioning failure rolls back the transaction
+            // so the caller sees a real gRPC error with a real cause — not a
+            // "success" response with a silently-wrong binding row persisted.
+            chain = chain.chain(count -> upsertBindingAndProvision(vs, baseIndexName)
+                    .replaceWith(count + 1));
+        }
+        return chain;
+    }
+
+    private Uni<Void> upsertBindingAndProvision(VectorSetEntity vs, String baseIndexName) {
+        return VectorSetIndexBindingEntity.findBinding(vs.id, baseIndexName)
+                .onItem().transformToUni(existing -> {
+                    Uni<Void> bindingStep;
+                    if (existing != null) {
+                        bindingStep = Uni.createFrom().voidItem();
+                    } else {
+                        VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+                        binding.id = UUID.randomUUID().toString();
+                        binding.vectorSet = vs;
+                        binding.indexName = baseIndexName;
+                        binding.status = "ACTIVE";
+                        bindingStep = binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
+                    }
+                    return bindingStep.chain(() -> provisionOpenSearchIndexFor(vs, baseIndexName));
+                });
+    }
+
+    /**
+     * Eagerly creates the OpenSearch child indices + KNN field mappings for
+     * this vector set under the given base index, for BOTH possible naming
+     * conventions used by the two supported indexing strategies today.
+     * Idempotent — safe to call multiple times; warm cache skips work.
+     *
+     * <p>Failures propagate. Missing embedding model / dimensions / chunker
+     * are TREATED AS ERRORS, not silent skips — an unprovisioned vector set
+     * would later fail the hot path, so surface the problem loudly NOW where
+     * the admin sees it instead of silently later where a doc disappears.
+     */
+    private Uni<Void> provisionOpenSearchIndexFor(VectorSetEntity vs, String baseIndexName) {
+        if (vs.embeddingModelConfig == null) {
+            return Uni.createFrom().failure(Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has no embedding model — cannot provision")
+                    .asRuntimeException());
+        }
+        int dims = vs.vectorDimensions > 0 ? vs.vectorDimensions : vs.embeddingModelConfig.dimensions;
+        if (dims <= 0) {
+            return Uni.createFrom().failure(Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has no vector dimensions — cannot provision")
+                    .asRuntimeException());
+        }
+
+        // The semantic path leaves chunkerConfig null. Fall back to the
+        // semantic config id as the "chunk config id" segment so the
+        // index naming is stable per (semanticConfig, granularity).
+        String chunkConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id
+                : (vs.semanticConfig != null ? vs.semanticConfig.configId : null);
+        if (chunkConfigId == null || chunkConfigId.isBlank()) {
+            return Uni.createFrom().failure(Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has neither chunker config nor semantic config — cannot derive index name")
+                    .asRuntimeException());
+        }
+        String embeddingId = vs.embeddingModelConfig.id;
+
+        String combinedIndex = baseIndexName + "--chunk--"
+                + IndexKnnProvisioner.sanitizeForIndexName(chunkConfigId);
+        // CHUNK_COMBINED field naming — must match
+        // ChunkCombinedIndexingStrategy.sanitizeEmbeddingFieldName:
+        //   "em_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_")
+        String combinedField = "em_" + embeddingId.replaceAll("[^a-zA-Z0-9_]", "_");
+        String separateIndex = baseIndexName + "--vs--"
+                + IndexKnnProvisioner.sanitizeForIndexName(chunkConfigId)
+                + "--" + IndexKnnProvisioner.sanitizeForIndexName(embeddingId);
+
+        final int dimsFinal = dims;
+        return indexKnnProvisioner.ensureKnnField(combinedIndex, combinedField, dimsFinal)
+                .chain(() -> indexKnnProvisioner.ensureKnnField(separateIndex, "vector", dimsFinal));
+    }
 
     @WithTransaction
     public Uni<CreateSemanticConfigResponse> createSemanticConfig(CreateSemanticConfigRequest request) {
