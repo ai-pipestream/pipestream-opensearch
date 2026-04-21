@@ -1,0 +1,49 @@
+{
+  "_doc": [
+    "Q4: per-document end-to-end latency = max(event_timestamp) - min(event_timestamp).",
+    "Answers 'how long does a single doc actually take across the whole pipeline?'",
+    "Top 50 slowest docs in the last 1h. Use this to find pipeline outliers --",
+    "a doc that takes 30s while p95 is 2s usually points at a hot spot in one step.",
+    "Run against: GET pipeline-events-*/_search"
+  ],
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "event_timestamp": { "gte": "now-1h", "lt": "now" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_doc": {
+      "terms": {
+        "field": "document_id",
+        "size": 50,
+        "order": { "e2e_ms": "desc" }
+      },
+      "aggs": {
+        "first_seen": { "min": { "field": "event_timestamp" } },
+        "last_seen":  { "max": { "field": "event_timestamp" } },
+        "hops":       { "max": { "field": "hop_number" } },
+        "steps":      { "value_count": { "field": "node_id" } },
+        "total_step_ms": { "sum": { "field": "duration_ms" } },
+        "e2e_ms": {
+          "bucket_script": {
+            "buckets_path": { "first": "first_seen", "last": "last_seen" },
+            "script": "params.last - params.first"
+          }
+        },
+        "wall_minus_step": {
+          "bucket_script": {
+            "buckets_path": {
+              "first": "first_seen",
+              "last":  "last_seen",
+              "stepms": "total_step_ms"
+            },
+            "script": "(params.last - params.first) - params.stepms"
+          }
+        }
+      }
+    }
+  }
+}

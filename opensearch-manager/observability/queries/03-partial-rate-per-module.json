@@ -1,0 +1,48 @@
+{
+  "_doc": [
+    "Q3: PARTIAL rate per module_id, last 1h.",
+    "Answers 'is silent error degradation eating throughput?'",
+    "Look at by_module.partial_rate.value (0.0 = clean, 1.0 = every call partial).",
+    "Run against: GET pipeline-events-*/_search"
+  ],
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "event_timestamp": { "gte": "now-1h", "lt": "now" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_module": {
+      "terms": { "field": "module_id", "size": 50 },
+      "aggs": {
+        "by_status": {
+          "terms": { "field": "status", "size": 5 }
+        },
+        "partial_count": {
+          "filter": { "term": { "status": "PARTIAL" } }
+        },
+        "total_count": {
+          "value_count": { "field": "status" }
+        },
+        "partial_rate": {
+          "bucket_script": {
+            "buckets_path": {
+              "partials": "partial_count._count",
+              "totals":   "total_count"
+            },
+            "script": "params.totals == 0 ? 0 : params.partials / params.totals"
+          }
+        },
+        "recent_errors": {
+          "top_hits": {
+            "size": 3,
+            "sort": [{ "event_timestamp": { "order": "desc" } }],
+            "_source": { "includes": ["event_timestamp", "document_id", "status", "error_code", "error_message"] }
+          }
+        }
+      }
+    }
+  }
+}

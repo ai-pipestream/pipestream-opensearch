@@ -54,6 +54,11 @@ dependencies {
     implementation libs.quarkus.arc
     implementation libs.quarkus.rest.jackson
     implementation libs.quarkus.grpc
+    // Micrometer for bulk-queue telemetry (queue depth gauge, flush counter,
+    // items-per-flush histogram, flush duration). Needed to tune
+    // queue-count × capacity × flush-interval under real load.
+    implementation 'io.quarkus:quarkus-micrometer'
+    implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-stork'
     implementation 'io.quarkus:quarkus-messaging-kafka'
     implementation 'io.quarkus:quarkus-jdbc-postgresql'

@@ -1,0 +1,36 @@
+{
+  "_doc": [
+    "Q1: per-instance throughput, last 1h, 1-minute buckets.",
+    "Answers 'is one engine instance starved or hot?'",
+    "Run against: GET pipeline-events-*/_search",
+    "Returns 0 hits because size=0; look at aggregations.by_instance.over_time."
+  ],
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "event_timestamp": { "gte": "now-1h", "lt": "now" } } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_instance": {
+      "terms": { "field": "service_instance_id", "size": 50, "missing": "(unknown)" },
+      "aggs": {
+        "over_time": {
+          "date_histogram": {
+            "field": "event_timestamp",
+            "fixed_interval": "1m",
+            "min_doc_count": 0,
+            "extended_bounds": { "min": "now-1h", "max": "now" }
+          },
+          "aggs": {
+            "docs_completed": {
+              "cardinality": { "field": "document_id", "precision_threshold": 4000 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

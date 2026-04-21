@@ -1,0 +1,69 @@
+{
+  "index_patterns": ["pipeline-events-*"],
+  "priority": 100,
+  "_meta": {
+    "owner": "pipestream-opensearch",
+    "purpose": "Per-step execution telemetry written by PipelineEventConsumer.",
+    "source_topic": "pipeline-events",
+    "source_record": "ai.pipestream.data.v1.StepExecutionRecord"
+  },
+  "template": {
+    "settings": {
+      "index": {
+        "number_of_shards": 1,
+        "number_of_replicas": 0,
+        "refresh_interval": "5s",
+        "codec": "best_compression"
+      }
+    },
+    "mappings": {
+      "dynamic": "true",
+      "date_detection": false,
+      "properties": {
+        "event_timestamp":  { "type": "date", "format": "epoch_millis" },
+        "indexed_at":       { "type": "date", "format": "epoch_millis" },
+
+        "document_id":         { "type": "keyword" },
+        "account_id":          { "type": "keyword" },
+        "stream_id":           { "type": "keyword" },
+        "graph_id":            { "type": "keyword" },
+        "node_id":             { "type": "keyword" },
+        "module_id":           { "type": "keyword" },
+        "service_instance_id": { "type": "keyword" },
+        "status":              { "type": "keyword" },
+        "error_code":          { "type": "keyword" },
+        "error_message":       { "type": "text" },
+
+        "hop_number":                 { "type": "integer" },
+        "duration_ms":                { "type": "long" },
+        "log_entry_count":            { "type": "integer" },
+        "log_entries_stored_count":   { "type": "integer" },
+        "log_entries_dropped_count":  { "type": "integer" },
+        "log_entries_total_chars":    { "type": "integer" },
+        "log_entries_truncated":      { "type": "boolean" },
+
+        "log_entries": {
+          "type": "object",
+          "enabled": true,
+          "properties": {
+            "timestamp_epoch_ms":  { "type": "date", "format": "epoch_millis" },
+            "level":               { "type": "keyword" },
+            "source":              { "type": "keyword" },
+            "module_name":         { "type": "keyword" },
+            "engine_node_id":      { "type": "keyword" },
+            "message":             { "type": "text" },
+            "message_truncated":   { "type": "boolean" }
+          }
+        },
+
+        "semantic_manager_telemetry": {
+          "type": "object",
+          "dynamic": "true"
+        }
+      }
+    },
+    "aliases": {
+      "pipeline-events": {}
+    }
+  }
+}
