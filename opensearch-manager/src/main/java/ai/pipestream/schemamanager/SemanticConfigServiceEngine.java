@@ -78,11 +78,18 @@ public class SemanticConfigServiceEngine {
                     .asRuntimeException());
         }
         return Panache.withTransaction(() ->
+                // Accept either the UUID primary key OR the stable configId
+                // (e.g. "default-semantic"). Admin UIs and test harnesses
+                // commonly know the stable name, not the generated UUID.
                 SemanticConfigEntity.<SemanticConfigEntity>findById(semanticConfigId)
+                        .onItem().transformToUni(byId -> byId != null
+                                ? Uni.createFrom().item(byId)
+                                : SemanticConfigEntity.findByConfigId(semanticConfigId))
                         .onItem().transformToUni(sc -> {
                             if (sc == null) {
                                 return Uni.createFrom().<Integer>failure(Status.NOT_FOUND
-                                        .withDescription("SemanticConfig not found: " + semanticConfigId)
+                                        .withDescription("SemanticConfig not found (tried as id and configId): "
+                                                + semanticConfigId)
                                         .asRuntimeException());
                             }
                             return VectorSetEntity.findBySemanticConfigId(sc.id)
