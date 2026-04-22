@@ -62,6 +62,35 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
     }
 
     @Override
+    public Uni<Boolean> ensurePlainIndex(String indexName) {
+        return Uni.createFrom().item(() -> {
+            try {
+                if (indexExists(indexName)) {
+                    return true;
+                }
+                var settings = new IndexSettings.Builder().knn(true).build();
+                var createRequest = new org.opensearch.client.opensearch.indices.CreateIndexRequest.Builder()
+                        .index(indexName)
+                        .settings(settings)
+                        .build();
+                return client.indices().create(createRequest).acknowledged();
+            } catch (org.opensearch.client.opensearch._types.OpenSearchException e) {
+                if (isIndexExistsError(e)) {
+                    return true;
+                }
+                throw new RuntimeException("Failed to ensure plain index " + indexName, e);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to ensure plain index " + indexName, e);
+            }
+        })
+        .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
+        .onFailure(this::isRetryable)
+        .retry()
+        .withBackOff(Duration.ofMillis(250), Duration.ofSeconds(3))
+        .atMost(6);
+    }
+
+    @Override
     public Uni<Boolean> createIndexWithNestedMapping(String indexName, String nestedFieldName, VectorFieldDefinition vectorFieldDefinition) {
         return Uni.createFrom().item(() -> {
             try {

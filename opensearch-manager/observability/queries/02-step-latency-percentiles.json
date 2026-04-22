@@ -1,0 +1,33 @@
+{
+  "_doc": [
+    "Q2: p50/p95/p99 duration_ms per module_id, last 1h.",
+    "Answers 'which step is slow?'",
+    "Run against: GET pipeline-events-*/_search"
+  ],
+  "size": 0,
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "event_timestamp": { "gte": "now-1h", "lt": "now" } } },
+        { "terms": { "status": ["SUCCESS", "PARTIAL"] } }
+      ]
+    }
+  },
+  "aggs": {
+    "by_module": {
+      "terms": { "field": "module_id", "size": 50, "order": { "p95": "desc" } },
+      "aggs": {
+        "calls":  { "value_count": { "field": "duration_ms" } },
+        "p50":    { "percentiles": { "field": "duration_ms", "percents": [50] } },
+        "p95":    { "percentiles": { "field": "duration_ms", "percents": [95] } },
+        "p99":    { "percentiles": { "field": "duration_ms", "percents": [99] } },
+        "by_node": {
+          "terms": { "field": "node_id", "size": 20 },
+          "aggs": {
+            "p95_node": { "percentiles": { "field": "duration_ms", "percents": [95] } }
+          }
+        }
+      }
+    }
+  }
+}

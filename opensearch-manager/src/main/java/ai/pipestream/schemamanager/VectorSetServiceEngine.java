@@ -45,6 +45,9 @@ public class VectorSetServiceEngine {
     @Inject
     VectorSetResolutionMetrics resolutionMetrics;
 
+    @Inject
+    ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
+
     @WithTransaction
     public Uni<CreateVectorSetResponse> createVectorSet(CreateVectorSetRequest request) {
         return Panache.withTransaction(() -> {
@@ -426,7 +429,11 @@ public class VectorSetServiceEngine {
                         return Uni.createFrom().item(saved);
                     }
                     return Uni.createFrom().failure(err);
-                });
+                })
+                // The hot path's IndexBindingCache must reload after any write
+                // touching this index. Fire-and-forget invalidation keeps this
+                // method's contract identical to before.
+                .invoke(vs -> bindingCache.invalidate(indexName));
     }
 
     /**

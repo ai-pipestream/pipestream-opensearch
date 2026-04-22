@@ -4,6 +4,8 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
+import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
+import ai.pipestream.schemamanager.indexing.IndexKnnProvisioner;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
@@ -13,6 +15,7 @@ import io.quarkus.hibernate.reactive.panache.common.WithSession;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
@@ -40,6 +43,245 @@ public class SemanticConfigServiceEngine {
 
     private static final String PROVENANCE_SEMANTIC_CONFIG = "SEMANTIC_CONFIG";
     private static final String DEFAULT_RESULT_SET_NAME = "default";
+
+    @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
+    @Inject
+    ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
+
+    /**
+     * Result of binding a SemanticConfig to a base index.
+     *
+     * @param bindingsProvisioned number of vector_set_index_binding rows that
+     *                            now exist for {@code baseIndexName} under this
+     *                            semantic config (newly created OR pre-existing).
+     * @param sideIndicesTouched  every OpenSearch side index that was created
+     *                            or confirmed-present by this call (parent
+     *                            index NOT included — that's the caller's job).
+     *                            Names are returned in deterministic insertion
+     *                            order, which simplifies test assertions.
+     */
+    public record AssignmentResult(int bindingsProvisioned, java.util.List<String> sideIndicesTouched) {}
+
+    /**
+     * Single-path assignment flow.
+     *
+     * <p>Admin defines a SemanticConfig (shape: which granularities, which embedder),
+     * then calls this method to bind the config to a specific base index. This is
+     * where OpenSearch child indices are eagerly created — NOT on per-doc index
+     * time, and NOT on per-VectorSet create time.
+     *
+     * <p>For each child VectorSet under the SemanticConfig:
+     * <ul>
+     *   <li>Upsert a {@link VectorSetIndexBindingEntity} row (vectorSet ↔ indexName)</li>
+     *   <li>Call {@link IndexKnnProvisioner#ensureKnnField} to create the child
+     *       OpenSearch index + put the KNN vector field mapping for both
+     *       possible naming conventions (CHUNK_COMBINED and SEPARATE_INDICES)</li>
+     * </ul>
+     *
+     * <p>After this returns successfully, the hot path does zero OpenSearch
+     * metadata calls — every index and field is already in place.
+     *
+     * @param semanticConfigId the SemanticConfig to assign
+     * @param baseIndexName    the base OpenSearch index to provision child indices under
+     * @return Uni emitting the number of bindings provisioned. Use
+     *         {@link #assignToIndexDetailed} when you need the list of side
+     *         indices that were touched (for callers that want to surface them
+     *         in their response, e.g. the ProvisionIndex RPC).
+     */
+    public Uni<Integer> assignToIndex(String semanticConfigId, String baseIndexName) {
+        return assignToIndexDetailed(semanticConfigId, baseIndexName)
+                .map(AssignmentResult::bindingsProvisioned);
+    }
+
+    /**
+     * Same as {@link #assignToIndex} but returns the full {@link AssignmentResult}
+     * so callers can surface which side indices were touched.
+     *
+     * <p>Two-phase to satisfy Hibernate Reactive's thread-affinity rules:
+     * <ol>
+     *   <li><b>Phase 1 ({@link #persistBindings})</b> — pure DB work inside a
+     *       single {@code @WithTransaction}: load the SemanticConfig + child
+     *       VectorSets, upsert binding rows, and project everything we need
+     *       for the OpenSearch step into plain Java records (so we don't
+     *       touch any Hibernate-managed entity outside the transaction).</li>
+     *   <li><b>Phase 2 ({@link #provisionAllSideIndices})</b> — OpenSearch
+     *       I/O ONLY, after the transaction has committed. Each
+     *       {@code ensureKnnField} call shifts execution to the worker pool
+     *       internally; that's safe now because the Hibernate session is
+     *       already closed and we never reach back into it.</li>
+     * </ol>
+     *
+     * <p>Why split: the previous "everything in one chain inside
+     * {@code @WithTransaction}" design failed with HR000068/HR000069 because
+     * the transaction commit had to return to Hibernate after the chain had
+     * been shifted onto the OpenSearch worker pool by {@code ensureKnnField}.
+     * Hibernate Reactive requires the closing thread to match the opening
+     * thread (event loop), so commit blew up — and {@code @WithTransaction}
+     * then masked the OpenSearch work that DID succeed by rolling back the
+     * binding rows.
+     *
+     * <p>Trade-off: if Phase 2 fails, the binding rows in Postgres are
+     * already committed but the OpenSearch side indices are missing. Re-running
+     * the call is idempotent — it skips the existing binding (cache hit) and
+     * retries the OpenSearch creation. The hot path's lazy fallback also
+     * covers the gap. This is strictly better than the previous "fail closed
+     * but also fail at all" behaviour.
+     */
+    public Uni<AssignmentResult> assignToIndexDetailed(String semanticConfigId, String baseIndexName) {
+        if (baseIndexName == null || baseIndexName.isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("baseIndexName is required for assignment")
+                    .asRuntimeException());
+        }
+        return persistBindings(semanticConfigId, baseIndexName)
+                .onItem().transformToUni(specs -> provisionAllSideIndices(specs, baseIndexName));
+    }
+
+    /**
+     * Side-index plan produced by Phase 1 and consumed by Phase 2. Plain
+     * record so it survives the boundary out of {@code @WithTransaction}
+     * without any Hibernate Session reachability.
+     */
+    record SideIndexSpec(String vectorSetId, String chunkConfigId, String embeddingId, int dimensions) {}
+
+    /**
+     * Phase 1: persists binding rows and projects the data Phase 2 needs
+     * into pojo {@link SideIndexSpec}s. Runs entirely on the Vert.x event
+     * loop inside a single transaction. Returns an empty list when the
+     * SemanticConfig has no children — Phase 2 then becomes a no-op.
+     */
+    @WithTransaction
+    protected Uni<List<SideIndexSpec>> persistBindings(String semanticConfigId, String baseIndexName) {
+        return Panache.withTransaction(() ->
+                // Accept either the UUID primary key OR the stable configId
+                // (e.g. "default-semantic"). Admin UIs and test harnesses
+                // commonly know the stable name, not the generated UUID.
+                SemanticConfigEntity.<SemanticConfigEntity>findById(semanticConfigId)
+                        .onItem().transformToUni(byId -> byId != null
+                                ? Uni.createFrom().item(byId)
+                                : SemanticConfigEntity.findByConfigId(semanticConfigId))
+                        .onItem().transformToUni(sc -> {
+                            if (sc == null) {
+                                return Uni.createFrom().<List<SideIndexSpec>>failure(Status.NOT_FOUND
+                                        .withDescription("SemanticConfig not found (tried as id and configId): "
+                                                + semanticConfigId)
+                                        .asRuntimeException());
+                            }
+                            return VectorSetEntity.findBySemanticConfigConfigId(sc.configId)
+                                    .onItem().transformToUni(vsList -> {
+                                        if (vsList.isEmpty()) {
+                                            LOG.warnf("SemanticConfig %s (configId=%s) has no child VectorSets — nothing to bind",
+                                                    sc.id, sc.configId);
+                                            return Uni.createFrom().item(java.util.List.<SideIndexSpec>of());
+                                        }
+                                        LOG.infof("Assigning SemanticConfig %s to index %s: %d child VectorSets",
+                                                sc.id, baseIndexName, vsList.size());
+                                        return upsertAllBindings(vsList, baseIndexName);
+                                    });
+                        }));
+    }
+
+    private Uni<List<SideIndexSpec>> upsertAllBindings(List<VectorSetEntity> vsList, String baseIndexName) {
+        List<SideIndexSpec> specs = new ArrayList<>(vsList.size());
+        Uni<Void> chain = Uni.createFrom().voidItem();
+        for (VectorSetEntity vs : vsList) {
+            chain = chain.chain(() -> upsertBinding(vs, baseIndexName)
+                    .invoke(() -> specs.add(toSpec(vs)))
+                    .replaceWithVoid());
+        }
+        return chain.replaceWith(specs);
+    }
+
+    private Uni<Void> upsertBinding(VectorSetEntity vs, String baseIndexName) {
+        return VectorSetIndexBindingEntity.findBinding(vs.id, baseIndexName)
+                .onItem().transformToUni(existing -> {
+                    if (existing != null) {
+                        return Uni.createFrom().voidItem();
+                    }
+                    VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+                    binding.id = UUID.randomUUID().toString();
+                    binding.vectorSet = vs;
+                    binding.indexName = baseIndexName;
+                    binding.status = "ACTIVE";
+                    return binding.<VectorSetIndexBindingEntity>persist().replaceWithVoid();
+                });
+    }
+
+    /**
+     * Project a {@link VectorSetEntity} into a session-independent
+     * {@link SideIndexSpec} for Phase 2. Also enforces every precondition
+     * the OpenSearch step needs (embedding model present, dimensions > 0,
+     * derivable chunk-config id) — surfaces violations as
+     * {@code FAILED_PRECONDITION} BEFORE Phase 2 starts so we don't half-bind.
+     */
+    private SideIndexSpec toSpec(VectorSetEntity vs) {
+        if (vs.embeddingModelConfig == null) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has no embedding model — cannot provision")
+                    .asRuntimeException();
+        }
+        int dims = vs.vectorDimensions > 0 ? vs.vectorDimensions : vs.embeddingModelConfig.dimensions;
+        if (dims <= 0) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has no vector dimensions — cannot provision")
+                    .asRuntimeException();
+        }
+        // The semantic path leaves chunkerConfig null. Fall back to the
+        // semantic config id as the "chunk config id" segment so the
+        // index naming is stable per (semanticConfig, granularity).
+        String chunkConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id
+                : (vs.semanticConfig != null ? vs.semanticConfig.configId : null);
+        if (chunkConfigId == null || chunkConfigId.isBlank()) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " has neither chunker config nor semantic config — cannot derive index name")
+                    .asRuntimeException();
+        }
+        return new SideIndexSpec(vs.id, chunkConfigId, vs.embeddingModelConfig.id, dims);
+    }
+
+    /**
+     * Phase 2: walks the {@link SideIndexSpec} list and provisions both the
+     * CHUNK_COMBINED and SEPARATE_INDICES side index for every spec. Pure
+     * OpenSearch I/O — no Hibernate.
+     *
+     * <p>Returns even when the spec list is empty (degenerate
+     * "no children to bind" case) — the caller still wants the
+     * {@link AssignmentResult} so it can include 0 in its tally.
+     *
+     * <p>Cache invalidation happens at the END regardless of partial
+     * provisioning failures: the binding rows are already committed, so
+     * the cache MUST drop the stale snapshot or the next index call will
+     * miss the fresh bindings.
+     */
+    private Uni<AssignmentResult> provisionAllSideIndices(List<SideIndexSpec> specs, String baseIndexName) {
+        if (specs.isEmpty()) {
+            return Uni.createFrom().item(new AssignmentResult(0, java.util.List.of()));
+        }
+        java.util.List<String> touched = new java.util.ArrayList<>(specs.size() * 2);
+        Uni<Void> chain = Uni.createFrom().voidItem();
+        for (SideIndexSpec spec : specs) {
+            String combinedIndex = baseIndexName + "--chunk--"
+                    + IndexKnnProvisioner.sanitizeForIndexName(spec.chunkConfigId());
+            // CHUNK_COMBINED field naming — must match
+            // ChunkCombinedIndexingStrategy.sanitizeEmbeddingFieldName:
+            //   "em_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_")
+            String combinedField = "em_" + spec.embeddingId().replaceAll("[^a-zA-Z0-9_]", "_");
+            String separateIndex = baseIndexName + "--vs--"
+                    + IndexKnnProvisioner.sanitizeForIndexName(spec.chunkConfigId())
+                    + "--" + IndexKnnProvisioner.sanitizeForIndexName(spec.embeddingId());
+
+            chain = chain
+                    .chain(() -> indexKnnProvisioner.ensureKnnField(combinedIndex, combinedField, spec.dimensions()))
+                    .invoke(() -> touched.add(combinedIndex))
+                    .chain(() -> indexKnnProvisioner.ensureKnnField(separateIndex, "vector", spec.dimensions()))
+                    .invoke(() -> touched.add(separateIndex));
+        }
+        return chain
+                .invoke(() -> bindingCache.invalidate(baseIndexName))
+                .map(v -> new AssignmentResult(specs.size(), java.util.List.copyOf(touched)));
+    }
 
     @WithTransaction
     public Uni<CreateSemanticConfigResponse> createSemanticConfig(CreateSemanticConfigRequest request) {
@@ -178,7 +420,7 @@ public class SemanticConfigServiceEngine {
                         .withDescription("SemanticConfig not found: " + request.getId())
                         .asRuntimeException());
             }
-            return VectorSetEntity.findBySemanticConfigId(entity.id)
+            return VectorSetEntity.findBySemanticConfigConfigId(entity.configId)
                     .map(children -> {
                         List<String> ids = children.stream().map(vs -> vs.id).toList();
                         return GetSemanticConfigResponse.newBuilder()
@@ -224,8 +466,11 @@ public class SemanticConfigServiceEngine {
                                         .setMessage("Not found: " + request.getId())
                                         .build());
                             }
-                            // Delete child VectorSets first, then the config
-                            return VectorSetEntity.findBySemanticConfigId(entity.id)
+                            // Delete child VectorSets first, then the config.
+                            // Children are looked up by the parent's stable
+                            // configId (NOT the UUID id) — see the entity
+                            // method's javadoc.
+                            return VectorSetEntity.findBySemanticConfigConfigId(entity.configId)
                                     .onItem().transformToUni(children -> {
                                         if (children.isEmpty()) {
                                             return entity.delete()

@@ -1,7 +1,12 @@
 package ai.pipestream.schemamanager.bulk;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.runtime.StartupEvent;
+import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
@@ -15,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 @ApplicationScoped
 public class BulkQueueSetBean {
@@ -27,13 +33,50 @@ public class BulkQueueSetBean {
     @Inject
     BulkIndexingConfig config;
 
+    @Inject
+    MeterRegistry meterRegistry;
+
     private volatile BulkQueueSet queueSet;
 
-    void onStartup(@Observes StartupEvent event) {
+    // Micrometer instruments — populated in onStartup so the queueSet reference
+    // is ready before Micrometer scrapes the gauges.
+    private Counter flushTotalCounter;
+    private Counter flushErrorCounter;
+    private Counter itemsFailedCounter;
+    private DistributionSummary flushItemsSummary;
+    private Timer flushDurationTimer;
+
+    void onStartup(@Observes @Priority(Integer.MAX_VALUE) StartupEvent event) {
         queueSet = new BulkQueueSet(
                 config.queueCount(), config.capacity(), config.flushIntervalMs(),
                 this::handleFlush);
         queueSet.start();
+        // Gauge backed by BulkQueueSet#totalPending — Micrometer polls whenever the
+        // registry is scraped. Gives live queue depth across every queue without
+        // extra counters on the hot submit path.
+        meterRegistry.gauge("opensearch_bulk_queue_depth_total", this, b ->
+                b.queueSet == null ? 0 : b.queueSet.totalPending());
+        meterRegistry.gauge("opensearch_bulk_queue_count", this, b ->
+                b.queueSet == null ? 0 : b.queueSet.getQueueCount());
+        meterRegistry.gauge("opensearch_bulk_queue_capacity", this, b ->
+                b.queueSet == null ? 0 : b.queueSet.getCapacity());
+        flushTotalCounter = Counter.builder("opensearch_bulk_flush_total")
+                .description("Bulk flushes attempted since JVM start (success + error).")
+                .register(meterRegistry);
+        flushErrorCounter = Counter.builder("opensearch_bulk_flush_error_total")
+                .description("Bulk flushes that threw on the OpenSearch round-trip.")
+                .register(meterRegistry);
+        itemsFailedCounter = Counter.builder("opensearch_bulk_items_failed_total")
+                .description("Per-item failures inside an otherwise-successful bulk response.")
+                .register(meterRegistry);
+        flushItemsSummary = DistributionSummary.builder("opensearch_bulk_flush_items")
+                .description("Items per flush — tunes queue-count × capacity × flush-interval.")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meterRegistry);
+        flushDurationTimer = Timer.builder("opensearch_bulk_flush_duration")
+                .description("Wall-clock per bulk round-trip to OpenSearch.")
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meterRegistry);
         LOG.infof("BulkQueueSetBean started: %d queues, capacity=%d, flushInterval=%dms",
                 config.queueCount(), config.capacity(), config.flushIntervalMs());
     }
@@ -81,6 +124,9 @@ public class BulkQueueSetBean {
      * off bulk completions.
      */
     private void handleFlush(List<BulkIndexItem> batch) {
+        flushTotalCounter.increment();
+        flushItemsSummary.record(batch.size());
+        long startNanos = System.nanoTime();
         try {
             BulkRequest.Builder br = new BulkRequest.Builder();
             for (BulkIndexItem item : batch) {
@@ -96,10 +142,12 @@ public class BulkQueueSetBean {
             }
 
             BulkResponse response = openSearchAsyncClient.bulk(br.build()).get();
+            flushDurationTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
 
             if (response.errors()) {
                 long errorCount = response.items().stream()
                         .filter(item -> item.error() != null).count();
+                itemsFailedCounter.increment(errorCount);
                 LOG.warnf("Bulk flush had %d errors out of %d items", errorCount, batch.size());
             } else {
                 LOG.debugf("Bulk flush succeeded: %d items", batch.size());
@@ -131,6 +179,8 @@ public class BulkQueueSetBean {
                 }
             }
         } catch (Exception e) {
+            flushErrorCounter.increment();
+            flushDurationTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
             LOG.errorf(e, "Bulk flush failed for batch of %d items", batch.size());
             for (BulkIndexItem item : batch) {
                 if (item.resultFuture() != null) {

@@ -8,6 +8,7 @@ import io.smallrye.mutiny.Uni;
 import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.util.*;
@@ -40,6 +41,23 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     @Inject
     KnnIndexConfig knnConfig;
+
+    @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
+    /**
+     * When false (default), {@code nlp_analysis.sentences} is stripped from the
+     * parent/base document before indexing. Per-sentence NLP is already
+     * denormalized onto each chunk document via {@code chunk_analytics}, so
+     * keeping it on the parent is pure duplication — and it's typically the
+     * heaviest field in the parent (tens of KB per doc on long text). Strip
+     * drops per-doc parent payload dramatically, which is what lets the sink's
+     * OSM bulk flush keep up under load. Set to {@code true} explicitly if a
+     * downstream consumer needs doc-level aggregations over sentence spans.
+     */
+    @ConfigProperty(name = "pipestream.opensearch.base-doc.include-sentence-nlp",
+            defaultValue = "false")
+    boolean includeSentenceNlpInBaseDoc;
 
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
@@ -158,6 +176,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 @SuppressWarnings("unchecked")
                 Map<String, Object> docAsMap = objectMapper.readValue(jsonDoc, Map.class);
                 sanitizePunctuationCounts(docAsMap);
+                if (!includeSentenceNlpInBaseDoc) {
+                    stripSentenceLevelNlp(docAsMap);
+                }
                 return docAsMap;
             } catch (Exception e) {
                 LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", indexName, documentId);
@@ -293,7 +314,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
      * Replaces non-alphanumeric characters (except _ and -) with _.
      */
     static String sanitizeForIndexName(String input) {
-        return input.replaceAll("[^a-zA-Z0-9_\\-]", "_").toLowerCase();
+        return IndexKnnProvisioner.sanitizeForIndexName(input);
     }
 
     // ===== Chunk index processing =====
@@ -333,31 +354,15 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     /**
      * Ensures the chunk index exists with KNN-enabled vector fields for each embedding model.
+     * Delegates to {@link IndexKnnProvisioner} — on the hot path this is O(1) cache
+     * lookups because eager provisioning at VectorSet-create time already populated the cache.
      */
     private Uni<Void> ensureChunkIndex(String chunkIndexName, Map<String, Integer> embeddingDimensions) {
         Uni<Void> chain = Uni.createFrom().voidItem();
-
         for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
             String fieldName = sanitizeEmbeddingFieldName(entry.getKey());
             int dimensions = entry.getValue();
-            String cacheKey = chunkIndexName + "|" + fieldName;
-
-            // Skip if we've already ensured this field exists in this JVM lifetime
-            if (ensuredFields.contains(cacheKey)) {
-                continue;
-            }
-
-            chain = chain.flatMap(v ->
-                    openSearchSchemaClient.nestedMappingExists(chunkIndexName, fieldName)
-                            .flatMap(exists -> {
-                                if (exists) {
-                                    ensuredFields.add(cacheKey);
-                                    return Uni.createFrom().voidItem();
-                                }
-                                return ensureFlatKnnField(chunkIndexName, fieldName, dimensions)
-                                        .invoke(() -> ensuredFields.add(cacheKey));
-                            })
-            );
+            chain = chain.flatMap(v -> indexKnnProvisioner.ensureKnnField(chunkIndexName, fieldName, dimensions));
         }
         return chain;
     }
@@ -592,6 +597,23 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Removes per-sentence NLP detail from the parent document's
+     * {@code nlp_analysis.sentences} list, keeping only doc-level aggregates
+     * ({@code noun_density}, {@code lexical_density}, {@code total_tokens},
+     * {@code detected_language}, etc.). Sentence-level analytics already ride
+     * on each chunk document's {@code chunk_analytics}, so dropping the parent
+     * copy removes ~90% of the parent payload on long text without losing any
+     * search capability.
+     */
+    @SuppressWarnings("unchecked")
+    private void stripSentenceLevelNlp(Map<String, Object> docMap) {
+        Object nlpRaw = docMap.get("nlp_analysis");
+        if (nlpRaw instanceof Map) {
+            ((Map<String, Object>) nlpRaw).remove("sentences");
         }
     }
 

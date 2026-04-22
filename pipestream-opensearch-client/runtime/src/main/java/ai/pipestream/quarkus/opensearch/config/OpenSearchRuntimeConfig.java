@@ -50,14 +50,15 @@ public interface OpenSearchRuntimeConfig {
 
     /**
      * Maximum number of connections in the connection pool.
+     * Default tuned for a single dedicated OS instance with fast storage; lower in shared/cloud setups.
      */
-    @WithDefault("20")
+    @WithDefault("128")
     int maxConnections();
 
     /**
-     * Maximum connections per route.
+     * Maximum connections per route. When all traffic targets one OS host this should match maxConnections.
      */
-    @WithDefault("10")
+    @WithDefault("128")
     int maxConnectionsPerRoute();
 
     /**

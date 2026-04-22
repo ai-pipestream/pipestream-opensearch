@@ -27,4 +27,21 @@ public interface OpenSearchSchemaService {
      */
     Uni<Boolean> createIndexWithNestedMapping(String indexName, String nestedFieldName, VectorFieldDefinition vectorFieldDefinition);
 
+    /**
+     * Ensures a plain parent index exists with KNN settings enabled (so KNN
+     * field mappings can be added later without recreating the index).
+     *
+     * <p>Used by the {@code ProvisionIndex} admin RPC for the parent document
+     * index — the side indices that actually hold vectors are created
+     * separately by {@link ai.pipestream.schemamanager.indexing.IndexKnnProvisioner}
+     * during semantic-config binding.
+     *
+     * <p>Idempotent: if the index already exists this is a no-op (returns
+     * {@code true}). No mappings are touched on existing indices.
+     *
+     * @param indexName name of the parent index to ensure
+     * @return Uni emitting {@code true} on success
+     */
+    Uni<Boolean> ensurePlainIndex(String indexName);
+
 }
