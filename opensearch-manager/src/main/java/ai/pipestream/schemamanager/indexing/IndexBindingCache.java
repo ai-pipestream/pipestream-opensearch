@@ -91,6 +91,10 @@ public class IndexBindingCache {
     @ConfigProperty(name = "pipestream.opensearch-manager.binding-cache.ttl-seconds", defaultValue = "300")
     long ttlSeconds;
 
+    /** CDI; {@link #ttlSeconds} is injected from configuration. */
+    public IndexBindingCache() {
+    }
+
     /**
      * Loaded snapshot of the bindings for a single OpenSearch index.
      *
@@ -110,16 +114,31 @@ public class IndexBindingCache {
             long loadedAtMs
     ) {
 
+        /**
+         * Whether this cache entry is older than the configured TTL.
+         *
+         * @param ttlSeconds TTL in seconds
+         * @return true if the entry should be refreshed
+         */
         public boolean isExpired(long ttlSeconds) {
             return System.currentTimeMillis() - loadedAtMs > Duration.ofSeconds(ttlSeconds).toMillis();
         }
 
-        /** True once this index's OS field mapping has been confirmed in this JVM. */
+        /**
+         * True once this index's OS field mapping has been confirmed in this JVM.
+         *
+         * @param fieldName nested vector field name
+         * @return whether the field has been verified against a live mapping
+         */
         public boolean isOsFieldVerified(String fieldName) {
             return verifiedOsFields.contains(fieldName);
         }
 
-        /** Mark the OS field mapping confirmed; idempotent and thread-safe. */
+        /**
+         * Mark the OS field mapping confirmed; idempotent and thread-safe.
+         *
+         * @param fieldName nested vector field name
+         */
         public void markOsFieldVerified(String fieldName) {
             verifiedOsFields.add(fieldName);
         }
@@ -128,6 +147,13 @@ public class IndexBindingCache {
     /**
      * Immutable mapping descriptor: everything {@code NestedIndexingStrategy}
      * needs to write a doc without going back to the DB or OpenSearch.
+     *
+     * @param vectorSetId      canonical vector set id
+     * @param fieldName        OpenSearch nested field name for vectors
+     * @param dimensions       vector dimension count
+     * @param semanticConfigId semantic config id bound to this vector set, or {@code null}
+     * @param granularity      granularity label from the vector set
+     * @param name             human-readable vector set name
      */
     public record VectorSetMapping(
             String vectorSetId,
@@ -138,6 +164,12 @@ public class IndexBindingCache {
             String name
     ) {
 
+        /**
+         * Builds a mapping from a loaded {@link VectorSetEntity}.
+         *
+         * @param vs persisted vector set row
+         * @return mapping snapshot
+         */
         public static VectorSetMapping fromEntity(VectorSetEntity vs) {
             String semanticConfigId = vs.semanticConfig != null ? vs.semanticConfig.configId : null;
             return new VectorSetMapping(
@@ -156,6 +188,10 @@ public class IndexBindingCache {
      * entry on miss. Returns {@code null} (inside the {@link Uni}) when the
      * index has no binding for this vector set — caller MUST convert to
      * {@link IllegalStateException}.
+     *
+     * @param indexName   OpenSearch index name
+     * @param vectorSetId canonical vector set id
+     * @return mapping inside a {@link Uni}, or {@code null} when unbound
      */
     public Uni<VectorSetMapping> lookupByVectorSetId(String indexName, String vectorSetId) {
         return getOrLoad(indexName).map(entry -> entry.byVectorSetId.get(vectorSetId));
@@ -164,6 +200,11 @@ public class IndexBindingCache {
     /**
      * Lookup by ({@code semantic_config_id}, {@code granularity}). Granularity
      * is the short form, e.g. {@code "SENTENCE"} (not the proto enum prefix).
+     *
+     * @param indexName        OpenSearch index name
+     * @param semanticConfigId semantic configuration id
+     * @param granularity      granularity label (short form)
+     * @return mapping inside a {@link Uni}, or {@code null} when unbound
      */
     public Uni<VectorSetMapping> lookupBySemanticConfig(String indexName, String semanticConfigId, String granularity) {
         String key = semanticConfigId + "|" + granularity;
@@ -174,6 +215,10 @@ public class IndexBindingCache {
      * Lookup by derived semantic name (e.g. {@code "title_text_chunker_embedder"}).
      * Used when neither {@code vector_set_id} nor {@code semantic_config_id} is
      * set on the inbound {@code SemanticVectorSet}.
+     *
+     * @param indexName OpenSearch index name
+     * @param name      derived semantic vector set name
+     * @return mapping inside a {@link Uni}, or {@code null} when unbound
      */
     public Uni<VectorSetMapping> lookupByName(String indexName, String name) {
         return getOrLoad(indexName).map(entry -> entry.byName.get(name));
@@ -182,6 +227,9 @@ public class IndexBindingCache {
     /**
      * Returns the loaded snapshot for an index, refreshing if expired or
      * absent. Concurrent callers for the same index share a single load.
+     *
+     * @param indexName OpenSearch index name
+     * @return memoized load of {@link IndexEntry}
      */
     public Uni<IndexEntry> getOrLoad(String indexName) {
         IndexEntry hot = cache.get(indexName);
@@ -206,6 +254,8 @@ public class IndexBindingCache {
      * {@code vector_set_index_binding} or {@code vector_set} that may change
      * the resolved mappings for {@code indexName}. The next lookup reloads
      * from the DB.
+     *
+     * @param indexName OpenSearch index name
      */
     public void invalidate(String indexName) {
         cache.remove(indexName);
@@ -213,14 +263,20 @@ public class IndexBindingCache {
         LOG.debugf("Invalidated binding cache for index '%s'", indexName);
     }
 
-    /** Drop everything. Test-only / admin-only. */
+    /**
+     * Drop all cached entries. Intended for tests or administrative tooling.
+     */
     public void invalidateAll() {
         cache.clear();
         pendingLoads.clear();
         LOG.info("Invalidated all binding caches");
     }
 
-    /** Number of cached index entries — exposed for diagnostics + tests. */
+    /**
+     * Number of cached index entries (for diagnostics and tests).
+     *
+     * @return cache size
+     */
     public int size() {
         return cache.size();
     }
@@ -231,6 +287,9 @@ public class IndexBindingCache {
      * {@code embeddingModelConfig} + {@code semanticConfig}) so the resulting
      * {@link IndexEntry} owns no live JPA state — safe to hand back across
      * sessions.
+     *
+     * @param indexName OpenSearch index name
+     * @return immutable snapshot for the index
      */
     @WithSession
     protected Uni<IndexEntry> loadFromDb(String indexName) {

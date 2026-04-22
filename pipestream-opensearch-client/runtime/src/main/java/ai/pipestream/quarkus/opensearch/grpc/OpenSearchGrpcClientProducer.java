@@ -32,7 +32,15 @@ public class OpenSearchGrpcClientProducer {
     DynamicGrpcClientFactory clientFactory;
 
     /**
+     * Creates the native OpenSearch gRPC client producer bean.
+     */
+    public OpenSearchGrpcClientProducer() {
+    }
+
+    /**
      * Get the gRPC channel for OpenSearch (lazy, resolved via Stork).
+     *
+     * @return a {@link Uni} that resolves to the OpenSearch gRPC channel
      */
     public Uni<Channel> getChannel() {
         return clientFactory.getChannel(OPENSEARCH_GRPC_SERVICE);
@@ -40,6 +48,8 @@ public class OpenSearchGrpcClientProducer {
 
     /**
      * Get the DocumentService Mutiny stub for bulk operations.
+     *
+     * @return a {@link Uni} that resolves to the document service stub
      */
     public Uni<MutinyDocumentServiceGrpc.MutinyDocumentServiceStub> getDocumentServiceStub() {
         return clientFactory.getClient(OPENSEARCH_GRPC_SERVICE, MutinyDocumentServiceGrpc::newMutinyStub);
@@ -47,6 +57,8 @@ public class OpenSearchGrpcClientProducer {
 
     /**
      * Get the SearchService Mutiny stub for search and k-NN queries.
+     *
+     * @return a {@link Uni} that resolves to the search service stub
      */
     public Uni<MutinySearchServiceGrpc.MutinySearchServiceStub> getSearchServiceStub() {
         return clientFactory.getClient(OPENSEARCH_GRPC_SERVICE, MutinySearchServiceGrpc::newMutinyStub);
@@ -54,6 +66,9 @@ public class OpenSearchGrpcClientProducer {
 
     /**
      * Execute a bulk request via DocumentService gRPC.
+     *
+     * @param request the bulk request to send to DocumentService
+     * @return a {@link Uni} that emits the bulk response
      */
     public Uni<BulkResponse> bulk(BulkRequest request) {
         if (request == null || request.getBulkRequestBodyCount() == 0) {

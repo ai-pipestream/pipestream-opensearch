@@ -20,7 +20,14 @@ public record BulkIndexItem(
     String routing,
     CompletableFuture<BulkItemResult> resultFuture
 ) {
-    /** Fire-and-forget constructor (no routing, no future). */
+    /**
+     * Fire-and-forget factory (no routing, no result future).
+     *
+     * @param indexName target index
+     * @param docId     document id
+     * @param document  document body
+     * @return bulk item without routing or completion future
+     */
     public static BulkIndexItem fireAndForget(String indexName, String docId, Map<String, Object> document) {
         return new BulkIndexItem(indexName, docId, document, null, null);
     }

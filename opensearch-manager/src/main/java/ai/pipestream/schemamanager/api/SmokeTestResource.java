@@ -30,6 +30,12 @@ public class SmokeTestResource {
 
     private static final Logger LOG = Logger.getLogger(SmokeTestResource.class);
 
+    /**
+     * Creates the smoke test resource.
+     */
+    public SmokeTestResource() {
+    }
+
     @Inject
     OpenSearchSchemaService schemaService;
 
@@ -44,6 +50,8 @@ public class SmokeTestResource {
 
     /**
      * Check OpenSearch connectivity by testing index existence on a known-missing index.
+     *
+     * @return connectivity details for a generated probe index
      */
     @GET
     @Path("/opensearch")
@@ -72,6 +80,7 @@ public class SmokeTestResource {
      * @param indexName   the index name to create
      * @param dimensions  vector dimensions (required — no default)
      * @param fieldName   nested field name (default "embeddings")
+     * @return creation result for the requested index
      */
     @POST
     @Path("/create-index")
@@ -113,6 +122,9 @@ public class SmokeTestResource {
      * Builds an OpenSearchDocument with a SemanticVectorSet and indexes it,
      * triggering VectorSet creation, VectorSetIndexBinding creation,
      * and OpenSearch index/mapping creation.
+     *
+     * @param payload request body describing the smoke-test document and index settings
+     * @return indexing result and generated identifiers
      */
     @POST
     @Path("/index-document")
@@ -197,6 +209,9 @@ public class SmokeTestResource {
 
     /**
      * Verify index state: retrieves OpenSearch mapping and DB bindings for the given index.
+     *
+     * @param indexName index name to inspect
+     * @return combined OpenSearch mapping and database binding state
      */
     @GET
     @Path("/verify")
@@ -256,6 +271,9 @@ public class SmokeTestResource {
 
     /**
      * Preview how a Protobuf 'Any' message (sent as JSON) would be mapped to OpenSearchDocument.
+     *
+     * @param payload JSON payload to parse into test metadata
+     * @return mapped document preview or validation error details
      */
     @POST
     @Path("/map-any")
@@ -281,6 +299,9 @@ public class SmokeTestResource {
 
     /**
      * Delete test data: removes OpenSearch index, VectorSetIndexBindings, and orphaned VectorSets for the given index.
+     *
+     * @param indexName index name whose smoke-test resources should be removed
+     * @return cleanup result for OpenSearch and database state
      */
     @DELETE
     @Path("/cleanup")
@@ -341,6 +362,10 @@ public class SmokeTestResource {
 
     /**
      * Full indexing test using an OpenSearchDocument JSON (no organic registration).
+     *
+     * @param indexName target OpenSearch index name
+     * @param documentJson JSON representation of the document to index
+     * @return indexing result or validation error details
      */
     @POST
     @Path("/index-raw")

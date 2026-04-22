@@ -22,6 +22,15 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class NoOpVectorSetProvisioner implements VectorSetProvisioner {
 
+    /** CDI. */
+    public NoOpVectorSetProvisioner() {
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>This no-op implementation completes immediately without touching OpenSearch.
+     */
     @Override
     public Uni<Void> ensureFieldsForDirectives(VectorSetDirectives directives, String indexName) {
         return Uni.createFrom().voidItem();

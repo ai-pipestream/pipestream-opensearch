@@ -63,6 +63,8 @@ public class BulkQueueSet {
     /**
      * Submit an item via round-robin to one of the managed queues.
      * Reads the volatile queues reference exactly once for thread safety.
+     *
+     * @param item indexing operation to enqueue
      */
     public void submit(BulkIndexItem item) {
         BulkIndexingQueue[] current = queues;
@@ -144,6 +146,8 @@ public class BulkQueueSet {
 
     /**
      * Returns the current number of queues.
+     *
+     * @return queue count
      */
     public int getQueueCount() {
         return queues.length;
@@ -151,6 +155,8 @@ public class BulkQueueSet {
 
     /**
      * Returns the current capacity per queue.
+     *
+     * @return items per queue before forced flush
      */
     public int getCapacity() {
         return capacity;
@@ -158,6 +164,8 @@ public class BulkQueueSet {
 
     /**
      * Returns the current flush interval in ms.
+     *
+     * @return periodic flush interval
      */
     public int getFlushIntervalMs() {
         return flushIntervalMs;
@@ -165,6 +173,8 @@ public class BulkQueueSet {
 
     /**
      * Returns the total number of pending items across all queues.
+     *
+     * @return sum of {@link BulkIndexingQueue#pendingCount()} across queues
      */
     public int totalPending() {
         BulkIndexingQueue[] current = queues;

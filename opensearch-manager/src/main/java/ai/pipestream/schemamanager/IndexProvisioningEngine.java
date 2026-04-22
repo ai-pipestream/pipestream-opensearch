@@ -56,6 +56,10 @@ public class IndexProvisioningEngine {
 
     private static final Logger LOG = Logger.getLogger(IndexProvisioningEngine.class);
 
+    /** CDI; collaborators are injected after construction. */
+    public IndexProvisioningEngine() {
+    }
+
     @Inject
     OpenSearchSchemaService schemaService;
 

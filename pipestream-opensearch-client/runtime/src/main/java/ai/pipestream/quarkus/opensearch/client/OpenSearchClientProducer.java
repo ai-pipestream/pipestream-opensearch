@@ -42,6 +42,17 @@ public class OpenSearchClientProducer {
 
     private ApacheHttpClient5Transport transport;
 
+    /**
+     * Creates the CDI producer bean.
+     */
+    public OpenSearchClientProducer() {
+    }
+
+    /**
+     * Produces the shared HTTP transport used by OpenSearch clients.
+     *
+     * @return the configured Apache HTTP client transport
+     */
     @Produces
     @Singleton
     public ApacheHttpClient5Transport transport() {
@@ -51,6 +62,12 @@ public class OpenSearchClientProducer {
         return transport;
     }
 
+    /**
+     * Produces the synchronous OpenSearch client.
+     *
+     * @param transport the shared transport backing the client
+     * @return the configured synchronous OpenSearch client
+     */
     @Produces
     @Singleton
     public OpenSearchClient openSearchClient(ApacheHttpClient5Transport transport) {
@@ -58,6 +75,12 @@ public class OpenSearchClientProducer {
         return new OpenSearchClient(transport);
     }
 
+    /**
+     * Produces the asynchronous OpenSearch client.
+     *
+     * @param transport the shared transport backing the client
+     * @return the configured asynchronous OpenSearch client
+     */
     @Produces
     @Singleton
     public OpenSearchAsyncClient openSearchAsyncClient(ApacheHttpClient5Transport transport) {

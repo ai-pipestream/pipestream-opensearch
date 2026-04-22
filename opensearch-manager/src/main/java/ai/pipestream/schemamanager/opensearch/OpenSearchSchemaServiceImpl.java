@@ -24,12 +24,25 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * OpenSearch schema operations for index creation and nested vector mappings.
+ */
 @ApplicationScoped
 public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
 
     @Inject
     OpenSearchClient client;
 
+    /** CDI; dependencies injected after construction. */
+    public OpenSearchSchemaServiceImpl() {}
+
+    /**
+     * Checks whether the target index already contains the requested nested field mapping.
+     *
+     * @param indexName target OpenSearch index name
+     * @param nestedFieldName nested field name to inspect
+     * @return {@code true} when the nested field already exists
+     */
     @Override
     public Uni<Boolean> nestedMappingExists(String indexName, String nestedFieldName) {
         return Uni.createFrom().item(() -> {
@@ -61,6 +74,12 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
                 });
     }
 
+    /**
+     * Ensures a plain k-NN-enabled index exists.
+     *
+     * @param indexName target OpenSearch index name
+     * @return {@code true} when the index exists or is created successfully
+     */
     @Override
     public Uni<Boolean> ensurePlainIndex(String indexName) {
         return Uni.createFrom().item(() -> {
@@ -90,6 +109,14 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
         .atMost(6);
     }
 
+    /**
+     * Creates or updates the nested vector mapping on the target index.
+     *
+     * @param indexName target OpenSearch index name
+     * @param nestedFieldName nested field name to create or update
+     * @param vectorFieldDefinition vector field definition used to build the mapping
+     * @return {@code true} when the mapping change is acknowledged
+     */
     @Override
     public Uni<Boolean> createIndexWithNestedMapping(String indexName, String nestedFieldName, VectorFieldDefinition vectorFieldDefinition) {
         return Uni.createFrom().item(() -> {

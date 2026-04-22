@@ -26,6 +26,17 @@ public class AnyDocumentMapper {
     @Inject
     DescriptorRegistry descriptorRegistry;
 
+    /** CDI; {@link #descriptorRegistry} is injected after construction. */
+    public AnyDocumentMapper() {
+    }
+
+    /**
+     * Parses a protobuf {@link Any} into {@link OpenSearchDocument} using registered descriptors.
+     *
+     * @param anyDocument packed user document
+     * @param documentId  explicit id, or blank to assign a random UUID
+     * @return normalized OpenSearch document
+     */
     public OpenSearchDocument mapToOpenSearchDocument(Any anyDocument, String documentId) {
         String id = (documentId != null && !documentId.isBlank()) ? documentId : UUID.randomUUID().toString();
         

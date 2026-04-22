@@ -14,6 +14,17 @@ import jakarta.ws.rs.core.MediaType;
 @Produces(MediaType.TEXT_PLAIN)
 public class RootProbeResource {
 
+    /**
+     * Creates the root probe resource.
+     */
+    public RootProbeResource() {
+    }
+
+    /**
+     * Returns the service identifier used by simple probes.
+     *
+     * @return service name for root-level liveness checks
+     */
     @GET
     public String rootProbe() {
         return "opensearch-manager";

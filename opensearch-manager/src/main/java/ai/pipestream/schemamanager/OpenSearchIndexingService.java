@@ -70,11 +70,26 @@ public class OpenSearchIndexingService {
     @Inject
     OpenSearchManagerRuntimeConfig managerRuntimeConfig;
 
+    /** CDI; dependencies injected after construction. */
+    public OpenSearchIndexingService() {}
+
+    /**
+     * Indexes one OpenSearch document using the configured indexing strategy.
+     *
+     * @param request indexing request containing the target index and document payload
+     * @return the asynchronous indexing result
+     */
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         IndexingStrategyHandler strategy = resolveStrategy(request.getIndexingStrategy());
         return strategy.indexDocument(request);
     }
 
+    /**
+     * Indexes a micro-batch of streaming documents.
+     *
+     * @param batch batch of streaming indexing requests
+     * @return the asynchronous list of per-document responses
+     */
     public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         // Batch path always uses NESTED strategy (the only one currently implemented).
         // Future: inspect per-request strategy if batch contains mixed strategies.
@@ -99,6 +114,10 @@ public class OpenSearchIndexingService {
     /**
      * Queue a document for batched indexing into OpenSearch.
      * Fire-and-forget: the document will be included in the next bulk request.
+     *
+     * @param indexName target OpenSearch index name
+     * @param docId document identifier to write
+     * @param document document body to enqueue
      */
     public void queueForIndexing(String indexName, String docId, Map<String, Object> document) {
         bulkQueueSet.submitFireAndForget(indexName, docId, document);
@@ -106,6 +125,13 @@ public class OpenSearchIndexingService {
 
     // ===== Entity indexing methods (drives, nodes, modules, pipedocs, etc.) =====
 
+    /**
+     * Indexes filesystem drive metadata.
+     *
+     * @param drive drive payload to index
+     * @param key Kafka key used as the OpenSearch document id
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexDrive(Drive drive, java.util.UUID key) {
         Map<String, Object> document = new HashMap<>();
         document.put("name", drive.getName());
@@ -117,6 +143,12 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed drive document.
+     *
+     * @param key Kafka key used as the OpenSearch document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deleteDrive(java.util.UUID key) {
         try {
             return Uni.createFrom().completionStage(
@@ -125,6 +157,14 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes a filesystem node using the default retention settings.
+     *
+     * @param node filesystem node payload
+     * @param drive drive name that owns the node
+     * @param kafkaKey Kafka key used as the OpenSearch document id
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey) {
         return indexNode(node, drive, kafkaKey, null, 30);
     }
@@ -132,6 +172,10 @@ public class OpenSearchIndexingService {
     /**
      * Index a repository event directly from the Kafka event payload.
      * No gRPC callback needed — the event carries enough data for the catalog entry.
+     *
+     * @param event repository event to project into catalog, history, and filesystem indices
+     * @param kafkaKey Kafka key used as the OpenSearch document id for the filesystem entry
+     * @return a completion signal after the relevant indexing or delete work is queued
      */
     public Uni<Void> indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
         String operation = event.hasCreated() ? "CREATED"
@@ -226,6 +270,13 @@ public class OpenSearchIndexingService {
 
     /**
      * Index filesystem node metadata. OpenSearch document id is always {@code kafkaKey} (same as producer key).
+     *
+     * @param node filesystem node payload
+     * @param drive drive name that owns the node
+     * @param kafkaKey Kafka key used as the OpenSearch document id
+     * @param datasourceId datasource identifier to persist when available
+     * @param retentionIntentDays retention hint stored on the indexed document
+     * @return a completion signal after the document is queued
      */
     public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey, String datasourceId, int retentionIntentDays) {
         Map<String, Object> document = new HashMap<>();
@@ -251,6 +302,9 @@ public class OpenSearchIndexingService {
 
     /**
      * Deletes the filesystem node document indexed under the Kafka message key (must match {@link #indexNode}).
+     *
+     * @param kafkaKey Kafka key used as the OpenSearch document id
+     * @return a completion signal for the idempotent delete attempt
      */
     public Uni<Void> deleteFilesystemNodeByKafkaKey(UUID kafkaKey) {
         try {
@@ -269,6 +323,10 @@ public class OpenSearchIndexingService {
 
     /**
      * @deprecated OpenSearch filesystem node ids are Kafka UUID keys, not {@code drive/nodeId}.
+     *
+     * @param nodeId legacy node identifier
+     * @param drive drive name previously used to compose the document id
+     * @return a completion signal for the delete request
      */
     @Deprecated
     public Uni<Void> deleteNode(String nodeId, String drive) {
@@ -280,6 +338,12 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes module metadata for repository search.
+     *
+     * @param module module definition to index
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexModule(ModuleDefinition module) {
         Map<String, Object> document = new HashMap<>();
         document.put(ModuleFields.MODULE_ID.getFieldName(), module.getModuleId());
@@ -289,6 +353,12 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed module document.
+     *
+     * @param moduleId module identifier used as the OpenSearch document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deleteModule(String moduleId) {
         try {
             return Uni.createFrom().completionStage(
@@ -297,6 +367,12 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes repository metadata for a PipeDoc update.
+     *
+     * @param notification PipeDoc update payload to project into OpenSearch
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexPipeDoc(PipeDocUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(PipeDocFields.STORAGE_ID.getFieldName(), notification.getStorageId());
@@ -335,6 +411,12 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed PipeDoc document.
+     *
+     * @param storageId storage identifier used as the OpenSearch document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deletePipeDoc(String storageId) {
         try {
             return Uni.createFrom().completionStage(
@@ -343,6 +425,12 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes a document-upload event for admin and repository search.
+     *
+     * @param event uploaded-document event payload
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexDocumentUpload(DocumentUploadedEvent event) {
         Map<String, Object> document = new HashMap<>();
         document.put("doc_id", event.getDocId());
@@ -370,6 +458,13 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed document-upload record.
+     *
+     * @param accountId account identifier used in the composed document id
+     * @param docId document identifier used in the composed document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deleteDocumentUpload(String accountId, String docId) {
         String id = accountId + "/" + docId;
         try {
@@ -379,6 +474,12 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes a process-request notification.
+     *
+     * @param notification process request update payload
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexProcessRequest(ProcessRequestUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(ProcessFields.REQUEST_ID.getFieldName(), notification.getRequestId());
@@ -387,6 +488,12 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed process-request document.
+     *
+     * @param requestId request identifier used as the OpenSearch document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deleteProcessRequest(String requestId) {
         try {
             return Uni.createFrom().completionStage(
@@ -395,6 +502,12 @@ public class OpenSearchIndexingService {
         } catch (Exception e) { return Uni.createFrom().failure(e); }
     }
 
+    /**
+     * Indexes a process-response notification.
+     *
+     * @param notification process response update payload
+     * @return a completion signal after the document is queued
+     */
     public Uni<Void> indexProcessResponse(ProcessResponseUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(ProcessFields.RESPONSE_ID.getFieldName(), notification.getResponseId());
@@ -403,6 +516,12 @@ public class OpenSearchIndexingService {
         return Uni.createFrom().voidItem();
     }
 
+    /**
+     * Deletes an indexed process-response document.
+     *
+     * @param responseId response identifier used as the OpenSearch document id
+     * @return a completion signal for the delete request
+     */
     public Uni<Void> deleteProcessResponse(String responseId) {
         try {
             return Uni.createFrom().completionStage(
@@ -413,6 +532,12 @@ public class OpenSearchIndexingService {
 
     // ===== Index administration methods =====
 
+    /**
+     * Creates an index with the requested vector field configuration.
+     *
+     * @param request create-index request payload
+     * @return the asynchronous index creation result
+     */
     public Uni<CreateIndexResponse> createIndex(CreateIndexRequest request) {
         String vectorFieldName = request.hasVectorFieldName() && !request.getVectorFieldName().isBlank()
                 ? request.getVectorFieldName()
@@ -427,6 +552,9 @@ public class OpenSearchIndexingService {
 
     /**
      * Simplified index mapping for admin UIs (mirrors IndexAdminResource JSON shape).
+     *
+     * @param request mapping lookup request
+     * @return the asynchronous mapping response
      */
     public Uni<GetIndexMappingResponse> getIndexMapping(GetIndexMappingRequest request) {
         String indexName = request.getIndexName();
@@ -463,6 +591,12 @@ public class OpenSearchIndexingService {
                 });
     }
 
+    /**
+     * Checks whether an index exists.
+     *
+     * @param request existence-check request
+     * @return the asynchronous existence result
+     */
     public Uni<IndexExistsResponse> indexExists(IndexExistsRequest request) {
         String indexName = request.getIndexName();
         return Uni.createFrom().item(() -> {
@@ -477,6 +611,12 @@ public class OpenSearchIndexingService {
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Searches indexed filesystem metadata.
+     *
+     * @param request filesystem search request
+     * @return the asynchronous search response
+     */
     public Uni<SearchFilesystemMetaResponse> searchFilesystemMeta(SearchFilesystemMetaRequest request) {
         LOG.infof("Searching filesystem metadata: drive=%s, query=%s", request.getDrive(), request.getQuery());
 
@@ -545,6 +685,12 @@ public class OpenSearchIndexingService {
         });
     }
 
+    /**
+     * Searches indexed document-upload records.
+     *
+     * @param request document-upload search request
+     * @return the asynchronous search response
+     */
     public Uni<SearchDocumentUploadsResponse> searchDocumentUploads(SearchDocumentUploadsRequest request) {
         LOG.infof("Searching document uploads: query=%s", request.getQuery());
 
@@ -622,6 +768,12 @@ public class OpenSearchIndexingService {
         return v != null ? String.valueOf(v) : "";
     }
 
+    /**
+     * Deletes an OpenSearch index.
+     *
+     * @param request delete-index request
+     * @return the asynchronous delete result
+     */
     public Uni<DeleteIndexResponse> deleteIndex(DeleteIndexRequest request) {
         String indexName = request.getIndexName();
         LOG.infof("Deleting index '%s'", indexName);
@@ -647,6 +799,12 @@ public class OpenSearchIndexingService {
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Lists indices visible to the manager service.
+     *
+     * @param request list-indices request
+     * @return the asynchronous list response
+     */
     public Uni<ListIndicesResponse> listIndices(ListIndicesRequest request) {
         // OpenSearch async completion runs on an HTTP I/O thread without a Vert.x duplicated context.
         // Hibernate Reactive requires the request context — capture it here while still on the gRPC/event-loop thread.
@@ -741,6 +899,12 @@ public class OpenSearchIndexingService {
                 });
     }
 
+    /**
+     * Returns document-count and size statistics for an index.
+     *
+     * @param request index-stats request
+     * @return the asynchronous stats response
+     */
     public Uni<GetIndexStatsResponse> getIndexStats(GetIndexStatsRequest request) {
         String indexName = request.getIndexName();
         LOG.debugf("Getting stats for index '%s'", indexName);
@@ -786,6 +950,12 @@ public class OpenSearchIndexingService {
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Deletes a single document from an index.
+     *
+     * @param request delete-document request
+     * @return the asynchronous delete result
+     */
     public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
         String indexName = request.getIndexName();
         String documentId = request.getDocumentId();
@@ -816,6 +986,12 @@ public class OpenSearchIndexingService {
         }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Fetches a single stored document from an index.
+     *
+     * @param request get-document request
+     * @return the asynchronous document lookup result
+     */
     public Uni<GetOpenSearchDocumentResponse> getOpenSearchDocument(GetOpenSearchDocumentRequest request) {
         String indexName = request.getIndexName();
         String documentId = request.getDocumentId();

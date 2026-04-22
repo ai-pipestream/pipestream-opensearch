@@ -27,6 +27,10 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     // Cache of already-ensured (indexName + fieldName) pairs to avoid repeated mapping checks
     private final Set<String> ensuredFields = ConcurrentHashMap.newKeySet();
 
+    /** CDI; dependencies are injected after construction. */
+    public ChunkCombinedIndexingStrategy() {
+    }
+
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
 

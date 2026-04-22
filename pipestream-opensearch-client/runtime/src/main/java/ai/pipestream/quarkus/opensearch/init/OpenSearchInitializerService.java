@@ -30,6 +30,12 @@ public class OpenSearchInitializerService {
     Instance<OpenSearchInitializer> initializers;
 
     /**
+     * Creates the OpenSearch startup initializer service bean.
+     */
+    public OpenSearchInitializerService() {
+    }
+
+    /**
      * Runs all initializers on application startup.
      */
     void onStart(@Observes StartupEvent event) {

@@ -31,6 +31,12 @@ public class ReactiveOpenSearchClient {
     OpenSearchClient client;
 
     /**
+     * Creates the reactive client wrapper bean.
+     */
+    public ReactiveOpenSearchClient() {
+    }
+
+    /**
      * Check if an index exists.
      *
      * @param indexName the index name

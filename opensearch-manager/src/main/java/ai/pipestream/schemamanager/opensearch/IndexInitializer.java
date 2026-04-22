@@ -22,6 +22,9 @@ import java.util.concurrent.TimeUnit;
 
 import static ai.pipestream.schemamanager.opensearch.IndexConstants.Index;
 
+/**
+ * Ensures baseline Pipestream indices exist at application startup.
+ */
 @ApplicationScoped
 public class IndexInitializer {
 
@@ -30,6 +33,15 @@ public class IndexInitializer {
     @Inject
     OpenSearchClient client;
 
+    /** CDI; {@link #client} is injected after construction. */
+    public IndexInitializer() {
+    }
+
+    /**
+     * Creates missing indices with default mappings when the application starts.
+     *
+     * @param ev Quarkus startup event
+     */
     public void onStart(@Observes StartupEvent ev) {
         try {
             ensureIndex(Index.REPOSITORY_PIPEDOCS.getIndexName(), buildPipeDocsMapping());

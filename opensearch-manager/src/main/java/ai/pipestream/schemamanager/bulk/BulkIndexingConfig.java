@@ -10,15 +10,27 @@ import io.smallrye.config.WithDefault;
 @ConfigMapping(prefix = "bulk-indexing")
 public interface BulkIndexingConfig {
 
-    /** Number of concurrent draining queues. Runtime updates must stay within 2–32 (see UpdateBulkConfig). */
+    /**
+     * Number of concurrent draining queues. Runtime updates must stay within 2–32 (see UpdateBulkConfig).
+     *
+     * @return configured queue count
+     */
     @WithDefault("4")
     int queueCount();
 
-    /** Maximum items per queue before forced flush. */
+    /**
+     * Maximum items per queue before forced flush.
+     *
+     * @return capacity per queue
+     */
     @WithDefault("200")
     int capacity();
 
-    /** Milliseconds between periodic flush sweeps. */
+    /**
+     * Milliseconds between periodic flush sweeps.
+     *
+     * @return flush interval in milliseconds
+     */
     @WithDefault("2000")
     int flushIntervalMs();
 }

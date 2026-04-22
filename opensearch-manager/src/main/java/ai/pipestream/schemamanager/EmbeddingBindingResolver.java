@@ -23,6 +23,10 @@ public class EmbeddingBindingResolver {
     private static final Logger LOG = Logger.getLogger(EmbeddingBindingResolver.class);
     private static final String DEFAULT_RESULT_SET_NAME = "default";
 
+    /** CDI. */
+    public EmbeddingBindingResolver() {
+    }
+
     private static String normalizeResultSetName(String resultSetName) {
         return (resultSetName == null || resultSetName.isBlank()) ? DEFAULT_RESULT_SET_NAME : resultSetName;
     }
@@ -30,12 +34,24 @@ public class EmbeddingBindingResolver {
     /**
      * Resolves VectorFieldDefinition for the given index and field.
      * Prefers VectorSet; falls back to IndexEmbeddingBinding for backward compatibility.
+     *
+     * @param indexName OpenSearch index name
+     * @param fieldName nested vector field name
+     * @return resolved dimensions, or failure when no binding exists
      */
     @WithSession
     public Uni<VectorFieldDefinition> resolve(String indexName, String fieldName) {
         return resolve(indexName, fieldName, null);
     }
 
+    /**
+     * Resolves vector dimensions for an index, field, and optional result set name.
+     *
+     * @param indexName      OpenSearch index name
+     * @param fieldName      nested vector field name
+     * @param resultSetName  logical result set (blank defaults to {@code "default"})
+     * @return resolved dimensions, or failure when no binding exists
+     */
     @WithSession
     public Uni<VectorFieldDefinition> resolve(String indexName, String fieldName, String resultSetName) {
         String normalizedResultSetName = normalizeResultSetName(resultSetName);

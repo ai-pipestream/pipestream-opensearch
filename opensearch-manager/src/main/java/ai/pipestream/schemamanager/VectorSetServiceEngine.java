@@ -48,6 +48,16 @@ public class VectorSetServiceEngine {
     @Inject
     ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
 
+    /** CDI constructor. */
+    public VectorSetServiceEngine() {
+    }
+
+    /**
+     * Creates and persists a vector set from the supplied request.
+     *
+     * @param request create request
+     * @return response containing the created vector set
+     */
     @WithTransaction
     public Uni<CreateVectorSetResponse> createVectorSet(CreateVectorSetRequest request) {
         return Panache.withTransaction(() -> {
@@ -125,6 +135,12 @@ public class VectorSetServiceEngine {
                 .map(vs -> CreateVectorSetResponse.newBuilder().setVectorSet(vs).build());
     }
 
+    /**
+     * Loads a vector set by id or name, depending on the request mode.
+     *
+     * @param request lookup request
+     * @return response containing the resolved vector set
+     */
     @WithSession
     public Uni<GetVectorSetResponse> getVectorSet(GetVectorSetRequest request) {
         Uni<VectorSetEntity> lookup = request.hasByName() && request.getByName()
@@ -138,6 +154,12 @@ public class VectorSetServiceEngine {
                                 .asRuntimeException()));
     }
 
+    /**
+     * Updates an existing vector set.
+     *
+     * @param request update request
+     * @return response containing the updated vector set
+     */
     @WithTransaction
     public Uni<UpdateVectorSetResponse> updateVectorSet(UpdateVectorSetRequest request) {
         return Panache.withTransaction(() -> VectorSetEntity.<VectorSetEntity>findById(request.getId())
@@ -207,6 +229,12 @@ public class VectorSetServiceEngine {
                 });
     }
 
+    /**
+     * Deletes a vector set by id.
+     *
+     * @param request delete request
+     * @return deletion outcome
+     */
     @WithTransaction
     public Uni<DeleteVectorSetResponse> deleteVectorSet(DeleteVectorSetRequest request) {
         return Panache.withTransaction(() ->
@@ -225,6 +253,12 @@ public class VectorSetServiceEngine {
                         }));
     }
 
+    /**
+     * Lists vector sets using the supplied filters and pagination.
+     *
+     * @param request list request
+     * @return matching vector sets
+     */
     @WithSession
     public Uni<ListVectorSetsResponse> listVectorSets(ListVectorSetsRequest request) {
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
@@ -252,6 +286,12 @@ public class VectorSetServiceEngine {
                         .build());
     }
 
+    /**
+     * Resolves a vector set bound to an index, field, and result set.
+     *
+     * @param request resolution request
+     * @return resolution response
+     */
     @WithSession
     public Uni<ResolveVectorSetResponse> resolveVectorSet(ResolveVectorSetRequest request) {
         String resultSetName = normalizeResultSetName(
@@ -283,6 +323,9 @@ public class VectorSetServiceEngine {
 
     /**
      * Resolve a registered VectorSet id or an inline (ephemeral) tuple for sinks and semantic indexing.
+     *
+     * @param request directive resolution request
+     * @return resolution response
      */
     @WithSession
     public Uni<ResolveVectorSetFromDirectiveResponse> resolveVectorSetFromDirective(ResolveVectorSetFromDirectiveRequest request) {
@@ -369,6 +412,10 @@ public class VectorSetServiceEngine {
 
     /**
      * Used by {@link OpenSearchManagerService} when EnsureNestedEmbeddingsFieldIds are provided instead of explicit dimensions.
+     *
+     * @param chunkerConfigId chunker config id
+     * @param embeddingModelConfigId embedding model config id
+     * @return resolved embedding dimensions
      */
     @WithSession
     public Uni<Integer> resolveEmbeddingDimensionsFromConfigIds(String chunkerConfigId, String embeddingModelConfigId) {
@@ -391,7 +438,13 @@ public class VectorSetServiceEngine {
                 });
     }
 
-    /** Public hook for components that already have a loaded {@link VectorSetEntity}. */
+    /**
+     * Converts a loaded entity into the protobuf representation.
+     *
+     * @param e entity to convert
+     * @param indexName index name to include in the proto, or {@code null}
+     * @return protobuf vector set
+     */
     public VectorSet entityToProto(VectorSetEntity e, String indexName) {
         return toVectorSetProto(e, indexName);
     }

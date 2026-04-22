@@ -29,6 +29,12 @@ public class IndexTemplateInitializer implements OpenSearchInitializer {
     @Inject
     OpenSearchRuntimeConfig config;
 
+    /**
+     * Creates the default index template initializer bean.
+     */
+    public IndexTemplateInitializer() {
+    }
+
     @Override
     public void initialize(OpenSearchClient client) throws Exception {
         // Check if template already exists

@@ -20,49 +20,86 @@ import java.util.List;
 })
 public class VectorSetIndexBindingEntity extends PanacheEntityBase {
 
+    /** JPA persistence constructor. */
+    public VectorSetIndexBindingEntity() {
+    }
+
+    /** Primary key. */
     @Id
     public String id;
 
+    /** Referenced vector set row. */
     @ManyToOne(fetch = FetchType.EAGER)
     @JoinColumn(name = "vector_set_id", nullable = false)
     public VectorSetEntity vectorSet;
 
+    /** OpenSearch index name bound to the vector set. */
     @Column(name = "index_name", nullable = false)
     public String indexName;
 
+    /** Optional owning account id. */
     @Column(name = "account_id")
     public String accountId;
 
+    /** Optional owning datasource id. */
     @Column(name = "datasource_id")
     public String datasourceId;
 
+    /** Binding status such as {@code ACTIVE} or {@code ERROR}. */
     @Column(name = "status")
     public String status; // e.g., ACTIVE, PENDING, ERROR
 
+    /** Row creation time. */
     @CreationTimestamp
     @Column(name = "created_at", nullable = false)
     public LocalDateTime createdAt;
 
+    /** Row last update time. */
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     public LocalDateTime updatedAt;
 
+    /**
+     * Finds the binding for a vector set and index.
+     *
+     * @param vectorSetId vector set id
+     * @param indexName OpenSearch index name
+     * @return matching binding or {@code null}
+     */
     public static Uni<VectorSetIndexBindingEntity> findBinding(String vectorSetId, String indexName) {
         return find("vectorSet.id = ?1 and indexName = ?2", vectorSetId, indexName).firstResult();
     }
 
-    /** First binding for a VectorSet (any index), for enriching proto index_name. */
+    /**
+     * Returns the first binding for a vector set across all indexes.
+     *
+     * @param vectorSetId vector set id
+     * @return first matching binding or {@code null}
+     */
     public static Uni<VectorSetIndexBindingEntity> findFirstByVectorSetId(String vectorSetId) {
         return find("vectorSet.id = ?1", vectorSetId).firstResult();
     }
 
+    /**
+     * Finds a binding by index, field name, and result set name.
+     *
+     * @param indexName OpenSearch index name
+     * @param fieldName nested field name
+     * @param resultSetName logical result set name
+     * @return matching binding or {@code null}
+     */
     public static Uni<VectorSetIndexBindingEntity> findBindingByDetails(
             String indexName, String fieldName, String resultSetName) {
         return find("indexName = ?1 and vectorSet.fieldName = ?2 and vectorSet.resultSetName = ?3",
                 indexName, fieldName, resultSetName).firstResult();
     }
 
-    /** All VectorSet bindings for the given OpenSearch index names (for list enrichment). */
+    /**
+     * Lists all bindings for the supplied OpenSearch indexes.
+     *
+     * @param indexNames OpenSearch index names
+     * @return matching bindings, or an empty list when none are requested
+     */
     public static Uni<List<VectorSetIndexBindingEntity>> findAllByIndexNames(List<String> indexNames) {
         if (indexNames == null || indexNames.isEmpty()) {
             return Uni.createFrom().item(List.of());

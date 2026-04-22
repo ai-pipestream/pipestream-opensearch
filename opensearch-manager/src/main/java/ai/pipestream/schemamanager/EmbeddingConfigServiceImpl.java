@@ -22,6 +22,9 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
 
+/**
+ * gRPC service for embedding model configuration and index embedding bindings.
+ */
 @GrpcService
 public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc.EmbeddingConfigServiceImplBase {
 
@@ -30,6 +33,11 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
 
     private final SemanticMetadataEventProducer eventProducer;
 
+    /**
+     * Creates the gRPC service with its Kafka side-effect producer.
+     *
+     * @param eventProducer Kafka metadata event producer for semantic config updates
+     */
     public EmbeddingConfigServiceImpl(SemanticMetadataEventProducer eventProducer) {
         this.eventProducer = eventProducer;
     }

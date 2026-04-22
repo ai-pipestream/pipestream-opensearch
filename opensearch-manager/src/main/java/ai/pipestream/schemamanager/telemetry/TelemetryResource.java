@@ -26,6 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
+/**
+ * Internal telemetry endpoints for service, OpenSearch, and dynamic gRPC state.
+ */
 @Path("/internal/telemetry")
 @ApplicationScoped
 @Produces(MediaType.APPLICATION_JSON)
@@ -33,6 +36,12 @@ public class TelemetryResource {
     private static final Logger LOG = Logger.getLogger(TelemetryResource.class);
     private static final List<String> DEFAULT_DISCOVERY_SERVICES = List.of("opensearch-manager", "registration-service");
     private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+
+    /**
+     * Creates the telemetry resource.
+     */
+    public TelemetryResource() {
+    }
 
     @ConfigProperty(name = "telemetry.rest.enabled", defaultValue = "false")
     boolean telemetryEnabled;
@@ -70,6 +79,11 @@ public class TelemetryResource {
     @ConfigProperty(name = "quarkus.dynamic-grpc.consul.use-health-checks", defaultValue = "false")
     boolean dynamicGrpcConsulUseHealthChecks;
 
+    /**
+     * Returns combined stack telemetry for the service and its dependencies.
+     *
+     * @return stack telemetry snapshot
+     */
     @GET
     @Path("/stack")
     public Uni<StackTelemetry> stack() {
@@ -91,6 +105,11 @@ public class TelemetryResource {
                         )));
     }
 
+    /**
+     * Returns OpenSearch connectivity telemetry.
+     *
+     * @return OpenSearch telemetry snapshot
+     */
     @GET
     @Path("/opensearch")
     public Uni<OpenSearchTelemetry> opensearch() {
@@ -101,6 +120,11 @@ public class TelemetryResource {
                 .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Returns service-discovery telemetry for configured dynamic gRPC services.
+     *
+     * @return dynamic gRPC service-discovery snapshot
+     */
     @GET
     @Path("/dynamic-grpc")
     public Uni<DynamicGrpcTelemetry> dynamicGrpc() {
@@ -112,6 +136,11 @@ public class TelemetryResource {
                 .runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
     }
 
+    /**
+     * Returns application version telemetry.
+     *
+     * @return version snapshot for this service
+     */
     @GET
     @Path("/version")
     public VersionTelemetry version() {
@@ -252,6 +281,16 @@ public class TelemetryResource {
         return first.replaceFirst("^https?://", "");
     }
 
+    /**
+     * Aggregated telemetry for this service and its main dependencies.
+     *
+     * @param enabled whether telemetry endpoints are enabled
+     * @param applicationName Quarkus application name
+     * @param applicationVersion Quarkus application version
+     * @param opensearch OpenSearch connectivity telemetry
+     * @param dynamicGrpc dynamic gRPC discovery telemetry
+     * @param generatedAt timestamp when the snapshot was generated
+     */
     public record StackTelemetry(
             boolean enabled,
             String applicationName,
@@ -272,6 +311,19 @@ public class TelemetryResource {
         }
     }
 
+    /**
+     * OpenSearch connectivity and configuration telemetry.
+     *
+     * @param enabled whether telemetry endpoints are enabled
+     * @param configuredHosts configured OpenSearch hosts string
+     * @param protocol configured OpenSearch protocol
+     * @param baseUrl base URL used for probing
+     * @param reachable whether the probe succeeded
+     * @param statusCode HTTP status returned by the probe
+     * @param errorMessage probe error, if any
+     * @param authConfigured whether credentials are configured
+     * @param checkedAt timestamp when the probe completed
+     */
     public record OpenSearchTelemetry(
             boolean enabled,
             String configuredHosts,
@@ -288,6 +340,16 @@ public class TelemetryResource {
         }
     }
 
+    /**
+     * Dynamic gRPC discovery telemetry backed by Consul/Stork.
+     *
+     * @param enabled whether telemetry endpoints are enabled
+     * @param consulHost configured Consul host
+     * @param consulPort configured Consul port
+     * @param refreshPeriod configured refresh period
+     * @param useHealthChecks whether health checks are enabled
+     * @param services resolved service summaries
+     */
     public record DynamicGrpcTelemetry(
             boolean enabled,
             String consulHost,
@@ -301,6 +363,16 @@ public class TelemetryResource {
         }
     }
 
+    /**
+     * Resolution summary for one discovered service.
+     *
+     * @param serviceName logical service name
+     * @param defined whether the service is defined in Stork
+     * @param hasInstances whether any live instances were resolved
+     * @param instanceCount number of resolved instances
+     * @param status resolution status or failure reason
+     * @param instances resolved instance descriptors
+     */
     public record ServiceDiscoverySummary(
             String serviceName,
             boolean defined,
@@ -314,6 +386,14 @@ public class TelemetryResource {
         }
     }
 
+    /**
+     * Serializable view of a resolved service instance.
+     *
+     * @param host instance host
+     * @param port instance port
+     * @param id rendered host:port identifier
+     * @param secure whether the instance uses TLS
+     */
     public record ServiceInstanceDescriptor(
             String host,
             int port,
@@ -322,6 +402,15 @@ public class TelemetryResource {
     ) {
     }
 
+    /**
+     * Version metadata exposed by the telemetry endpoint.
+     *
+     * @param enabled whether telemetry endpoints are enabled
+     * @param applicationName Quarkus application name
+     * @param applicationVersion Quarkus application version
+     * @param profile active Quarkus profile
+     * @param checkedAt timestamp when the snapshot was generated
+     */
     public record VersionTelemetry(
             boolean enabled,
             String applicationName,
