@@ -27,8 +27,7 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    // TODO: revert to "main" after feat/provision-index-rpc merges.
-    gitRef = "feat/provision-index-rpc"
+    gitRef = "main"
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
