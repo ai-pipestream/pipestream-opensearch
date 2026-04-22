@@ -28,6 +28,12 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
 
     private static final Logger LOG = Logger.getLogger(SeparateIndicesIndexingStrategy.class);
 
+    /**
+     * Creates the indexing strategy bean.
+     */
+    public SeparateIndicesIndexingStrategy() {
+    }
+
     // Cache of already-ensured vs index names to avoid repeated mapping checks
     private final Set<String> ensuredIndices = ConcurrentHashMap.newKeySet();
 

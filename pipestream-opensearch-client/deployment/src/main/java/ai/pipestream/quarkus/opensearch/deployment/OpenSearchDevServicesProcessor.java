@@ -60,7 +60,21 @@ public class OpenSearchDevServicesProcessor {
     );
 
     /**
+     * Creates the DevServices processor.
+     */
+    public OpenSearchDevServicesProcessor() {
+    }
+
+    /**
      * DEV mode: Try to use compose-devservices first, fall back to testcontainer.
+     *
+     * @param dockerStatusBuildItem provides Docker availability status
+     * @param compose the detected compose-devservices project, when present
+     * @param launchMode the active Quarkus launch mode
+     * @param config the OpenSearch build-time configuration
+     * @param sharedNetwork shared-network build items contributed by DevServices
+     * @param devServicesConfig the Quarkus DevServices configuration
+     * @return the discovered or started OpenSearch DevServices result, or {@code null} when disabled
      */
     @BuildStep(onlyIf = IsDevelopment.class)
     public DevServicesResultBuildItem startOpenSearchDevServiceDev(
@@ -121,6 +135,11 @@ public class OpenSearchDevServicesProcessor {
     /**
      * TEST mode: Always start an isolated testcontainer.
      * Tests should not rely on compose-devservices to ensure isolation.
+     *
+     * @param dockerStatusBuildItem provides Docker availability status
+     * @param launchMode the active Quarkus launch mode
+     * @param config the OpenSearch build-time configuration
+     * @return the started OpenSearch DevServices result, or {@code null} when disabled
      */
     @BuildStep(onlyIf = IsTest.class, onlyIfNot = IsDevelopment.class)
     public DevServicesResultBuildItem startOpenSearchDevServiceTest(

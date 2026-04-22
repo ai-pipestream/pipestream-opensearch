@@ -17,6 +17,12 @@ public class SemanticConfigServiceImpl extends MutinySemanticConfigServiceGrpc.S
 
     private static final Logger LOG = Logger.getLogger(SemanticConfigServiceImpl.class);
 
+    /**
+     * Creates the gRPC semantic config service bean.
+     */
+    public SemanticConfigServiceImpl() {
+    }
+
     @Inject
     SemanticConfigServiceEngine engine;
 

@@ -22,6 +22,9 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * CDI bean that owns the {@link BulkQueueSet}, wires Micrometer, and executes OpenSearch bulk flushes.
+ */
 @ApplicationScoped
 public class BulkQueueSetBean {
 
@@ -37,6 +40,10 @@ public class BulkQueueSetBean {
     MeterRegistry meterRegistry;
 
     private volatile BulkQueueSet queueSet;
+
+    /** CDI. */
+    public BulkQueueSetBean() {
+    }
 
     // Micrometer instruments — populated in onStartup so the queueSet reference
     // is ready before Micrometer scrapes the gauges.
@@ -87,12 +94,24 @@ public class BulkQueueSetBean {
         }
     }
 
-    /** Submit an item for bulk indexing. The item's resultFuture completes when the flush processes it. */
+    /**
+     * Submit an item for bulk indexing. The item's {@link BulkIndexItem#resultFuture} completes when the flush processes it.
+     *
+     * @param item indexing operation
+     */
     public void submit(BulkIndexItem item) {
         queueSet.submit(item);
     }
 
-    /** Submit and get a future for the result. For gRPC paths that need a response. */
+    /**
+     * Submit and get a future for the result. For gRPC paths that need a response.
+     *
+     * @param indexName target index
+     * @param docId     document id
+     * @param document  document body
+     * @param routing   optional routing key
+     * @return future completed when the bulk response is applied to this item
+     */
     public CompletableFuture<BulkItemResult> submitWithFuture(String indexName, String docId,
                                                                Map<String, Object> document,
                                                                String routing) {
@@ -101,19 +120,54 @@ public class BulkQueueSetBean {
         return future;
     }
 
-    /** Fire-and-forget submit. For entity/telemetry indexing. */
+    /**
+     * Fire-and-forget submit. For entity/telemetry indexing.
+     *
+     * @param indexName target index
+     * @param docId     document id
+     * @param document  document body
+     */
     public void submitFireAndForget(String indexName, String docId, Map<String, Object> document) {
         submit(BulkIndexItem.fireAndForget(indexName, docId, document));
     }
 
-    /** Resize the queue set at runtime. */
+    /**
+     * Resize the queue set at runtime.
+     *
+     * @param queueCount      new queue count
+     * @param capacity        new per-queue capacity
+     * @param flushIntervalMs new flush interval in ms
+     */
     public void resize(int queueCount, int capacity, int flushIntervalMs) {
         queueSet.resize(queueCount, capacity, flushIntervalMs);
     }
 
+    /**
+     * Current queue count.
+     *
+     * @return number of parallel bulk queues
+     */
     public int getQueueCount() { return queueSet.getQueueCount(); }
+
+    /**
+     * Per-queue capacity before a flush is triggered.
+     *
+     * @return capacity per queue
+     */
     public int getCapacity() { return queueSet.getCapacity(); }
+
+    /**
+     * Periodic flush interval configured on the queue set.
+     *
+     * @return interval in milliseconds
+     */
     public int getFlushIntervalMs() { return queueSet.getFlushIntervalMs(); }
+
+    /**
+     * Total number of items waiting across all queues.
+     *
+     * @return combined pending depth
+     */
     public int totalPending() { return queueSet.totalPending(); }
 
     /**

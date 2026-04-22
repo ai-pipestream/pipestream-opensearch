@@ -41,6 +41,12 @@ public class OpenSearchManagerClientProducer {
     OpenSearchManagerClientConfig config;
 
     /**
+     * Creates the OpenSearch Manager client helper bean.
+     */
+    public OpenSearchManagerClientProducer() {
+    }
+
+    /**
      * Checks if the opensearch-manager client is enabled.
      * 
      * @return true if opensearch.manager.enabled=true

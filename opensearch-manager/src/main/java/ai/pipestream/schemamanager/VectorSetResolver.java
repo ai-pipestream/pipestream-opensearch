@@ -16,6 +16,16 @@ public class VectorSetResolver {
     @Inject
     VectorSetServiceEngine engine;
 
+    /** CDI constructor. */
+    public VectorSetResolver() {
+    }
+
+    /**
+     * Resolves a vector set from a directive containing either a registered id or inline spec.
+     *
+     * @param request directive resolution request
+     * @return resolution response
+     */
     public Uni<ResolveVectorSetFromDirectiveResponse> resolve(ResolveVectorSetFromDirectiveRequest request) {
         return engine.resolveVectorSetFromDirective(request);
     }

@@ -29,6 +29,10 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
 
     private static final Logger LOG = Logger.getLogger(NestedIndexingStrategy.class);
 
+    /** CDI; dependencies are injected after construction. */
+    public NestedIndexingStrategy() {
+    }
+
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
 
@@ -275,6 +279,9 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
      * and reconstructs SemanticVectorSet objects on the OpenSearchDocument builder.
      * <p>
      * Public because the read path (GetOpenSearchDocument) needs to call this.
+     *
+     * @param sourceMap  raw OpenSearch document source as a generic map
+     * @param docBuilder  protobuf builder receiving reconstructed semantic sets
      */
     @SuppressWarnings("unchecked")
     public void reconstructSemanticSets(Map<String, Object> sourceMap, OpenSearchDocument.Builder docBuilder) {
@@ -339,7 +346,7 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
      * Phase 1: Resolve every {@link SemanticVectorSet} on the inbound document
      * to a ({@code fieldName}, {@code dimensions}) pair.
      *
-     * <h3>Two-tier resolution</h3>
+     * <p><b>Two-tier resolution</b></p>
      * <ol>
      *   <li><b>Fast tier</b> (steady state): {@link IndexBindingCache} returns
      *       the mapping with no DB call. After the first doc per index loads
@@ -365,6 +372,12 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
      * <p>The {@code accountId}/{@code datasourceId} parameters are still
      * recorded on the binding row by the slow path but no longer consulted
      * by the hot path.
+     *
+     * @param indexName    target OpenSearch index
+     * @param document     inbound document containing semantic vector sets
+     * @param accountId    account id used when the slow path creates bindings
+     * @param datasourceId datasource id used when the slow path creates bindings
+     * @return resolved nested field names and dimensions for each semantic set
      */
     protected Uni<List<VectorSetMapping>> resolveVectorSetsForDocument(
             String indexName, OpenSearchDocument document, String accountId, String datasourceId) {
@@ -434,6 +447,12 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
      * fires on cache misses — typically only on cold start or for the first
      * doc per (index, vector_set) combination. Steady-state traffic never
      * touches this method.
+     *
+     * @param indexName    OpenSearch index receiving the document
+     * @param vset         semantic vector set from the inbound document
+     * @param accountId    account id recorded on new bindings
+     * @param datasourceId datasource id recorded on new bindings
+     * @return persisted vector set entity after resolve/create and bind
      */
     @WithTransaction
     protected Uni<VectorSetEntity> resolveOrCreateAndBind(

@@ -117,6 +117,13 @@ java {
     withSourcesJar()
 }
 
+// After a clean, included-build artifacts must exist before this project's javadoc
+// compiles against deployment sources pulled in transitively.
+tasks.named('javadoc') {
+    dependsOn(gradle.includedBuild('pipestream-opensearch-client').task(':pipestream-opensearch-client:jar'))
+    dependsOn(gradle.includedBuild('pipestream-opensearch-client').task(':pipestream-opensearch-client-deployment:jar'))
+}
+
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
     systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.56"
@@ -131,16 +138,16 @@ compileTestJava {
     options.encoding = 'UTF-8'
 }
 
-// Configure Javadoc task
+// Configure Javadoc task — strict doclint; skip only generated sources (proto, Quarkus, etc.)
 tasks.withType(Javadoc).configureEach { task ->
     def opts = task.options
     opts.encoding = 'UTF-8'
     opts.charSet = 'UTF-8'
     opts.locale = 'en'
-    // Suppress missing Javadoc warnings for now
-    opts.addStringOption('Xdoclint:-missing', '-quiet')
-    // Exclude internal packages
-    task.exclude('**/internal/**', '**/impl/**', '**/test/**')
+    opts.addBooleanOption('Xdoclint:all', true)
+    task.exclude { fe ->
+        fe.file.absolutePath.contains("${File.separator}build${File.separator}generated${File.separator}")
+    }
 }
 
 

@@ -27,6 +27,12 @@ public class OpenSearchHealthCheck implements HealthCheck {
     @Inject
     OpenSearchRuntimeConfig config;
 
+    /**
+     * Creates the readiness health check bean.
+     */
+    public OpenSearchHealthCheck() {
+    }
+
     @Override
     public HealthCheckResponse call() {
         HealthCheckResponseBuilder builder = HealthCheckResponse.named("OpenSearch connection health check");

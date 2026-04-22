@@ -27,6 +27,10 @@ public class AdminSearchService {
 
     private static final Logger LOG = Logger.getLogger(AdminSearchService.class);
 
+    /** CDI; dependencies are injected after construction. */
+    public AdminSearchService() {
+    }
+
     @Inject
     OpenSearchAsyncClient openSearchAsyncClient;
 

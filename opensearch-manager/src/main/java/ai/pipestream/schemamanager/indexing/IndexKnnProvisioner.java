@@ -45,6 +45,10 @@ public class IndexKnnProvisioner {
 
     private static final Logger LOG = Logger.getLogger(IndexKnnProvisioner.class);
 
+    /** CDI; collaborators are injected after construction. */
+    public IndexKnnProvisioner() {
+    }
+
     @Inject
     OpenSearchAsyncClient openSearchAsyncClient;
 
@@ -76,6 +80,9 @@ public class IndexKnnProvisioner {
      * Every caller that derives a chunk index name from {@code chunkConfigId} /
      * {@code embeddingId} MUST use this function. Drift = duplicate indices, cold
      * caches, silent per-doc churn.
+     *
+     * @param input raw id segment (chunk config id, embedding id, etc.)
+     * @return lowercase string safe for use inside OpenSearch index names
      */
     public static String sanitizeForIndexName(String input) {
         if (input == null || input.isEmpty()) {
@@ -92,6 +99,7 @@ public class IndexKnnProvisioner {
      * @param indexName  target OpenSearch index name
      * @param fieldName  KNN field name (e.g. "vector" or an embedding id)
      * @param dimensions vector dimension for the field
+     * @return completion when provisioning finishes (possibly no-op when cached)
      */
     public Uni<Void> ensureKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
@@ -176,6 +184,8 @@ public class IndexKnnProvisioner {
     /**
      * Test / admin helper: forget the cache for an index. The next ensure
      * call will re-issue the OpenSearch metadata requests.
+     *
+     * @param indexName OpenSearch index whose cached provisioning state is dropped
      */
     public void forgetIndex(String indexName) {
         indexExistsCache.remove(indexName);

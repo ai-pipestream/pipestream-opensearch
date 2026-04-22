@@ -44,6 +44,12 @@ public class SemanticConfigServiceEngine {
     private static final String PROVENANCE_SEMANTIC_CONFIG = "SEMANTIC_CONFIG";
     private static final String DEFAULT_RESULT_SET_NAME = "default";
 
+    /**
+     * Creates the semantic config service engine bean.
+     */
+    public SemanticConfigServiceEngine() {
+    }
+
     @Inject
     IndexKnnProvisioner indexKnnProvisioner;
 
@@ -128,6 +134,10 @@ public class SemanticConfigServiceEngine {
      * retries the OpenSearch creation. The hot path's lazy fallback also
      * covers the gap. This is strictly better than the previous "fail closed
      * but also fail at all" behaviour.
+     *
+     * @param semanticConfigId semantic config id or configId to assign
+     * @param baseIndexName base OpenSearch index that should receive bindings
+     * @return assignment result with binding count and side indices touched
      */
     public Uni<AssignmentResult> assignToIndexDetailed(String semanticConfigId, String baseIndexName) {
         if (baseIndexName == null || baseIndexName.isBlank()) {
@@ -151,6 +161,10 @@ public class SemanticConfigServiceEngine {
      * into pojo {@link SideIndexSpec}s. Runs entirely on the Vert.x event
      * loop inside a single transaction. Returns an empty list when the
      * SemanticConfig has no children — Phase 2 then becomes a no-op.
+     *
+     * @param semanticConfigId semantic config id or configId to bind
+     * @param baseIndexName base index receiving the bindings
+     * @return projected side-index specifications for provisioning
      */
     @WithTransaction
     protected Uni<List<SideIndexSpec>> persistBindings(String semanticConfigId, String baseIndexName) {
@@ -283,6 +297,12 @@ public class SemanticConfigServiceEngine {
                 .map(v -> new AssignmentResult(specs.size(), java.util.List.copyOf(touched)));
     }
 
+    /**
+     * Creates a semantic config and its child vector sets.
+     *
+     * @param request semantic config creation request
+     * @return created semantic config response
+     */
     @WithTransaction
     public Uni<CreateSemanticConfigResponse> createSemanticConfig(CreateSemanticConfigRequest request) {
         return Panache.withTransaction(() ->
@@ -408,6 +428,12 @@ public class SemanticConfigServiceEngine {
                 .map(e -> e.id);
     }
 
+    /**
+     * Loads a semantic config by id or name selector.
+     *
+     * @param request semantic config lookup request
+     * @return matching semantic config response
+     */
     @WithSession
     public Uni<GetSemanticConfigResponse> getSemanticConfig(GetSemanticConfigRequest request) {
         Uni<SemanticConfigEntity> lookup = request.hasByName() && request.getByName()
@@ -430,6 +456,12 @@ public class SemanticConfigServiceEngine {
         });
     }
 
+    /**
+     * Lists semantic configs with simple page-token pagination.
+     *
+     * @param request list request containing page controls
+     * @return paged semantic config response
+     */
     @WithSession
     public Uni<ListSemanticConfigsResponse> listSemanticConfigs(ListSemanticConfigsRequest request) {
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 50;
@@ -455,6 +487,12 @@ public class SemanticConfigServiceEngine {
                 });
     }
 
+    /**
+     * Deletes a semantic config and any child vector sets.
+     *
+     * @param request semantic config delete request
+     * @return deletion result
+     */
     @WithTransaction
     public Uni<DeleteSemanticConfigResponse> deleteSemanticConfig(DeleteSemanticConfigRequest request) {
         return Panache.withTransaction(() ->

@@ -24,6 +24,12 @@ public class OpenSearchProcessor {
     private static final Logger LOG = Logger.getLogger(OpenSearchProcessor.class);
     private static final String FEATURE = "pipestream-opensearch";
 
+    /**
+     * Creates the build processor.
+     */
+    public OpenSearchProcessor() {
+    }
+
     @BuildStep
     FeatureBuildItem feature() {
         return new FeatureBuildItem(FEATURE);

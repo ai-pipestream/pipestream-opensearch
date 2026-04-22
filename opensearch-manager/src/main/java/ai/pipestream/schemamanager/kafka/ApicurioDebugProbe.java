@@ -13,10 +13,17 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 
+/**
+ * Startup probe that logs resolved Apicurio Registry configuration for support diagnostics.
+ */
 @ApplicationScoped
 public class ApicurioDebugProbe {
 
     private static final Logger LOG = Logger.getLogger(ApicurioDebugProbe.class);
+
+    /** CDI. */
+    public ApicurioDebugProbe() {
+    }
     private static final String RUN_ID = "initial";
 
     void onStart(@Observes StartupEvent ignored) {

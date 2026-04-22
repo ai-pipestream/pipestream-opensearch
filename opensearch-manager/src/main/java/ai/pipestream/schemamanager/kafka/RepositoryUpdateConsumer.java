@@ -38,6 +38,16 @@ public class RepositoryUpdateConsumer {
     @Inject
     OpenSearchIndexingService indexingService;
 
+    /** CDI; {@link #indexingService} is injected after construction. */
+    public RepositoryUpdateConsumer() {
+    }
+
+    /**
+     * Indexes or deletes a filesystem drive document from OpenSearch.
+     *
+     * @param record Kafka record containing the drive notification
+     * @return completion when processing finishes
+     */
     @Incoming("drive-updates-in")
     public Uni<Void> consumeDriveUpdate(Record<UUID, DriveUpdateNotification> record) {
         UUID key = record.key();
@@ -57,6 +67,12 @@ public class RepositoryUpdateConsumer {
         .replaceWithVoid();
     }
 
+    /**
+     * Indexes repository document lifecycle events (create/update/delete).
+     *
+     * @param record Kafka record with repository event payload
+     * @return completion when indexing finishes
+     */
     @Incoming("repository-document-events-in")
     public Uni<Void> consumeDocumentEvent(Record<UUID, RepositoryEvent> record) {
         UUID key = record.key();
@@ -72,6 +88,12 @@ public class RepositoryUpdateConsumer {
             .replaceWithVoid();
     }
 
+    /**
+     * Indexes or deletes a pipeline module definition document.
+     *
+     * @param notification module create/update/delete payload
+     * @return completion when processing finishes
+     */
     @Incoming("module-updates-in")
     public Uni<Void> consumeModuleUpdate(ModuleUpdateNotification notification) {
         LOG.infof("Received module update: type=%s, module=%s",
@@ -89,6 +111,12 @@ public class RepositoryUpdateConsumer {
         .replaceWithVoid();
     }
 
+    /**
+     * Indexes or deletes a PipeDoc summary document.
+     *
+     * @param notification pipedoc create/update/delete payload
+     * @return completion when processing finishes
+     */
     @Incoming("pipedoc-updates-in")
     public Uni<Void> consumePipeDocUpdate(PipeDocUpdateNotification notification) {
         LOG.infof("Received pipedoc update: type=%s, docId=%s",
@@ -106,6 +134,12 @@ public class RepositoryUpdateConsumer {
         .replaceWithVoid();
     }
 
+    /**
+     * Indexes or deletes a pipeline process request document.
+     *
+     * @param notification process request create/update/delete payload
+     * @return completion when processing finishes
+     */
     @Incoming("process-request-updates-in")
     public Uni<Void> consumeProcessRequestUpdate(ProcessRequestUpdateNotification notification) {
         LOG.infof("Received process request update: type=%s, requestId=%s",
@@ -123,6 +157,12 @@ public class RepositoryUpdateConsumer {
         .replaceWithVoid();
     }
 
+    /**
+     * Indexes or deletes a pipeline process response document.
+     *
+     * @param notification process response create/update/delete payload
+     * @return completion when processing finishes
+     */
     @Incoming("process-response-updates-in")
     public Uni<Void> consumeProcessResponseUpdate(ProcessResponseUpdateNotification notification) {
         LOG.infof("Received process response update: type=%s, responseId=%s",
@@ -140,6 +180,12 @@ public class RepositoryUpdateConsumer {
         .replaceWithVoid();
     }
 
+    /**
+     * Indexes connector upload metadata for repository document uploads.
+     *
+     * @param event upload event payload
+     * @return completion when indexing finishes
+     */
     @Incoming("document-uploaded-events-in")
     public Uni<Void> consumeDocumentUploadedEvent(DocumentUploadedEvent event) {
         LOG.infof("Received document upload event: docId=%s, filename=%s, mimeType=%s, connector=%s",
@@ -152,6 +198,12 @@ public class RepositoryUpdateConsumer {
             .replaceWithVoid();
     }
 
+    /**
+     * Receives graph lifecycle events; currently logs and ignores activate/deactivate noise.
+     *
+     * @param event graph update payload
+     * @return immediate void completion
+     */
     @Incoming("graph-updates-in")
     public Uni<Void> consumeGraphUpdate(GraphUpdateEvent event) {
         LOG.infof("Received graph update event: kind=%s, graphId=%s, clusterId=%s, version=%s",

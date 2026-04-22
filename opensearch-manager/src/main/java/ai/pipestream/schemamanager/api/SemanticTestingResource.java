@@ -25,6 +25,12 @@ public class SemanticTestingResource {
 
     private static final Logger LOG = Logger.getLogger(SemanticTestingResource.class);
 
+    /**
+     * Creates the resource.
+     */
+    public SemanticTestingResource() {
+    }
+
     @Inject
     AnyDocumentMapper anyDocumentMapper;
 
@@ -33,6 +39,9 @@ public class SemanticTestingResource {
 
     /**
      * Preview how a Protobuf 'Any' message (sent as JSON) would be mapped.
+     *
+     * @param payload JSON payload to parse into test metadata
+     * @return mapped document preview or validation error details
      */
     @POST
     @Path("/map")
@@ -59,6 +68,10 @@ public class SemanticTestingResource {
 
     /**
      * Perform a full "Organic Registration" test using a provided OpenSearchDocument JSON.
+     *
+     * @param indexName target OpenSearch index name
+     * @param documentJson JSON representation of the document to index
+     * @return indexing result or validation error details
      */
     @POST
     @Path("/index")

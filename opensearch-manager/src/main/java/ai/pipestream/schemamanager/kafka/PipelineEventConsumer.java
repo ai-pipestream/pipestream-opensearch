@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Consumes pipeline telemetry events from the engine and indexes them
@@ -32,16 +33,43 @@ public class PipelineEventConsumer {
     private static final int MAX_TOTAL_LOG_CHARS = 12_000;
     private static final int MAX_LOG_MESSAGE_CHARS = 1_000;
 
+    /** Tracks the number of events received so we can log the first one at INFO for visibility,
+     *  then downgrade to DEBUG to avoid flooding. Aids diagnosis when the pipeline-events index
+     *  is unexpectedly empty (a flow we hit 2026-04-22 where 2995 events were consumed from
+     *  Kafka but 0 landed in OpenSearch). */
+    private final AtomicLong eventsReceived = new AtomicLong();
+
     @Inject
     OpenSearchIndexingService indexingService;
 
+    /** CDI; {@link #indexingService} is injected after construction. */
+    public PipelineEventConsumer() {
+    }
+
+    /**
+     * Indexes a single pipeline {@link StepExecutionRecord} into the monthly telemetry index.
+     *
+     * @param record Kafka record with key and value
+     * @return empty completion when indexing finishes or the event is dropped
+     */
     @Incoming("pipeline-events")
     public Uni<Void> consumePipelineEvent(Record<UUID, StepExecutionRecord> record) {
+        if (record == null || record.value() == null) {
+            LOG.warnf("PipelineEventConsumer received null record/value (key=%s) — dropping; this usually indicates a deserializer misconfiguration on the pipeline-events channel",
+                    record == null ? "null-record" : String.valueOf(record.key()));
+            return Uni.createFrom().voidItem();
+        }
         UUID key = record.key();
         StepExecutionRecord step = record.value();
 
-        LOG.debugf("Received pipeline event: node=%s, module=%s, doc=%s, status=%s",
-                step.getNodeId(), step.getModuleId(), step.getDocumentId(), step.getStatus());
+        long count = eventsReceived.incrementAndGet();
+        if (count == 1L) {
+            LOG.infof("PipelineEventConsumer received its first pipeline event (node=%s, module=%s, doc=%s, status=%s) — subsequent events log at DEBUG",
+                    step.getNodeId(), step.getModuleId(), step.getDocumentId(), step.getStatus());
+        } else {
+            LOG.debugf("Received pipeline event #%d: node=%s, module=%s, doc=%s, status=%s",
+                    count, step.getNodeId(), step.getModuleId(), step.getDocumentId(), step.getStatus());
+        }
 
         long eventTimestamp = step.hasStartTime() ? step.getStartTime().getSeconds() * 1000 : System.currentTimeMillis();
         long durationMs = 0;
@@ -83,7 +111,19 @@ public class PipelineEventConsumer {
                 .atZone(ZoneOffset.UTC).format(MONTH_FORMAT);
         String indexName = "pipeline-events-" + monthSuffix;
 
-        indexingService.queueForIndexing(indexName, key.toString(), document);
+        // Kafka key may be null for records produced without an explicit key.
+        // Fall back to the protobuf stream_id so telemetry events still land
+        // with a stable document ID; otherwise BulkQueueSetBean would later
+        // NPE on a null docId and that failure is invisible to the consumer.
+        String docId = key != null ? key.toString()
+                : (!step.getStreamId().isEmpty() ? step.getStreamId() : UUID.randomUUID().toString());
+
+        try {
+            indexingService.queueForIndexing(indexName, docId, document);
+        } catch (RuntimeException e) {
+            LOG.warnf(e, "Failed to queue pipeline event for indexing (index=%s, doc=%s, node=%s) — event dropped, telemetry is incomplete",
+                    indexName, docId, step.getNodeId());
+        }
         return Uni.createFrom().voidItem();
     }
 

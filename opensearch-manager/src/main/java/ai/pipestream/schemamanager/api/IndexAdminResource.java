@@ -25,6 +25,10 @@ public class IndexAdminResource {
 
     private static final Logger LOG = Logger.getLogger(IndexAdminResource.class);
 
+    /** JAX-RS resource; dependencies are injected after construction. */
+    public IndexAdminResource() {
+    }
+
     @Inject
     OpenSearchIndexingService indexingService;
 
@@ -36,6 +40,9 @@ public class IndexAdminResource {
 
     /**
      * List all indices, optionally filtered by prefix.
+     *
+     * @param prefix optional index name prefix filter
+     * @return JSON payload with {@code indices} and {@code count}
      */
     @GET
     public Uni<Response> listIndices(@QueryParam("prefix") String prefix) {
@@ -64,6 +71,9 @@ public class IndexAdminResource {
 
     /**
      * Get stats for a specific index.
+     *
+     * @param indexName OpenSearch index name
+     * @return JSON stats or error payload
      */
     @GET
     @Path("/{indexName}/stats")
@@ -85,6 +95,9 @@ public class IndexAdminResource {
 
     /**
      * Check if an index exists.
+     *
+     * @param indexName OpenSearch index name
+     * @return JSON with {@code exists} flag
      */
     @GET
     @Path("/{indexName}/exists")
@@ -99,6 +112,9 @@ public class IndexAdminResource {
 
     /**
      * Get mapping for an index.
+     *
+     * @param indexName OpenSearch index name
+     * @return JSON mapping summary or error payload
      */
     @GET
     @Path("/{indexName}/mapping")
@@ -131,6 +147,9 @@ public class IndexAdminResource {
     /**
      * Create an index with semantic vector schema.
      * Requires dimensions parameter for the kNN vector field.
+     *
+     * @param payload JSON body with {@code indexName}, {@code dimensions}, and optional {@code fieldName}
+     * @return creation result or validation error
      */
     @POST
     public Uni<Response> createIndex(Map<String, Object> payload) {
@@ -173,6 +192,10 @@ public class IndexAdminResource {
     /**
      * Delete an index. For safety, only allows deletion of indices matching
      * test-pipeline-* or pipeline-* prefixes, unless force=true.
+     *
+     * @param indexName OpenSearch index name
+     * @param force     when true, bypasses the pipeline name prefix safety check
+     * @return deletion outcome JSON
      */
     @DELETE
     @Path("/{indexName}")
@@ -201,6 +224,10 @@ public class IndexAdminResource {
 
     /**
      * Retrieve a document from an index by ID.
+     *
+     * @param indexName  OpenSearch index name
+     * @param documentId document id
+     * @return document JSON when found, otherwise 404
      */
     @GET
     @Path("/{indexName}/documents/{documentId}")
@@ -232,6 +259,10 @@ public class IndexAdminResource {
 
     /**
      * Delete a document from an index by ID.
+     *
+     * @param indexName  OpenSearch index name
+     * @param documentId document id
+     * @return JSON with success flag and message
      */
     @DELETE
     @Path("/{indexName}/documents/{documentId}")

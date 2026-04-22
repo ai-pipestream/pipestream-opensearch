@@ -52,6 +52,8 @@ public class BulkIndexingQueue {
 
     /**
      * Start the periodic flush timer using the provided scheduler.
+     *
+     * @param scheduler executor used for periodic flush ticks and capacity-triggered flushes
      */
     public void start(ScheduledExecutorService scheduler) {
         this.scheduler = scheduler;
@@ -81,6 +83,8 @@ public class BulkIndexingQueue {
      * Submit an item to the queue. If the queue size reaches capacity, schedule a flush
      * on the executor thread — never flush inline, because the caller may be a Vert.x
      * event loop thread and the flush handler does blocking I/O.
+     *
+     * @param item indexing operation to enqueue
      */
     public void submit(BulkIndexItem item) {
         queue.offer(item);
@@ -121,6 +125,8 @@ public class BulkIndexingQueue {
     /**
      * Drain all pending items without calling the flush handler.
      * Used during queue resize to move items to new queues.
+     *
+     * @return drained items (possibly empty)
      */
     public List<BulkIndexItem> drainRemaining() {
         List<BulkIndexItem> remaining = new ArrayList<>();
@@ -144,6 +150,8 @@ public class BulkIndexingQueue {
 
     /**
      * Returns the number of items currently pending in the queue.
+     *
+     * @return pending item count
      */
     public int pendingCount() {
         return queue.size();
@@ -151,6 +159,8 @@ public class BulkIndexingQueue {
 
     /**
      * Returns this queue's identifier.
+     *
+     * @return queue id used in logging
      */
     public int queueId() {
         return queueId;

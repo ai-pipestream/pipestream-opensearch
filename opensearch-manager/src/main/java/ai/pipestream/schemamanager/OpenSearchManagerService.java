@@ -46,6 +46,9 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     @Inject
     IndexProvisioningEngine indexProvisioningEngine;
 
+    /** CDI; dependencies injected after construction. */
+    public OpenSearchManagerService() {}
+
     // TODO(phase-3): AddIndexField RPC — append a single new field (KNN or
     //   scalar) to an already-provisioned index without recreating it. Used
     //   when an admin wants to start collecting an additional embedding model
@@ -60,11 +63,23 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     //   row(s) and optionally the side index. Today the only way to undo a
     //   binding is direct DB surgery.
 
+    /**
+     * Indexes one OpenSearch document through the gRPC API.
+     *
+     * @param request document indexing request
+     * @return the asynchronous indexing result
+     */
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         return indexingService.indexDocument(request);
     }
 
+    /**
+     * Streams document indexing requests and emits results in micro-batches.
+     *
+     * @param requests inbound stream of indexing requests
+     * @return outbound stream of per-document indexing responses
+     */
     @Override
     public io.smallrye.mutiny.Multi<StreamIndexDocumentsResponse> streamIndexDocuments(io.smallrye.mutiny.Multi<StreamIndexDocumentsRequest> requests) {
         // Collect documents into batches of 100 or every 500ms
@@ -79,6 +94,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
                 });
     }
 
+    /**
+     * Maps an arbitrary protobuf payload into an OpenSearch document and indexes it.
+     *
+     * @param request request containing the source payload and index metadata
+     * @return the asynchronous indexing result
+     */
     @Override
     public Uni<IndexAnyDocumentResponse> indexAnyDocument(IndexAnyDocumentRequest request) {
         return Uni.createFrom().item(() -> {
@@ -112,61 +133,133 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
                   .build());
     }
 
+    /**
+     * Creates an index through the gRPC API.
+     *
+     * @param request create-index request
+     * @return the asynchronous create-index result
+     */
     @Override
     public Uni<CreateIndexResponse> createIndex(CreateIndexRequest request) {
         return indexingService.createIndex(request);
     }
 
+    /**
+     * Provisions an index and any related bindings required by the request.
+     *
+     * @param request provision-index request
+     * @return the asynchronous provisioning result
+     */
     @Override
     public Uni<ProvisionIndexResponse> provisionIndex(ProvisionIndexRequest request) {
         return indexProvisioningEngine.provision(request);
     }
 
+    /**
+     * Deletes an index through the gRPC API.
+     *
+     * @param request delete-index request
+     * @return the asynchronous delete-index result
+     */
     @Override
     public Uni<DeleteIndexResponse> deleteIndex(DeleteIndexRequest request) {
         return indexingService.deleteIndex(request);
     }
 
+    /**
+     * Checks whether an index exists.
+     *
+     * @param request existence-check request
+     * @return the asynchronous existence result
+     */
     @Override
     public Uni<IndexExistsResponse> indexExists(IndexExistsRequest request) {
         return indexingService.indexExists(request);
     }
 
+    /**
+     * Lists indices available through the manager service.
+     *
+     * @param request list-indices request
+     * @return the asynchronous list response
+     */
     @Override
     public Uni<ListIndicesResponse> listIndices(ListIndicesRequest request) {
         return indexingService.listIndices(request);
     }
 
+    /**
+     * Returns basic statistics for an index.
+     *
+     * @param request index-stats request
+     * @return the asynchronous stats response
+     */
     @Override
     public Uni<GetIndexStatsResponse> getIndexStats(GetIndexStatsRequest request) {
         return indexingService.getIndexStats(request);
     }
 
+    /**
+     * Returns the current mapping for an index.
+     *
+     * @param request mapping lookup request
+     * @return the asynchronous mapping response
+     */
     @Override
     public Uni<GetIndexMappingResponse> getIndexMapping(GetIndexMappingRequest request) {
         return indexingService.getIndexMapping(request);
     }
 
+    /**
+     * Deletes a single document from an index.
+     *
+     * @param request delete-document request
+     * @return the asynchronous delete result
+     */
     @Override
     public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
         return indexingService.deleteDocument(request);
     }
 
+    /**
+     * Fetches a single stored OpenSearch document.
+     *
+     * @param request get-document request
+     * @return the asynchronous lookup result
+     */
     @Override
     public Uni<GetOpenSearchDocumentResponse> getOpenSearchDocument(GetOpenSearchDocumentRequest request) {
         return indexingService.getOpenSearchDocument(request);
     }
 
+    /**
+     * Searches indexed filesystem metadata.
+     *
+     * @param request filesystem search request
+     * @return the asynchronous search response
+     */
     @Override
     public Uni<SearchFilesystemMetaResponse> searchFilesystemMeta(SearchFilesystemMetaRequest request) {
         return indexingService.searchFilesystemMeta(request);
     }
 
+    /**
+     * Searches indexed document-upload records.
+     *
+     * @param request document-upload search request
+     * @return the asynchronous search response
+     */
     @Override
     public Uni<SearchDocumentUploadsResponse> searchDocumentUploads(SearchDocumentUploadsRequest request) {
         return indexingService.searchDocumentUploads(request);
     }
 
+    /**
+     * Ensures a nested embeddings field exists on the target index.
+     *
+     * @param request request describing the field to resolve or create
+     * @return the asynchronous ensure-field result
+     */
     @Override
     public Uni<EnsureNestedEmbeddingsFieldExistsResponse> ensureNestedEmbeddingsFieldExists(
             EnsureNestedEmbeddingsFieldExistsRequest request) {
@@ -225,6 +318,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
         });
     }
 
+    /**
+     * Returns the active bulk-indexing configuration.
+     *
+     * @param request bulk-config request
+     * @return the asynchronous bulk-config response
+     */
     @Override
     public Uni<GetBulkConfigResponse> getBulkConfig(GetBulkConfigRequest request) {
         return Uni.createFrom().item(() ->
@@ -237,6 +336,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
                         .build());
     }
 
+    /**
+     * Updates the bulk-indexing configuration after validating the requested ranges.
+     *
+     * @param request bulk-config update request
+     * @return the asynchronous update result
+     */
     @Override
     public Uni<UpdateBulkConfigResponse> updateBulkConfig(UpdateBulkConfigRequest request) {
         return Uni.createFrom().item(() -> {

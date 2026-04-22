@@ -32,6 +32,11 @@ public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.Chu
 
     private final SemanticMetadataEventProducer eventProducer;
 
+    /**
+     * Creates the gRPC service with its Kafka side-effect producer.
+     *
+     * @param eventProducer Kafka metadata event producer for semantic config updates
+     */
     public ChunkerConfigServiceImpl(SemanticMetadataEventProducer eventProducer) {
         this.eventProducer = eventProducer;
     }

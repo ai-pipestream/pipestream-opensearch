@@ -16,11 +16,17 @@ public interface IndexingStrategyHandler {
 
     /**
      * Index a single document using this strategy's vector storage layout.
+     *
+     * @param request indexing request
+     * @return indexing outcome
      */
     Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request);
 
     /**
      * Index a batch of documents using this strategy's vector storage layout.
+     *
+     * @param batch stream indexing requests
+     * @return one response per request, aligned with input order
      */
     Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch);
 }

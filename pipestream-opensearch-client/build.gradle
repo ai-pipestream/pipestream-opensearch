@@ -12,9 +12,21 @@ subprojects {
     java {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
+        withJavadocJar()
     }
 
     compileJava {
         options.encoding = 'UTF-8'
+    }
+
+    tasks.withType(Javadoc).configureEach { task ->
+        def opts = task.options
+        opts.encoding = 'UTF-8'
+        opts.charSet = 'UTF-8'
+        opts.locale = 'en'
+        opts.addBooleanOption('Xdoclint:all', true)
+        task.exclude { fe ->
+            fe.file.absolutePath.contains("${File.separator}build${File.separator}generated${File.separator}")
+        }
     }
 }
