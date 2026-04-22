@@ -43,6 +43,23 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     @Inject
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
+    @Inject
+    IndexProvisioningEngine indexProvisioningEngine;
+
+    // TODO(phase-3): AddIndexField RPC — append a single new field (KNN or
+    //   scalar) to an already-provisioned index without recreating it. Used
+    //   when an admin wants to start collecting an additional embedding model
+    //   on an existing corpus. Idempotent; refuses on dimension change.
+    // TODO(phase-3): RemoveIndexField RPC — drop a field from an existing
+    //   index. Requires either reindex-with-exclusion or accepting the field
+    //   stays in the lucene segments until next merge. Should be admin-only,
+    //   gated behind a confirm flag. Used to clean up failed embedding-model
+    //   experiments.
+    // TODO(phase-3): RemoveSemanticBinding RPC — counterpart to
+    //   AssignSemanticConfigToIndex. Should drop the vector_set_index_binding
+    //   row(s) and optionally the side index. Today the only way to undo a
+    //   binding is direct DB surgery.
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         return indexingService.indexDocument(request);
@@ -98,6 +115,11 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
     @Override
     public Uni<CreateIndexResponse> createIndex(CreateIndexRequest request) {
         return indexingService.createIndex(request);
+    }
+
+    @Override
+    public Uni<ProvisionIndexResponse> provisionIndex(ProvisionIndexRequest request) {
+        return indexProvisioningEngine.provision(request);
     }
 
     @Override

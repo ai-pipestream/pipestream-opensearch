@@ -92,8 +92,13 @@ public class BulkIndexingQueue {
     /**
      * Drain all pending items and invoke the flush handler.
      * If the handler throws, all futures in the batch are completed with failure.
+     *
+     * Thread-safe without synchronization: {@link LinkedBlockingQueue#drainTo} is atomic,
+     * so concurrent callers each receive disjoint batches. The flushHandler must itself
+     * be thread-safe (handleFlush in BulkQueueSetBean only touches local state, Micrometer
+     * instruments, and the thread-safe OpenSearch async client).
      */
-    public synchronized void flush() {
+    public void flush() {
         List<BulkIndexItem> batch = new ArrayList<>();
         queue.drainTo(batch);
         if (batch.isEmpty()) {

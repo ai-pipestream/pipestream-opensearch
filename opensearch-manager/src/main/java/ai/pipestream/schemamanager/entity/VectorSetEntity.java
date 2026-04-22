@@ -107,8 +107,18 @@ public class VectorSetEntity extends PanacheEntityBase {
         return find("semanticConfig.configId = ?1 and granularity = ?2", semanticConfigId, granularity).firstResult();
     }
 
-    public static Uni<List<VectorSetEntity>> findBySemanticConfigId(String semanticConfigId) {
-        return list("semanticConfig.configId", semanticConfigId);
+    /**
+     * Returns every VectorSet whose parent SemanticConfig has the given
+     * stable {@code configId} (e.g. {@code "default-semantic"}). Pass
+     * {@link SemanticConfigEntity#configId}, NOT the entity's UUID
+     * primary key — the underlying JPQL matches {@code semanticConfig.configId},
+     * not {@code semanticConfig.id}. Method renamed from
+     * {@code findBySemanticConfigId} to make the contract impossible to
+     * confuse: the previous name lured callers into passing {@code .id}
+     * (UUID), which silently returned an empty list.
+     */
+    public static Uni<List<VectorSetEntity>> findBySemanticConfigConfigId(String semanticConfigConfigId) {
+        return list("semanticConfig.configId", semanticConfigConfigId);
     }
 
     public static Uni<List<VectorSetEntity>> listOrderedByCreatedDesc(int page, int pageSize) {

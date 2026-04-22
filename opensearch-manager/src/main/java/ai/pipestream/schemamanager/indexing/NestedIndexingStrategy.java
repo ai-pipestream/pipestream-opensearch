@@ -41,6 +41,36 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
     @Inject
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
+    @Inject
+    IndexBindingCache bindingCache;
+
+    @Inject
+    io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
+    /**
+     * Counts every time {@link #resolveOrCreateAndBind} fires — i.e. every doc
+     * that arrived for a (index, vector_set) pair the canonical
+     * {@code OpenSearchManagerService.ProvisionIndex} flow had not pre-bound.
+     *
+     * <p>Steady-state expected value: <b>0</b> per minute. A non-zero rate
+     * means somebody is sending documents to an index whose semantic side
+     * indices were not provisioned up front, and we're paying for slow-tier
+     * DB writes + cluster-state churn on the per-document hot path. Watch
+     * this in dashboards; alert if it stays non-zero for more than a few
+     * minutes after a deploy / index rotation.
+     */
+    private io.micrometer.core.instrument.Counter lazyBindFallbackCounter;
+
+    @jakarta.annotation.PostConstruct
+    void initMetrics() {
+        this.lazyBindFallbackCounter = io.micrometer.core.instrument.Counter
+                .builder("opensearch_manager_lazy_bind_fallback_total")
+                .description("Documents that triggered the slow-tier vector-set bind+provision fallback "
+                        + "because their index was not pre-provisioned via ProvisionIndex. "
+                        + "Steady-state value should be 0/min.")
+                .register(meterRegistry);
+    }
+
     @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         var document = request.getDocument();
@@ -303,98 +333,202 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
-    // ===== Phase 1: DB operations =====
+    // ===== Phase 1: cache-first binding resolution =====
 
     /**
-     * Phase 1 (DB): Resolve or create VectorSets and bindings inside a transaction.
-     * Returns a list of (fieldName, dimensions) pairs needed for OpenSearch mappings.
+     * Phase 1: Resolve every {@link SemanticVectorSet} on the inbound document
+     * to a ({@code fieldName}, {@code dimensions}) pair.
+     *
+     * <h3>Two-tier resolution</h3>
+     * <ol>
+     *   <li><b>Fast tier</b> (steady state): {@link IndexBindingCache} returns
+     *       the mapping with no DB call. After the first doc per index loads
+     *       the cache, every subsequent doc resolves in pure CPU. This is the
+     *       100%-of-traffic path once
+     *       {@code SemanticConfigService.AssignSemanticConfigToIndex} has been
+     *       called — see {@code SemanticConfigServiceEngine} javadoc.</li>
+     *   <li><b>Slow tier</b> (cold start / unprovisioned doc): on cache miss,
+     *       fall through to {@link #resolveOrCreateAndBind} which runs the
+     *       legacy "find or create vector set + create index binding" logic
+     *       inside a transaction, then invalidates the cache for that index
+     *       so the next miss reloads the freshly-bound state. Slow path runs
+     *       at most once per (index, vector_set) pair before steady state.</li>
+     * </ol>
+     *
+     * <p>The slow tier preserves the contract for callers that hand in
+     * ad-hoc vector sets (without first calling AssignToIndex) — no
+     * regression on existing crawls. The fast tier delivers the perf win:
+     * the per-doc DB lookups + INSERT-ON-CONFLICT against
+     * {@code vector_set_index_binding} that drove p99 IndexDocument latency
+     * past 700 seconds disappear.
+     *
+     * <p>The {@code accountId}/{@code datasourceId} parameters are still
+     * recorded on the binding row by the slow path but no longer consulted
+     * by the hot path.
      */
-    @WithTransaction
     protected Uni<List<VectorSetMapping>> resolveVectorSetsForDocument(
             String indexName, OpenSearchDocument document, String accountId, String datasourceId) {
         if (document.getSemanticSetsCount() == 0) {
             return Uni.createFrom().item(Collections.emptyList());
         }
 
-        List<VectorSetMapping> mappings = new ArrayList<>();
-        Uni<Void> chain = Uni.createFrom().voidItem();
+        return bindingCache.getOrLoad(indexName).flatMap(entry -> {
+            List<VectorSetMapping> mappings = new ArrayList<>(document.getSemanticSetsCount());
+            Uni<Void> chain = Uni.createFrom().voidItem();
+            for (SemanticVectorSet vset : document.getSemanticSetsList()) {
+                final SemanticVectorSet capturedVset = vset;
+                IndexBindingCache.VectorSetMapping cached = lookupInEntry(entry, capturedVset);
+                if (cached != null) {
+                    String nested = (capturedVset.hasNestedFieldName()
+                            && !capturedVset.getNestedFieldName().isBlank())
+                            ? capturedVset.getNestedFieldName()
+                            : cached.fieldName();
+                    mappings.add(new VectorSetMapping(nested, cached.dimensions()));
+                    continue;
+                }
+                // Cache miss: fall through to slow tier (creates if needed,
+                // invalidates the cache so the next access reloads).
+                chain = chain.flatMap(v -> resolveOrCreateAndBind(
+                        indexName, capturedVset, accountId, datasourceId)
+                        .invoke(resolved -> {
+                            String nested = (capturedVset.hasNestedFieldName()
+                                    && !capturedVset.getNestedFieldName().isBlank())
+                                    ? capturedVset.getNestedFieldName()
+                                    : resolved.fieldName;
+                            mappings.add(new VectorSetMapping(nested, resolved.vectorDimensions));
+                        })
+                        .replaceWithVoid());
+            }
+            return chain.replaceWith(mappings);
+        });
+    }
 
-        for (SemanticVectorSet vset : document.getSemanticSetsList()) {
-            String semanticId = String.format("%s_%s_%s",
+    /**
+     * Look up a {@link SemanticVectorSet} in a loaded
+     * {@link IndexBindingCache.IndexEntry}. Returns {@code null} on miss —
+     * caller decides whether to fall through to the slow tier or fail.
+     */
+    private IndexBindingCache.VectorSetMapping lookupInEntry(
+            IndexBindingCache.IndexEntry entry, SemanticVectorSet vset) {
+        if (vset.hasVectorSetId() && !vset.getVectorSetId().isBlank()) {
+            return entry.byVectorSetId().get(vset.getVectorSetId());
+        }
+        if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
+                && vset.hasGranularity()
+                && vset.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
+            String granStr = vset.getGranularity().name().replace("GRANULARITY_LEVEL_", "");
+            return entry.bySemanticAndGran().get(vset.getSemanticConfigId() + "|" + granStr);
+        }
+        String name = String.format("%s_%s_%s",
                 vset.getSourceFieldName(), vset.getChunkConfigId(), vset.getEmbeddingId())
                 .replaceAll("[^a-zA-Z0-9_]", "_");
+        return entry.byName().get(name);
+    }
 
-            chain = chain.flatMap(v -> {
-                if (vset.hasVectorSetId() && !vset.getVectorSetId().isBlank()) {
-                    return VectorSetEntity.<VectorSetEntity>findById(vset.getVectorSetId())
-                            .onItem().transformToUni(entity -> {
-                                if (entity == null) {
-                                    return Uni.createFrom().failure(new IllegalStateException(
-                                            "SemanticVectorSet references unknown vector_set_id: " + vset.getVectorSetId()));
-                                }
-                                String nested = vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank()
-                                        ? vset.getNestedFieldName()
-                                        : entity.fieldName;
-                                mappings.add(new VectorSetMapping(nested, entity.vectorDimensions));
-                                return ensureIndexBinding(indexName, entity, accountId, datasourceId);
-                            });
-                }
-                // Path: Semantic config — lookup by (semantic_config_id, granularity)
-                if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
-                        && vset.hasGranularity()
-                        && vset.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
-                    String granStr = vset.getGranularity().name().replace("GRANULARITY_LEVEL_", "");
-                    return VectorSetEntity.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr)
-                            .onItem().transformToUni(entity -> {
-                                if (entity == null) {
-                                    LOG.warnf("No VectorSet for semantic_config=%s granularity=%s — skipping",
-                                            vset.getSemanticConfigId(), granStr);
-                                    return Uni.createFrom().voidItem();
-                                }
-                                String nested = vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank()
-                                        ? vset.getNestedFieldName() : entity.fieldName;
-                                mappings.add(new VectorSetMapping(nested, entity.vectorDimensions));
-                                return ensureIndexBinding(indexName, entity, accountId, datasourceId);
-                            });
-                }
-                return resolveOrCreateVectorSet(semanticId, vset)
-                        .onItem().transformToUni(vs -> {
-                            mappings.add(new VectorSetMapping(vs.fieldName, vs.vectorDimensions));
-                            if (vs.id != null && vs.id.startsWith("transient-")) {
-                                return Uni.createFrom().voidItem();
-                            }
-                            return ensureIndexBinding(indexName, vs, accountId, datasourceId);
-                        });
-            });
+    /**
+     * Slow-tier fallback: resolve or create the {@link VectorSetEntity} +
+     * upsert its binding row, then invalidate the cache for {@code indexName}
+     * so subsequent docs see the freshly-written state. Runs in a transaction.
+     *
+     * <p>This path is the legacy hot-path code, demoted to a fallback. It only
+     * fires on cache misses — typically only on cold start or for the first
+     * doc per (index, vector_set) combination. Steady-state traffic never
+     * touches this method.
+     */
+    @WithTransaction
+    protected Uni<VectorSetEntity> resolveOrCreateAndBind(
+            String indexName, SemanticVectorSet vset, String accountId, String datasourceId) {
+        // Hot path observability: every entry into this method is a missed
+        // pre-provisioning opportunity. Tag with index so dashboards can pin
+        // the offending crawl/test/admin flow that's bypassing ProvisionIndex.
+        lazyBindFallbackCounter.increment();
+        LOG.warnf("Lazy vector-set bind fallback fired for index=%s vector_set_id=%s semantic_config=%s — "
+                        + "this index should have been pre-provisioned via OpenSearchManagerService.ProvisionIndex. "
+                        + "Continuing with slow-tier resolve+bind+provision; subsequent docs to the same index will be fast.",
+                indexName,
+                vset.hasVectorSetId() ? vset.getVectorSetId() : "(none)",
+                vset.hasSemanticConfigId() ? vset.getSemanticConfigId() : "(none)");
+        Uni<VectorSetEntity> resolveVs;
+        if (vset.hasVectorSetId() && !vset.getVectorSetId().isBlank()) {
+            resolveVs = VectorSetEntity.<VectorSetEntity>findById(vset.getVectorSetId())
+                    .onItem().ifNull().failWith(() -> new IllegalStateException(
+                            "SemanticVectorSet references unknown vector_set_id: " + vset.getVectorSetId()));
+        } else if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
+                && vset.hasGranularity()
+                && vset.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
+            String granStr = vset.getGranularity().name().replace("GRANULARITY_LEVEL_", "");
+            resolveVs = VectorSetEntity.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr)
+                    .onItem().ifNull().failWith(() -> new IllegalStateException(String.format(
+                            "No VectorSet for semantic_config=%s granularity=%s — provision via "
+                                    + "SemanticConfigService before indexing.",
+                            vset.getSemanticConfigId(), granStr)));
+        } else {
+            String semanticId = String.format("%s_%s_%s",
+                    vset.getSourceFieldName(), vset.getChunkConfigId(), vset.getEmbeddingId())
+                    .replaceAll("[^a-zA-Z0-9_]", "_");
+            resolveVs = resolveOrCreateVectorSet(semanticId, vset);
         }
-
-        return chain.replaceWith(mappings);
+        return resolveVs
+                .flatMap(vs -> {
+                    if (vs.id != null && vs.id.startsWith("transient-")) {
+                        return Uni.createFrom().item(vs);
+                    }
+                    return ensureIndexBinding(indexName, vs, accountId, datasourceId).replaceWith(vs);
+                })
+                .invoke(vs -> bindingCache.invalidate(indexName));
     }
 
     // ===== Phase 2: OpenSearch I/O =====
 
     /**
-     * Phase 2 (OpenSearch I/O): Ensure nested KNN mappings exist. Runs outside transaction.
+     * Phase 2 (OpenSearch I/O): Ensure nested KNN mappings exist.
+     *
+     * <p>Fast path: every mapping that the {@link IndexBindingCache} entry has
+     * already marked verified short-circuits with no OpenSearch call. This is
+     * the steady-state behaviour because
+     * {@code SemanticConfigServiceEngine.assignToIndex} provisions all
+     * mappings up front and the first doc to use each (index, field) marks it
+     * verified for the rest of the JVM's life.
+     *
+     * <p>Slow path (cold cache or a brand-new field): the unverified mappings
+     * are checked + created in parallel via {@code Uni.combine().all()}; the
+     * old serial {@code flatMap} chain forced N sequential cluster-state round
+     * trips per doc.
      */
     private Uni<Void> ensureOpenSearchMappings(String indexName, List<VectorSetMapping> mappings) {
         if (mappings.isEmpty()) {
             return Uni.createFrom().voidItem();
         }
+        return bindingCache.getOrLoad(indexName).flatMap(entry -> {
+            List<Uni<Void>> tasks = new ArrayList<>(mappings.size());
+            for (VectorSetMapping m : mappings) {
+                if (entry.isOsFieldVerified(m.fieldName())) {
+                    continue;
+                }
+                tasks.add(ensureSingleMapping(indexName, m, entry));
+            }
+            if (tasks.isEmpty()) {
+                return Uni.createFrom().voidItem();
+            }
+            return Uni.combine().all().unis(tasks).discardItems().replaceWithVoid();
+        });
+    }
 
-        Uni<Void> chain = Uni.createFrom().voidItem();
-        for (VectorSetMapping m : mappings) {
-            chain = chain.flatMap(v ->
-                openSearchSchemaClient.nestedMappingExists(indexName, m.fieldName())
-                    .flatMap(exists -> {
-                        if (exists) return Uni.createFrom().voidItem();
-                        VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
-                                .setDimension(m.dimensions())
-                                .build();
-                        return openSearchSchemaClient.createIndexWithNestedMapping(indexName, m.fieldName(), vfd)
-                                .replaceWith(Uni.createFrom().voidItem());
-                    }));
-        }
-        return chain;
+    private Uni<Void> ensureSingleMapping(
+            String indexName, VectorSetMapping m, IndexBindingCache.IndexEntry entry) {
+        return openSearchSchemaClient.nestedMappingExists(indexName, m.fieldName())
+                .flatMap(exists -> {
+                    if (exists) {
+                        entry.markOsFieldVerified(m.fieldName());
+                        return Uni.createFrom().voidItem();
+                    }
+                    VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
+                            .setDimension(m.dimensions())
+                            .build();
+                    return openSearchSchemaClient.createIndexWithNestedMapping(indexName, m.fieldName(), vfd)
+                            .invoke(() -> entry.markOsFieldVerified(m.fieldName()))
+                            .replaceWithVoid();
+                });
     }
 
     // ===== Internal records =====
@@ -407,7 +541,7 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
-    // ===== DB resolution helpers =====
+    // ===== Slow-tier DB helpers (cache-miss fallback only) =====
 
     private Uni<VectorSetEntity> resolveOrCreateVectorSet(String semanticId, SemanticVectorSet vset) {
         return VectorSetEntity.findByName(semanticId)
@@ -415,12 +549,11 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                 if (existing != null) {
                     return Uni.createFrom().item(existing);
                 }
-
                 return resolveChunkerConfig(vset.getChunkConfigId())
                     .onItem().transformToUni(cc -> resolveEmbeddingConfig(vset.getEmbeddingId())
                         .onItem().transformToUni(emc -> {
                             VectorSetEntity entity = new VectorSetEntity();
-                            entity.id = UUID.randomUUID().toString();
+                            entity.id = java.util.UUID.randomUUID().toString();
                             entity.name = semanticId;
                             entity.chunkerConfig = cc;
                             entity.embeddingModelConfig = emc;
@@ -429,7 +562,6 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                             entity.sourceCel = vset.getSourceFieldName();
                             entity.vectorDimensions = emc.dimensions;
                             entity.provenance = "SEMANTIC_INDEXING";
-
                             return entity.<VectorSetEntity>persist().replaceWith(entity);
                         })
                     )
@@ -438,9 +570,8 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                             LOG.infof("VectorSet '%s' created by concurrent request — re-fetching", semanticId);
                             return VectorSetEntity.findByName(semanticId);
                         }
-                        LOG.errorf(err, "VectorSet resolution failed for '%s' — chunker or embedding config not found in DB. "
-                                + "This document will NOT be indexed with correct vector mappings. "
-                                + "Ensure the semantic-manager has registered its configs before indexing.", semanticId);
+                        LOG.errorf(err, "VectorSet resolution failed for '%s' — chunker or embedding config not found in DB.",
+                                semanticId);
                         return Uni.createFrom().failure(err);
                     });
             });
@@ -454,11 +585,10 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                     .onItem().transformToUni(byName -> {
                         if (byName != null) return Uni.createFrom().item(byName);
                         return ChunkerConfigEntity.findByConfigId(configId)
-                            .onItem().transformToUni(byConfigId -> {
-                                if (byConfigId != null) return Uni.createFrom().item(byConfigId);
-                                return Uni.createFrom().failure(
-                                    new RuntimeException("Chunker config not found: " + configId));
-                            });
+                            .onItem().transformToUni(byConfigId -> byConfigId != null
+                                    ? Uni.createFrom().item(byConfigId)
+                                    : Uni.createFrom().failure(new IllegalStateException(
+                                            "Chunker config not found: " + configId)));
                     });
             });
     }
@@ -468,21 +598,20 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
             .onItem().transformToUni(found -> {
                 if (found != null) return Uni.createFrom().item(found);
                 return EmbeddingModelConfig.findByName(configId)
-                    .onItem().transformToUni(byName -> {
-                        if (byName != null) return Uni.createFrom().item(byName);
-                        return Uni.createFrom().failure(
-                            new RuntimeException("Embedding model config not found: " + configId));
-                    });
+                    .onItem().transformToUni(byName -> byName != null
+                            ? Uni.createFrom().item(byName)
+                            : Uni.createFrom().failure(new IllegalStateException(
+                                    "Embedding model config not found: " + configId)));
             });
     }
 
     private Uni<Void> ensureIndexBinding(String indexName, VectorSetEntity vs, String accountId, String datasourceId) {
-        String id = UUID.nameUUIDFromBytes((vs.id + "|" + indexName).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
-
-        String sql = "INSERT INTO vector_set_index_binding (id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
+        String id = java.util.UUID.nameUUIDFromBytes(
+                (vs.id + "|" + indexName).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
+        String sql = "INSERT INTO vector_set_index_binding "
+                + "(id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
                 + "VALUES (?1, ?2, ?3, ?4, ?5, ?6, now(), now()) "
                 + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
-
         return Panache.getSession()
                 .flatMap(session -> session.flush().replaceWith(session))
                 .flatMap(session -> session.createNativeQuery(sql)
@@ -495,12 +624,23 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                         .executeUpdate()
                         .invoke(rowCount -> {
                             if (rowCount > 0) {
-                                LOG.infof("Created index binding: vectorSet=%s index=%s", vs.id, indexName);
-                            } else {
-                                LOG.debugf("Index binding already exists: vectorSet=%s index=%s", vs.id, indexName);
+                                LOG.infof("Created index binding (slow-tier fallback): vectorSet=%s index=%s",
+                                        vs.id, indexName);
                             }
                         })
                         .replaceWithVoid());
+    }
+
+    private static boolean isConstraintViolation(Throwable t) {
+        while (t != null) {
+            String msg = t.getMessage();
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint")
+                    || msg.contains("duplicate key"))) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     // ===== OpenSearch REST indexing =====
@@ -527,28 +667,4 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         });
     }
 
-    // ===== Constraint violation helpers =====
-
-    private static boolean isConstraintViolation(Throwable t) {
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
-                return true;
-            }
-            t = t.getCause();
-        }
-        return false;
-    }
-
-    private static boolean isUniqueVsIndexBindingViolation(Throwable t) {
-        Throwable original = t;
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && msg.contains("unique_vs_index_binding")) {
-                return true;
-            }
-            t = t.getCause();
-        }
-        return isConstraintViolation(original);
-    }
 }
