@@ -27,7 +27,8 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "main"
+    // TODO: revert to "main" after feat/provision-index-rpc merges.
+    gitRef = "feat/provision-index-rpc"
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
@@ -119,7 +120,7 @@ java {
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
-    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.52"
+    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.56"
 }
 compileJava {
     options.encoding = 'UTF-8'
