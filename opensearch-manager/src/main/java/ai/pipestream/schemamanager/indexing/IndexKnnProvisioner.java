@@ -92,6 +92,54 @@ public class IndexKnnProvisioner {
     }
 
     /**
+     * Ensures the given index exists. If it doesn't, creates it with standard settings.
+     * Idempotent. O(1) on a warm cache.
+     *
+     * @param indexName target OpenSearch index name
+     * @return completion when provisioning finishes (possibly no-op when cached)
+     */
+    public Uni<Void> ensureIndex(String indexName) {
+        if (indexExistsCache.contains(indexName)) {
+            return Uni.createFrom().voidItem();
+        }
+        return Uni.createFrom().item(() -> {
+            provisionIndexBlocking(indexName);
+            return (Void) null;
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    private void provisionIndexBlocking(String indexName) {
+        try {
+            boolean exists;
+            try {
+                exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
+            } catch (Exception e) {
+                exists = false;
+            }
+            if (!exists) {
+                LOG.infof("IndexKnnProvisioner: creating non-KNN index %s", indexName);
+                try {
+                    openSearchAsyncClient.indices().create(c -> c
+                            .index(indexName)
+                            .settings(s -> s
+                                    .numberOfShards(knnConfig.numberOfShards())
+                                    .numberOfReplicas(knnConfig.numberOfReplicas())
+                            )
+                    ).get();
+                } catch (Exception createErr) {
+                    if (!createErr.getMessage().contains("resource_already_exists_exception")) {
+                        throw createErr;
+                    }
+                }
+            }
+            indexExistsCache.add(indexName);
+        } catch (Exception e) {
+            LOG.errorf(e, "IndexKnnProvisioner: failed to ensure index %s", indexName);
+            throw new RuntimeException("Failed to provision index " + indexName, e);
+        }
+    }
+
+    /**
      * Ensures the given index exists with KNN settings and that the given field
      * has a {@code knn_vector} mapping of the given dimension. Idempotent.
      * O(1) on a warm cache.

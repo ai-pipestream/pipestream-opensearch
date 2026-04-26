@@ -27,7 +27,7 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "main"
+    gitRef = "feat/intake-streaming-context-fields"
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
