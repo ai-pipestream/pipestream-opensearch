@@ -7,6 +7,7 @@ import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
+import ai.pipestream.server.vertx.RunOnVertxContext;
 import io.grpc.Status;
 import io.quarkus.grpc.GrpcService;
 import io.quarkus.hibernate.reactive.panache.Panache;
@@ -26,6 +27,7 @@ import java.util.UUID;
  * Uses Hibernate Reactive Panache with Mutiny; no blocking calls.
  */
 @GrpcService
+@RunOnVertxContext
 public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.ChunkerConfigServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(ChunkerConfigServiceImpl.class);

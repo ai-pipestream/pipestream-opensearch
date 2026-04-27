@@ -3,6 +3,7 @@ package ai.pipestream.schemamanager;
 import ai.pipestream.opensearch.v1.*;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
+import ai.pipestream.server.vertx.RunOnVertxContext;
 import jakarta.inject.Singleton;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -13,6 +14,7 @@ import org.jboss.logging.Logger;
  */
 @GrpcService
 @Singleton
+@RunOnVertxContext
 public class VectorSetServiceImpl extends MutinyVectorSetServiceGrpc.VectorSetServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(VectorSetServiceImpl.class);

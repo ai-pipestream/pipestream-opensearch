@@ -3,6 +3,7 @@ package ai.pipestream.schemamanager;
 import ai.pipestream.opensearch.v1.*;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
+import ai.pipestream.server.vertx.RunOnVertxContext;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 import org.jboss.logging.Logger;
@@ -13,6 +14,7 @@ import org.jboss.logging.Logger;
  */
 @GrpcService
 @Singleton
+@RunOnVertxContext
 public class SemanticConfigServiceImpl extends MutinySemanticConfigServiceGrpc.SemanticConfigServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(SemanticConfigServiceImpl.class);

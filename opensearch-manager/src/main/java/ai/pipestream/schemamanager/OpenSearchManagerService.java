@@ -8,6 +8,7 @@ import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsResponse;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.mutiny.Uni;
+import ai.pipestream.server.vertx.RunOnVertxContext;
 import jakarta.inject.Singleton;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -18,6 +19,7 @@ import org.jboss.logging.Logger;
  */
 @GrpcService
 @Singleton
+@RunOnVertxContext
 public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc.OpenSearchManagerServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(OpenSearchManagerService.class);
