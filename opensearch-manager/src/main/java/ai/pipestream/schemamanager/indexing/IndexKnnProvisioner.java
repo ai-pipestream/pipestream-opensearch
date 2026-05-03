@@ -114,7 +114,7 @@ public class IndexKnnProvisioner {
             try {
                 exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
             } catch (Exception e) {
-                exists = false;
+                throw new RuntimeException("Failed to check whether index exists: " + indexName, e);
             }
             if (!exists) {
                 LOG.infof("IndexKnnProvisioner: creating non-KNN index %s", indexName);
@@ -169,7 +169,7 @@ public class IndexKnnProvisioner {
                 try {
                     exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
                 } catch (Exception e) {
-                    exists = false;
+                    throw new RuntimeException("Failed to check whether index exists: " + indexName, e);
                 }
                 if (!exists) {
                     LOG.infof("IndexKnnProvisioner: creating index %s (shards=%d, replicas=%d, refresh=%s)",

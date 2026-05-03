@@ -149,12 +149,15 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
         // For now, iterate individually. Can be optimized to group bulk operations later.
         List<Uni<StreamIndexDocumentsResponse>> tasks = batch.stream().map(req -> {
-            IndexDocumentRequest indexReq = IndexDocumentRequest.newBuilder()
+            IndexDocumentRequest.Builder indexReq = IndexDocumentRequest.newBuilder()
                     .setIndexName(req.getIndexName())
                     .setDocument(req.getDocument())
-                    .setIndexingStrategy(req.getIndexingStrategy())
-                    .build();
-            return indexDocument(indexReq)
+                    .setIndexingStrategy(req.getIndexingStrategy());
+            if (req.hasDocumentMap()) {
+                indexReq.setDocumentMap(req.getDocumentMap());
+            }
+            indexReq.addAllChunkDocuments(req.getChunkDocumentsList());
+            return indexDocument(indexReq.build())
                     .map(resp -> StreamIndexDocumentsResponse.newBuilder()
                             .setRequestId(req.getRequestId())
                             .setDocumentId(resp.getDocumentId())

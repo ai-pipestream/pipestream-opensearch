@@ -12,6 +12,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -55,7 +56,8 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
                 .addAllChunkDocuments(request.getChunkDocumentsList())
                 .build();
 
-        return enqueueDocumentsAsync(List.of(streamReq))
+        return indexKnnProvisioner.ensureIndex(request.getIndexName())
+                .flatMap(v -> enqueueDocumentsAsync(List.of(streamReq)))
                 .map(resps -> {
                     var r = resps.get(0);
                     return IndexDocumentResponse.newBuilder()
@@ -114,22 +116,23 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
                     chunkUnis.add(enqueueChunkGroup(entry.getKey(), entry.getValue()));
                 }
             }
-if (chunkUnis.isEmpty()) {
-    responseUnis.add(baseUni);
-} else {
-    // Return success only if both base and all chunk groups enqueued successfully
-    responseUnis.add(Uni.combine().all().unis(chunkUnis).with(results -> {
-        return results.stream().allMatch(r -> (Boolean)r);
-    }).flatMap(allChunksOk -> baseUni.map(resp -> {
-        if (!allChunksOk) {
-            return StreamIndexDocumentsResponse.newBuilder(resp)
-                    .setSuccess(false)
-                    .setMessage(resp.getMessage() + " (some chunks failed enqueue)")
-                    .build();
-        }
-        return resp;
-    })));
-}
+
+            if (chunkUnis.isEmpty()) {
+                responseUnis.add(baseUni);
+            } else {
+                // Return success only if both base and all chunk groups flush successfully.
+                responseUnis.add(Uni.combine().all().unis(chunkUnis).with(results -> {
+                    return results.stream().allMatch(r -> (Boolean) r);
+                }).flatMap(allChunksOk -> baseUni.map(resp -> {
+                    if (!allChunksOk) {
+                        return StreamIndexDocumentsResponse.newBuilder(resp)
+                                .setSuccess(false)
+                                .setMessage(resp.getMessage() + " (some chunks failed indexing)")
+                                .build();
+                    }
+                    return resp;
+                })));
+            }
         }
 
         return Uni.join().all(responseUnis).andCollectFailures();
@@ -170,19 +173,27 @@ if (chunkUnis.isEmpty()) {
         int dimension = first.chunk().getEmbeddingsMap().get(first.embeddingModelId()).getValuesCount();
 
         return indexKnnProvisioner.ensureKnnField(vsIndexName, "vector", dimension)
-                .replaceWith(() -> {
-                    boolean allOk = true;
+                .flatMap(v -> {
+                    List<Uni<Boolean>> chunkResults = new ArrayList<>(entries.size());
                     for (VsChunkEntry entry : entries) {
                         try {
                             Map<String, Object> docMap = serializeChunkForModel(entry.chunk(), entry.embeddingModelId());
                             String docId = generateChunkDocId(entry.chunk(), entry.embeddingModelId());
-                            bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null);
+                            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future =
+                                    bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null);
+                            chunkResults.add(Uni.createFrom().completionStage(future)
+                                    .map(ai.pipestream.schemamanager.bulk.BulkItemResult::success)
+                                    .onFailure().recoverWithItem(false));
                         } catch (Exception e) {
                             LOG.errorf(e, "Failed to enqueue chunk %s", entry.chunk().getDocId());
-                            allOk = false;
+                            chunkResults.add(Uni.createFrom().item(false));
                         }
                     }
-                    return allOk;
+                    if (chunkResults.isEmpty()) {
+                        return Uni.createFrom().item(true);
+                    }
+                    return Uni.combine().all().unis(chunkResults)
+                            .with(results -> results.stream().allMatch(r -> (Boolean) r));
                 });
     }
 

@@ -18,6 +18,7 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
@@ -57,7 +58,7 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
     void initMetrics() {
         this.lazyBindFallbackCounter = io.micrometer.core.instrument.Counter
                 .builder("opensearch_manager_lazy_bind_fallback_total")
-                .description("Documents that triggered the slow-tier vector-set bind+provision fallback.")
+                .description("Documents that triggered the slow-tier vector-set bind+provision fallback. Steady-state should be 0/min; non-zero means an index was not pre-provisioned.")
                 .register(meterRegistry);
     }
 
@@ -413,12 +414,26 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                             entity.sourceCel = vset.getSourceFieldName();
                             entity.vectorDimensions = emc.dimensions;
                             entity.provenance = "SEMANTIC_INDEXING";
-                            return entity.<VectorSetEntity>persistAndFlush()
-                                    .onFailure().recoverWithUni(err -> {
-                                        if (isConstraintViolation(err)) return VectorSetEntity.findByName(semanticId);
-                                        return Uni.createFrom().failure(err);
-                                    })
-                                    .replaceWith(entity);
+                            String sql = "INSERT INTO vector_set "
+                                    + "(id, name, chunker_config_id, embedding_model_config_id, field_name, "
+                                    + "result_set_name, source_cel, vector_dimensions, provenance, created_at, updated_at) "
+                                    + "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, now(), now()) "
+                                    + "ON CONFLICT ON CONSTRAINT unique_vector_set_name DO NOTHING";
+                            return Panache.getSession()
+                                    .flatMap(session -> session.createNativeQuery(sql)
+                                            .setParameter(1, entity.id)
+                                            .setParameter(2, entity.name)
+                                            .setParameter(3, cc.id)
+                                            .setParameter(4, emc.id)
+                                            .setParameter(5, entity.fieldName)
+                                            .setParameter(6, entity.resultSetName)
+                                            .setParameter(7, entity.sourceCel)
+                                            .setParameter(8, entity.vectorDimensions)
+                                            .setParameter(9, entity.provenance)
+                                            .executeUpdate())
+                                    .flatMap(rows -> VectorSetEntity.findByName(semanticId))
+                                    .onItem().ifNull().failWith(() -> new IllegalStateException(
+                                            "VectorSet was not created or found: " + semanticId));
                         })
                     );
             });
@@ -438,12 +453,13 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
     }
 
     private Uni<Void> ensureIndexBinding(String indexName, VectorSetEntity vs, String accountId, String datasourceId) {
-        String id = java.util.UUID.nameUUIDFromBytes((vs.id + "|" + indexName).getBytes()).toString();
+        String id = java.util.UUID.nameUUIDFromBytes((vs.id + "|" + indexName).getBytes(StandardCharsets.UTF_8)).toString();
         String sql = "INSERT INTO vector_set_index_binding "
                 + "(id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
                 + "VALUES (?1, ?2, ?3, ?4, ?5, ?6, now(), now()) "
-                + "ON CONFLICT (id) DO NOTHING";
+                + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
         return Panache.getSession()
+                .flatMap(session -> session.flush().replaceWith(session))
                 .flatMap(session -> session.createNativeQuery(sql)
                         .setParameter(1, id)
                         .setParameter(2, vs.id)
@@ -458,7 +474,7 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
     private static boolean isConstraintViolation(Throwable t) {
         while (t != null) {
             String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint"))) return true;
+            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) return true;
             t = t.getCause();
         }
         return false;
