@@ -580,35 +580,49 @@ public class VectorSetServiceEngine {
                                 .withDescription("VectorSet not found: " + vsId)
                                 .asRuntimeException());
                     }
-                    String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id : null;
-                    String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.id : null;
+                    // Use the SYMBOLIC ids (configId / name), not the DB UUIDs.
+                    // The sink derives side-index names from the same symbolic
+                    // ids the chunker/embedder stamp on emitted chunks at runtime.
+                    // Using `.id` (UUID) here would make the eager provisioner
+                    // create indices like `--vs--<UUID>--<UUID>` that the sink
+                    // never writes to (mismatch → cold cache + empty indices).
+                    String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
+                    String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
                     int dimensions = vs.vectorDimensions;
                     return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
-                            .map(existing -> existing == null
-                                    ? BindLookupResult.needCreate(chunkerConfigId, embeddingModelId, dimensions)
-                                    : BindLookupResult.alreadyBound(toBindingProto(existing)));
+                            .map(existing -> new BindLookupResult(
+                                    existing != null ? toBindingProto(existing) : null,
+                                    chunkerConfigId, embeddingModelId, dimensions));
                 }));
 
         return phase1.chain(lookup -> {
-                    if (lookup.alreadyBoundProto != null) {
-                        return Uni.createFrom().item(BindVectorSetToIndexResponse.newBuilder()
-                                .setBinding(lookup.alreadyBoundProto)
-                                .setCreated(false)
-                                .build());
-                    }
-                    // Phase 2: provision OS — no session, no transaction. The
-                    // provisioner is free to hop to a worker thread without
-                    // tripping Hibernate Reactive's "live transaction on close" check.
-                    return vectorSetProvisioner.ensureFieldsForVectorSet(
+                    // ALWAYS run the eager provisioner, even when the binding row
+                    // already exists. Short-circuiting on "already bound" was a
+                    // fallback that hid configId-drift bugs: if the chunkerConfig's
+                    // stored configId changed since the original bind (e.g. via a
+                    // self-repair UpdateChunkerConfig), the existing OpenSearch
+                    // side index has a now-stale name and the chunker module
+                    // writes to a name nothing provisioned. Always re-provisioning
+                    // forces the side-index naming to track the current chunker
+                    // configId. The provisioner is idempotent (cache hit on
+                    // unchanged state = O(1) noop), so this is cheap.
+                    Uni<Void> provision = vectorSetProvisioner.ensureFieldsForVectorSet(
                                     vsId,
                                     lookup.chunkerConfigId,
                                     lookup.embeddingModelId,
                                     lookup.dimensions,
                                     indexName)
-                            // Phase 3: insert binding row in a fresh transaction —
-                            // emit back onto the captured event loop because the
-                            // provisioner ran its blocking OS work on a worker thread.
-                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
+                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()));
+
+                    if (lookup.alreadyBoundProto != null) {
+                        // Binding row exists; re-provisioned above; return as not-created.
+                        return provision.replaceWith(BindVectorSetToIndexResponse.newBuilder()
+                                .setBinding(lookup.alreadyBoundProto)
+                                .setCreated(false)
+                                .build());
+                    }
+                    // Phase 3: insert binding row in a fresh transaction.
+                    return provision
                             .chain(() -> Panache.withTransaction(() ->
                                     VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
                                         VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
@@ -645,20 +659,16 @@ public class VectorSetServiceEngine {
 
     /**
      * Outcome of the phase-1 lookup for a single (vector_set, index) bind.
-     * Either the binding already exists (return its proto), or it needs to be
-     * created and we've captured the recipe scalars the provisioner needs.
+     * Always carries the recipe scalars the eager provisioner needs (the
+     * provisioner runs even on already-bound rows so configId drift can't
+     * cause silent side-index naming mismatches). The proto is non-null
+     * iff a binding row already exists.
      */
     private record BindLookupResult(
             VectorSetIndexBinding alreadyBoundProto,
             String chunkerConfigId,
             String embeddingModelId,
             int dimensions) {
-        static BindLookupResult alreadyBound(VectorSetIndexBinding proto) {
-            return new BindLookupResult(proto, null, null, 0);
-        }
-        static BindLookupResult needCreate(String chunkerId, String embeddingId, int dim) {
-            return new BindLookupResult(null, chunkerId, embeddingId, dim);
-        }
     }
 
     /**
@@ -763,9 +773,15 @@ public class VectorSetServiceEngine {
                 resolveBatchLookup(vsIds, indexName));
 
         return phase1.chain(batch -> {
-                    // Phase 2: provision OS for every "needs create" entry, sequentially.
+                    // Phase 2: provision OS for EVERY entry, sequentially — both the
+                    // ones that need a new binding row AND the ones that are already
+                    // bound. Re-provisioning already-bound entries is the architectural
+                    // rule (no fallbacks): the eager provisioner is idempotent (cache
+                    // hit = O(1) noop) when nothing has changed, and is the only path
+                    // that catches configId-drift in pre-existing rows. Skipping it
+                    // for already-bound entries was a fallback that hid drift bugs.
                     Uni<Void> provisionChain = Uni.createFrom().voidItem();
-                    for (BatchBindEntry entry : batch.toCreate) {
+                    for (BatchBindEntry entry : batch.allEntries()) {
                         final BatchBindEntry e = entry;
                         provisionChain = provisionChain.chain(() ->
                                 vectorSetProvisioner.ensureFieldsForVectorSet(
@@ -811,14 +827,18 @@ public class VectorSetServiceEngine {
                                     .withDescription("VectorSet not found: " + vsId)
                                     .asRuntimeException());
                         }
-                        String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id : null;
-                        String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.id : null;
+                        // Symbolic ids (see bindVectorSetToIndex for the why).
+                        String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
+                        String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
                         int dimensions = vs.vectorDimensions;
                         return VectorSetIndexBindingEntity.findBinding(vsId, indexName).map(existing -> {
+                            BatchBindEntry entry = new BatchBindEntry(
+                                    vsId, chunkerConfigId, embeddingModelId, dimensions);
                             if (existing != null) {
                                 acc.alreadyBoundProtos.add(toBindingProto(existing));
+                                acc.alreadyBoundEntries.add(entry);
                             } else {
-                                acc.toCreate.add(new BatchBindEntry(vsId, chunkerConfigId, embeddingModelId, dimensions));
+                                acc.toCreate.add(entry);
                             }
                             return acc;
                         });
@@ -872,7 +892,16 @@ public class VectorSetServiceEngine {
     /** Aggregate phase-1 result for the batch RPC. */
     private static final class BatchBindLookupResult {
         final List<VectorSetIndexBinding> alreadyBoundProtos = new java.util.ArrayList<>();
+        final List<BatchBindEntry> alreadyBoundEntries = new java.util.ArrayList<>();
         final List<BatchBindEntry> toCreate = new java.util.ArrayList<>();
+
+        /** All entries (already-bound + needs-create); the eager provisioner runs over every one. */
+        List<BatchBindEntry> allEntries() {
+            List<BatchBindEntry> all = new java.util.ArrayList<>(alreadyBoundEntries.size() + toCreate.size());
+            all.addAll(alreadyBoundEntries);
+            all.addAll(toCreate);
+            return all;
+        }
     }
 
     private static int parseOffset(String pageToken) {

@@ -92,8 +92,49 @@ public class IndexKnnProvisioner {
     }
 
     /**
-     * Ensures the given index exists. If it doesn't, creates it with standard settings.
-     * Idempotent. O(1) on a warm cache.
+     * Strict-verify variant of {@link #ensureIndex}: succeeds only if the
+     * index has already been provisioned (cache hit). Throws otherwise.
+     * NEVER touches OpenSearch. Use from hot paths (per-doc indexing) where
+     * silently creating an index would mask a missing eager-provisioning
+     * step and add latency to every first-doc-per-(JVM, index) write.
+     *
+     * <p>Hot paths used to call {@link #ensureIndex} for safety. That made
+     * the first doc per (JVM, index) pay 2-4 cluster-state round trips, and
+     * worse, masked the case where eager provisioning never ran (sink would
+     * silently create indices that nothing else expects). Strict-mode here
+     * fails fast: callers see "not eagerly provisioned" with a pointer to
+     * the eager RPCs.
+     */
+    public void requireIndex(String indexName) {
+        if (!indexExistsCache.contains(indexName)) {
+            throw new IllegalStateException(
+                    "Index '" + indexName + "' was not eagerly provisioned. "
+                            + "Call BindVectorSetToIndex / AssignSemanticConfigToIndex / ProvisionIndex "
+                            + "before indexing.");
+        }
+    }
+
+    /**
+     * Strict-verify variant of {@link #ensureKnnField}: succeeds only if the
+     * (index, field, dim) triple has already been provisioned (cache hit).
+     * Throws otherwise. NEVER touches OpenSearch.
+     */
+    public void requireKnnField(String indexName, String fieldName, int dimensions) {
+        String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
+        if (!ensured.contains(cacheKey)) {
+            throw new IllegalStateException(
+                    "KNN field not eagerly provisioned: index=" + indexName
+                            + " field=" + fieldName + " dim=" + dimensions
+                            + ". Call BindVectorSetToIndex / AssignSemanticConfigToIndex first.");
+        }
+    }
+
+    /**
+     * Eagerly ensures the given index exists. If it doesn't, creates it with
+     * standard settings. Idempotent. O(1) on a warm cache.
+     *
+     * <p><b>Eager paths only.</b> Hot paths must use {@link #requireIndex}
+     * — see its javadoc for why.
      *
      * @param indexName target OpenSearch index name
      * @return completion when provisioning finishes (possibly no-op when cached)
@@ -140,9 +181,12 @@ public class IndexKnnProvisioner {
     }
 
     /**
-     * Ensures the given index exists with KNN settings and that the given field
-     * has a {@code knn_vector} mapping of the given dimension. Idempotent.
-     * O(1) on a warm cache.
+     * Eagerly ensures the given index exists with KNN settings and that the
+     * given field has a {@code knn_vector} mapping of the given dimension.
+     * Idempotent. O(1) on a warm cache.
+     *
+     * <p><b>Eager paths only.</b> Hot paths must use {@link #requireKnnField}
+     * — see its javadoc.
      *
      * @param indexName  target OpenSearch index name
      * @param fieldName  KNN field name (e.g. "vector" or an embedding id)

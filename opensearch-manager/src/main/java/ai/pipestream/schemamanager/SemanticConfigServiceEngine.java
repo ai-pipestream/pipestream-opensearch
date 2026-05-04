@@ -242,17 +242,81 @@ public class SemanticConfigServiceEngine {
                     .withDescription("VectorSet " + vs.id + " has no vector dimensions — cannot provision")
                     .asRuntimeException();
         }
-        // The semantic path leaves chunkerConfig null. Fall back to the
-        // semantic config id as the "chunk config id" segment so the
-        // index naming is stable per (semanticConfig, granularity).
-        String chunkConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id
-                : (vs.semanticConfig != null ? vs.semanticConfig.configId : null);
-        if (chunkConfigId == null || chunkConfigId.isBlank()) {
+        // chunkConfigId MUST match what the writer stamps on emitted chunks
+        // — that's how the side-index name lines up between provisioner and
+        // sink. Three cases:
+        //
+        // 1. chunker-backed VectorSet (recipe path):
+        //      chunker module stamps chunk.chunk_config_id = chunkerConfig.configId
+        //      (the symbolic id, e.g. "sentence-10-3")
+        //
+        // 2. semantic-config-backed VectorSet (centroid granularity child):
+        //      semantic-graph module stamps chunk.chunk_config_id = the
+        //      granularity-specific literal it emits at runtime, NOT the
+        //      semanticConfig.configId. Mapping comes from
+        //      module-semantic-graph/SemanticGraphPipelineService:
+        //        PARAGRAPH      → "paragraph_centroid"
+        //        SECTION        → "section_centroid"
+        //        DOCUMENT       → "document_centroid"
+        //        SEMANTIC_CHUNK → "semantic"  (SemanticPipelineInvariants.SEMANTIC_CHUNK_CONFIG_ID)
+        //        SENTENCE       → not emitted by semantic-graph; chunker
+        //                         emits "sentences_internal" directly. The
+        //                         child VectorSet for SENTENCE granularity
+        //                         is provisioned defensively under the same
+        //                         name in case a future semantic step emits it.
+        //      Previous code used `semanticConfig.configId` ("default-semantic")
+        //      so we provisioned `--chunk--default-semantic` while semantic-graph
+        //      wrote to `--chunk--paragraph_centroid` etc. Strict-mode then
+        //      rejected every centroid chunk silently.
+        //
+        // 3. embedding id segment: must use the symbolic NAME the embedder
+        //      module stamps on the embedding map key, NOT the DB UUID. Sink
+        //      derives the side-index name from the chunk's embedding key.
+        String chunkConfigId;
+        if (vs.chunkerConfig != null) {
+            chunkConfigId = vs.chunkerConfig.configId;
+        } else if (vs.semanticConfig != null) {
+            chunkConfigId = chunkConfigIdForGranularity(vs.granularity, vs.semanticConfig.configId);
+        } else {
             throw Status.FAILED_PRECONDITION
                     .withDescription("VectorSet " + vs.id + " has neither chunker config nor semantic config — cannot derive index name")
                     .asRuntimeException();
         }
-        return new SideIndexSpec(vs.id, chunkConfigId, vs.embeddingModelConfig.id, dims);
+        if (chunkConfigId == null || chunkConfigId.isBlank()) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription("VectorSet " + vs.id + " resolved to a blank chunk_config_id — cannot derive index name")
+                    .asRuntimeException();
+        }
+        // Use embedder NAME (symbolic, e.g. "minilm") not the DB UUID — the
+        // sink derives side-index/field names from the chunk's embedding map
+        // key, which the embedder module stamps as the symbolic name.
+        String embeddingId = vs.embeddingModelConfig.name != null
+                && !vs.embeddingModelConfig.name.isBlank()
+                ? vs.embeddingModelConfig.name
+                : vs.embeddingModelConfig.id;
+        return new SideIndexSpec(vs.id, chunkConfigId, embeddingId, dims);
+    }
+
+    /**
+     * Maps a SemanticConfig child VectorSet's {@code granularity} value to
+     * the literal {@code chunk_config_id} that {@code module-semantic-graph}
+     * stamps on emitted chunks at that granularity. Source of truth:
+     * {@code SemanticGraphPipelineService} call sites.
+     */
+    private static String chunkConfigIdForGranularity(String granularity, String fallbackSemanticConfigId) {
+        if (granularity == null) return fallbackSemanticConfigId;
+        return switch (granularity.toUpperCase()) {
+            case "PARAGRAPH"      -> "paragraph_centroid";
+            case "SECTION"        -> "section_centroid";
+            case "DOCUMENT"       -> "document_centroid";
+            case "SEMANTIC_CHUNK" -> "semantic";
+            // Sentence granularity isn't emitted by semantic-graph today;
+            // the chunker emits sentences_internal directly. Provision
+            // defensively under that name so a recipe survives a future
+            // semantic-graph that does emit at SENTENCE granularity.
+            case "SENTENCE"       -> "sentences_internal";
+            default               -> fallbackSemanticConfigId;
+        };
     }
 
     /**

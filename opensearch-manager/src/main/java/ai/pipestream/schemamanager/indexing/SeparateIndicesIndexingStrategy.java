@@ -56,7 +56,13 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
                 .addAllChunkDocuments(request.getChunkDocumentsList())
                 .build();
 
-        return indexKnnProvisioner.ensureIndex(request.getIndexName())
+        // STRICT: hot path verifies the base index was eagerly provisioned;
+        // does not create. If missing, fail loud rather than silently
+        // creating an index nothing else expects.
+        return Uni.createFrom().item(() -> {
+                    indexKnnProvisioner.requireIndex(request.getIndexName());
+                    return (Void) null;
+                })
                 .flatMap(v -> enqueueDocumentsAsync(List.of(streamReq)))
                 .map(resps -> {
                     var r = resps.get(0);
@@ -79,13 +85,15 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
             byBaseIndex.computeIfAbsent(req.getIndexName(), k -> new ArrayList<>()).add(req);
         }
 
-        List<Uni<Void>> baseSchemaTasks = new ArrayList<>();
-        for (String indexName : byBaseIndex.keySet()) {
-            baseSchemaTasks.add(indexKnnProvisioner.ensureIndex(indexName));
-        }
-
-        return Uni.combine().all().unis(baseSchemaTasks).discardItems()
-            .flatMap(v -> enqueueDocumentsAsync(batch));
+        // STRICT: verify each base index was eagerly provisioned. No
+        // create-on-missing.
+        return Uni.createFrom().item(() -> {
+                    for (String indexName : byBaseIndex.keySet()) {
+                        indexKnnProvisioner.requireIndex(indexName);
+                    }
+                    return (Void) null;
+                })
+                .flatMap(v -> enqueueDocumentsAsync(batch));
     }
 
     private Uni<List<StreamIndexDocumentsResponse>> enqueueDocumentsAsync(List<StreamIndexDocumentsRequest> batch) {
@@ -172,7 +180,12 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
         VsChunkEntry first = entries.get(0);
         int dimension = first.chunk().getEmbeddingsMap().get(first.embeddingModelId()).getValuesCount();
 
-        return indexKnnProvisioner.ensureKnnField(vsIndexName, "vector", dimension)
+        // STRICT: verify the per-recipe side index + knn field were eagerly
+        // provisioned by the bind-time path. No create-on-missing here.
+        return Uni.createFrom().item(() -> {
+                    indexKnnProvisioner.requireKnnField(vsIndexName, "vector", dimension);
+                    return (Void) null;
+                })
                 .flatMap(v -> {
                     List<Uni<Boolean>> chunkResults = new ArrayList<>(entries.size());
                     for (VsChunkEntry entry : entries) {

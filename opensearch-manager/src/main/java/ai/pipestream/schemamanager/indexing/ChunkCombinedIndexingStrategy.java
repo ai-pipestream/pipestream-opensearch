@@ -365,13 +365,20 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
      * lookups because eager provisioning at VectorSet-create time already populated the cache.
      */
     private Uni<Void> ensureChunkIndex(String chunkIndexName, Map<String, Integer> embeddingDimensions) {
-        Uni<Void> chain = Uni.createFrom().voidItem();
-        for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
-            String fieldName = sanitizeEmbeddingFieldName(entry.getKey());
-            int dimensions = entry.getValue();
-            chain = chain.flatMap(v -> indexKnnProvisioner.ensureKnnField(chunkIndexName, fieldName, dimensions));
-        }
-        return chain;
+        // STRICT: hot path no longer creates indices/fields. The eager paths
+        // (BindVectorSetToIndex, AssignSemanticConfigToIndex, ProvisionIndex)
+        // must have populated the cache before any doc reaches here. If they
+        // didn't, fail loud — silently creating fields here was costing
+        // seconds on the first doc per (JVM, index, field) and masking
+        // missing eager-provisioning steps elsewhere.
+        return Uni.createFrom().item(() -> {
+            for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
+                String fieldName = sanitizeEmbeddingFieldName(entry.getKey());
+                int dimensions = entry.getValue();
+                indexKnnProvisioner.requireKnnField(chunkIndexName, fieldName, dimensions);
+            }
+            return (Void) null;
+        });
     }
 
     /**

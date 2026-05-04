@@ -103,13 +103,25 @@ public class EagerVectorSetProvisioner implements VectorSetProvisioner {
                     "VectorSet " + vectorSetId + " has non-positive vector_dimensions=" + vectorDimensions));
         }
 
-        final String sideIndex = deriveSeparateVsIndexName(indexName, chunkerConfigId, embeddingModelId);
+        // Provision BOTH naming conventions so the sink works whichever
+        // strategy is configured (CHUNK_COMBINED uses --chunk--<config>;
+        // SEPARATE_INDICES uses --vs--<config>--<embedder>). Mirrors what
+        // SemanticConfigServiceEngine.provisionAllSideIndices already does
+        // for child VectorSets — and matches the contract documented on
+        // AssignSemanticConfigToIndexRequest in the proto:
+        //   "Both are provisioned eagerly so whichever strategy the
+        //    pipeline uses finds the child index + KNN mapping already
+        //    in place."
+        final String separateIndex = deriveSeparateVsIndexName(indexName, chunkerConfigId, embeddingModelId);
+        final String combinedIndex = deriveChunkCombinedIndexName(indexName, chunkerConfigId);
+        final String combinedField = deriveCombinedFieldName(embeddingModelId);
 
-        LOG.infof("EagerVectorSetProvisioner: bind-time provisioning vs=%s base=%s side=%s field=vector dim=%d",
-                vectorSetId, indexName, sideIndex, vectorDimensions);
+        LOG.infof("EagerVectorSetProvisioner: bind-time provisioning vs=%s base=%s separate=%s combined=%s combinedField=%s dim=%d",
+                vectorSetId, indexName, separateIndex, combinedIndex, combinedField, vectorDimensions);
 
         return indexKnnProvisioner.ensureIndex(indexName)
-                .chain(() -> indexKnnProvisioner.ensureKnnField(sideIndex, "vector", vectorDimensions));
+                .chain(() -> indexKnnProvisioner.ensureKnnField(separateIndex, "vector", vectorDimensions))
+                .chain(() -> indexKnnProvisioner.ensureKnnField(combinedIndex, combinedField, vectorDimensions));
     }
 
     /**
@@ -129,5 +141,32 @@ public class EagerVectorSetProvisioner implements VectorSetProvisioner {
                 + IndexKnnProvisioner.sanitizeForIndexName(chunkConfigId)
                 + "--"
                 + IndexKnnProvisioner.sanitizeForIndexName(embeddingModelId);
+    }
+
+    /**
+     * Derives the CHUNK_COMBINED chunk-index name. Mirrors
+     * {@code ChunkCombinedIndexingStrategy.deriveChunkIndexName}. Must stay
+     * in sync.
+     */
+    public static String deriveChunkCombinedIndexName(String baseIndex, String chunkConfigId) {
+        return baseIndex + "--chunk--"
+                + IndexKnnProvisioner.sanitizeForIndexName(chunkConfigId);
+    }
+
+    /**
+     * Derives the embedding field name used inside a CHUNK_COMBINED chunk
+     * index. Mirrors {@code ChunkCombinedIndexingStrategy.sanitizeEmbeddingFieldName}
+     * EXACTLY — must stay in sync with the field-naming used at write time
+     * or the eager-provisioned field name won't match what the sink writes.
+     *
+     * <p>Note the regex differs from {@code IndexKnnProvisioner.sanitizeForIndexName}:
+     * field names use {@code [^a-zA-Z0-9_]} (hyphens become underscores)
+     * while index names use {@code [^a-zA-Z0-9_\-]} (hyphens preserved).
+     * Using the wrong one yielded {@code em_paraphrase-minilm} (with hyphen)
+     * eagerly provisioned vs {@code em_paraphrase_minilm} (with underscore)
+     * the sink wrote, so strict-mode rejected every chunk.
+     */
+    public static String deriveCombinedFieldName(String embeddingModelId) {
+        return "em_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_");
     }
 }
