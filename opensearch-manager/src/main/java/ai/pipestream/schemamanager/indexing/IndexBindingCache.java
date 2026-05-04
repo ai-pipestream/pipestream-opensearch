@@ -66,9 +66,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code pipestream.opensearch-manager.binding-cache.ttl-seconds}.
  *
  * <h2>Concurrency</h2>
- * <p>Concurrent first-touches for the same index dedupe via {@code Uni.memoize}
- * on the load future stored in {@link #pendingLoads}. After the load resolves,
- * the result moves to {@link #cache} and the pending entry is cleared.
+ * <p>Concurrent first-touches for the same index may each perform their own DB
+ * load. Do not share a memoized Hibernate Reactive {@code @WithSession} Uni
+ * across subscribers: that can reuse one session concurrently and corrupt the
+ * reactive result processing state. After the first load resolves, the result
+ * moves to {@link #cache} and steady state is memory-only.
  */
 @ApplicationScoped
 public class IndexBindingCache {
@@ -76,12 +78,6 @@ public class IndexBindingCache {
     private static final Logger LOG = Logger.getLogger(IndexBindingCache.class);
 
     private final ConcurrentHashMap<String, IndexEntry> cache = new ConcurrentHashMap<>();
-
-    /**
-     * In-flight loads, keyed by index name. Cleared after the load resolves.
-     * Concurrent callers attach to the same memoized {@link Uni}.
-     */
-    private final ConcurrentHashMap<String, Uni<IndexEntry>> pendingLoads = new ConcurrentHashMap<>();
 
     /**
      * Cache TTL. After this many seconds, an entry is considered stale and a
@@ -236,17 +232,9 @@ public class IndexBindingCache {
         if (hot != null && !hot.isExpired(ttlSeconds)) {
             return Uni.createFrom().item(hot);
         }
-        return pendingLoads.computeIfAbsent(indexName, idx ->
-                loadFromDb(idx)
-                        .invoke(loaded -> {
-                            cache.put(idx, loaded);
-                            pendingLoads.remove(idx);
-                        })
-                        .onFailure().invoke(err -> {
-                            pendingLoads.remove(idx);
-                            LOG.errorf(err, "Failed to load index bindings for '%s'", idx);
-                        })
-                        .memoize().indefinitely());
+        return loadFromDb(indexName)
+                .invoke(loaded -> cache.put(indexName, loaded))
+                .onFailure().invoke(err -> LOG.errorf(err, "Failed to load index bindings for '%s'", indexName));
     }
 
     /**
@@ -259,7 +247,6 @@ public class IndexBindingCache {
      */
     public void invalidate(String indexName) {
         cache.remove(indexName);
-        pendingLoads.remove(indexName);
         LOG.debugf("Invalidated binding cache for index '%s'", indexName);
     }
 
@@ -268,7 +255,6 @@ public class IndexBindingCache {
      */
     public void invalidateAll() {
         cache.clear();
-        pendingLoads.clear();
         LOG.info("Invalidated all binding caches");
     }
 

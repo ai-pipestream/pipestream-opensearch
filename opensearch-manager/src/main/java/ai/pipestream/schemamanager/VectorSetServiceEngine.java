@@ -9,6 +9,8 @@ import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
+import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
+import com.google.protobuf.Timestamp;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
@@ -17,6 +19,8 @@ import io.quarkus.hibernate.reactive.panache.Panache;
 import io.quarkus.hibernate.reactive.panache.common.WithSession;
 import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
 import io.smallrye.mutiny.Uni;
+import io.vertx.core.Context;
+import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -47,6 +51,9 @@ public class VectorSetServiceEngine {
 
     @Inject
     ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
+
+    @Inject
+    VectorSetProvisioner vectorSetProvisioner;
 
     /** CDI constructor. */
     public VectorSetServiceEngine() {
@@ -525,6 +532,386 @@ public class VectorSetServiceEngine {
             return Uni.createFrom().item(saved);
         });
     }
+
+    // ============================================================================
+    // BINDING RPCs — recipe ↔ index association (many-to-many)
+    // ============================================================================
+
+    /**
+     * Binds an existing VectorSet recipe to an OpenSearch index. The recipe
+     * must already exist; the index does not need to exist (the eager
+     * provisioner — task #79 — will create it as part of putMapping if
+     * needed).
+     *
+     * <p>Idempotent: re-binding the same (vector_set_id, index_name) pair
+     * returns the existing binding with {@code created=false}.
+     */
+    public Uni<BindVectorSetToIndexResponse> bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
+        if (request.getVectorSetId().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id is required").asRuntimeException());
+        }
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        final String vsId = request.getVectorSetId();
+        final String indexName = request.getIndexName();
+        final String accountId = request.hasAccountId() ? request.getAccountId() : null;
+        final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+
+        // Capture the calling Vert.x context now (gRPC dispatch puts us on
+        // the event loop). Phase 2's OpenSearch I/O hops to a worker pool;
+        // we use this captured context to emit Phase 3 back onto the event
+        // loop where Hibernate Reactive's session machinery requires it.
+        final Context vertxContext = Vertx.currentContext();
+        if (vertxContext == null) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                    "bindVectorSetToIndex must run on a Vert.x context"));
+        }
+
+        // Phase 1: read recipe + check existing binding inside a session.
+        // Capture EAGER-loaded scalars so the provisioner phase (which runs
+        // OUTSIDE any session) doesn't need the entity.
+        Uni<BindLookupResult> phase1 = Panache.withSession(() ->
+                VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
+                    if (vs == null) {
+                        return Uni.createFrom().<BindLookupResult>failure(Status.NOT_FOUND
+                                .withDescription("VectorSet not found: " + vsId)
+                                .asRuntimeException());
+                    }
+                    String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id : null;
+                    String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.id : null;
+                    int dimensions = vs.vectorDimensions;
+                    return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
+                            .map(existing -> existing == null
+                                    ? BindLookupResult.needCreate(chunkerConfigId, embeddingModelId, dimensions)
+                                    : BindLookupResult.alreadyBound(toBindingProto(existing)));
+                }));
+
+        return phase1.chain(lookup -> {
+                    if (lookup.alreadyBoundProto != null) {
+                        return Uni.createFrom().item(BindVectorSetToIndexResponse.newBuilder()
+                                .setBinding(lookup.alreadyBoundProto)
+                                .setCreated(false)
+                                .build());
+                    }
+                    // Phase 2: provision OS — no session, no transaction. The
+                    // provisioner is free to hop to a worker thread without
+                    // tripping Hibernate Reactive's "live transaction on close" check.
+                    return vectorSetProvisioner.ensureFieldsForVectorSet(
+                                    vsId,
+                                    lookup.chunkerConfigId,
+                                    lookup.embeddingModelId,
+                                    lookup.dimensions,
+                                    indexName)
+                            // Phase 3: insert binding row in a fresh transaction —
+                            // emit back onto the captured event loop because the
+                            // provisioner ran its blocking OS work on a worker thread.
+                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
+                            .chain(() -> Panache.withTransaction(() ->
+                                    VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
+                                        VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+                                        row.id = UUID.randomUUID().toString();
+                                        row.vectorSet = vs;
+                                        row.indexName = indexName;
+                                        row.accountId = accountId;
+                                        row.datasourceId = datasourceId;
+                                        row.status = "ACTIVE";
+                                        return row.<VectorSetIndexBindingEntity>persist();
+                                    })))
+                            .map(persisted -> BindVectorSetToIndexResponse.newBuilder()
+                                    .setBinding(toBindingProto(persisted))
+                                    .setCreated(true)
+                                    .build());
+                })
+                .onFailure().recoverWithUni(err -> {
+                    if (isUniqueVsIndexBindingViolation(err)) {
+                        // Concurrent insert won the race — re-read and return as not-created.
+                        // Same event-loop hop applies before re-entering Panache.
+                        return Uni.createFrom().<Void>voidItem()
+                                .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
+                                .chain(() -> Panache.withSession(() ->
+                                        VectorSetIndexBindingEntity.findBinding(vsId, indexName)
+                                                .map(existing -> BindVectorSetToIndexResponse.newBuilder()
+                                                        .setBinding(toBindingProto(existing))
+                                                        .setCreated(false)
+                                                        .build())));
+                    }
+                    return Uni.createFrom().failure(err);
+                })
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /**
+     * Outcome of the phase-1 lookup for a single (vector_set, index) bind.
+     * Either the binding already exists (return its proto), or it needs to be
+     * created and we've captured the recipe scalars the provisioner needs.
+     */
+    private record BindLookupResult(
+            VectorSetIndexBinding alreadyBoundProto,
+            String chunkerConfigId,
+            String embeddingModelId,
+            int dimensions) {
+        static BindLookupResult alreadyBound(VectorSetIndexBinding proto) {
+            return new BindLookupResult(proto, null, null, 0);
+        }
+        static BindLookupResult needCreate(String chunkerId, String embeddingId, int dim) {
+            return new BindLookupResult(null, chunkerId, embeddingId, dim);
+        }
+    }
+
+    /**
+     * Removes a VectorSet ↔ index binding. Idempotent: returns
+     * {@code unbound=false} when no such binding existed. Does NOT drop
+     * the OpenSearch field/side-index — data preservation is the default.
+     * (OpenSearch does not support removing fields from a mapping anyway;
+     * dropping a SEPARATE_INDICES side-index can be added later as an
+     * opt-in flag on this RPC.)
+     */
+    @WithTransaction
+    public Uni<UnbindVectorSetFromIndexResponse> unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
+        if (request.getVectorSetId().isBlank() || request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id and index_name are required").asRuntimeException());
+        }
+        final String indexName = request.getIndexName();
+        return VectorSetIndexBindingEntity.deleteBinding(request.getVectorSetId(), indexName)
+                .map(count -> UnbindVectorSetFromIndexResponse.newBuilder()
+                        .setUnbound(count != null && count > 0)
+                        .build())
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /** Lists indices a single VectorSet is bound to, paginated. */
+    @WithSession
+    public Uni<ListIndicesForVectorSetResponse> listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
+        if (request.getVectorSetId().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id is required").asRuntimeException());
+        }
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+        int offset = parseOffset(request.getPageToken());
+        return VectorSetIndexBindingEntity.listByVectorSetId(request.getVectorSetId(), offset, pageSize)
+                .map(rows -> {
+                    var b = ListIndicesForVectorSetResponse.newBuilder();
+                    for (var row : rows) {
+                        b.addBindings(toBindingProto(row));
+                    }
+                    if (rows.size() == pageSize) {
+                        b.setNextPageToken(String.valueOf(offset + pageSize));
+                    }
+                    return b.build();
+                });
+    }
+
+    /** Lists VectorSets bound to a single index, paginated, with hydrated recipes. */
+    @WithSession
+    public Uni<ListVectorSetsForIndexResponse> listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+        int offset = parseOffset(request.getPageToken());
+        return VectorSetIndexBindingEntity.listByIndexName(request.getIndexName(), offset, pageSize)
+                .map(rows -> {
+                    var b = ListVectorSetsForIndexResponse.newBuilder();
+                    for (var row : rows) {
+                        b.addEntries(ListVectorSetsForIndexResponse.Entry.newBuilder()
+                                .setBinding(toBindingProto(row))
+                                .setVectorSet(toVectorSetProto(row.vectorSet, row.indexName))
+                                .build());
+                    }
+                    if (rows.size() == pageSize) {
+                        b.setNextPageToken(String.valueOf(offset + pageSize));
+                    }
+                    return b.build();
+                });
+    }
+
+    /**
+     * All-or-nothing: bind every requested VectorSet to the given index.
+     * If any bind fails (NOT_FOUND, dimension mismatch, etc.) the
+     * transaction rolls back so the index ends up with all the requested
+     * bindings or none of them.
+     */
+    public Uni<CreateIndexWithVectorSetsResponse> createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        if (request.getVectorSetIdsList().isEmpty()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("at least one vector_set_id is required").asRuntimeException());
+        }
+        final String indexName = request.getIndexName();
+        final String accountId = request.hasAccountId() ? request.getAccountId() : null;
+        final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+        final List<String> vsIds = List.copyOf(request.getVectorSetIdsList());
+
+        final Context vertxContext = Vertx.currentContext();
+        if (vertxContext == null) {
+            return Uni.createFrom().failure(new IllegalStateException(
+                    "createIndexWithVectorSets must run on a Vert.x context"));
+        }
+
+        // Phase 1: validate ALL vsIds + check existing bindings, in one read-only session.
+        // Failing here (e.g. NOT_FOUND on any id) short-circuits before any OS work
+        // or DB writes happen — preserves the all-or-nothing atomicity contract.
+        Uni<BatchBindLookupResult> phase1 = Panache.withSession(() ->
+                resolveBatchLookup(vsIds, indexName));
+
+        return phase1.chain(batch -> {
+                    // Phase 2: provision OS for every "needs create" entry, sequentially.
+                    Uni<Void> provisionChain = Uni.createFrom().voidItem();
+                    for (BatchBindEntry entry : batch.toCreate) {
+                        final BatchBindEntry e = entry;
+                        provisionChain = provisionChain.chain(() ->
+                                vectorSetProvisioner.ensureFieldsForVectorSet(
+                                        e.vsId, e.chunkerConfigId, e.embeddingModelId,
+                                        e.dimensions, indexName));
+                    }
+
+                    return provisionChain
+                            // Provisioning hopped to a worker thread — return to the
+                            // event loop before any further Panache calls.
+                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
+                            .chain(() -> {
+                                if (batch.toCreate.isEmpty()) {
+                                    // Everything was already bound — no DB writes needed.
+                                    return Uni.createFrom().item(buildBatchResponse(indexName, batch.alreadyBoundProtos, List.of()));
+                                }
+                                // Phase 3: insert all new binding rows atomically in one transaction.
+                                return Panache.withTransaction(() -> persistBatch(batch.toCreate, indexName, accountId, datasourceId))
+                                        .map(newRows -> {
+                                            List<VectorSetIndexBinding> newProtos = new java.util.ArrayList<>(newRows.size());
+                                            for (VectorSetIndexBindingEntity r : newRows) newProtos.add(toBindingProto(r));
+                                            return buildBatchResponse(indexName, batch.alreadyBoundProtos, newProtos);
+                                        });
+                            });
+                })
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /**
+     * Read-only phase-1 lookup for the batch RPC. Walks every requested vsId,
+     * (a) loads the entity to validate existence and capture EAGER scalars,
+     * (b) checks for an existing binding and either records the existing proto
+     *     or queues a create entry. NOT_FOUND on any id fails the whole batch.
+     */
+    private Uni<BatchBindLookupResult> resolveBatchLookup(List<String> vsIds, String indexName) {
+        Uni<BatchBindLookupResult> chain = Uni.createFrom().item(new BatchBindLookupResult());
+        for (String id : vsIds) {
+            final String vsId = id;
+            chain = chain.chain(acc ->
+                    VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
+                        if (vs == null) {
+                            return Uni.createFrom().<BatchBindLookupResult>failure(Status.NOT_FOUND
+                                    .withDescription("VectorSet not found: " + vsId)
+                                    .asRuntimeException());
+                        }
+                        String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.id : null;
+                        String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.id : null;
+                        int dimensions = vs.vectorDimensions;
+                        return VectorSetIndexBindingEntity.findBinding(vsId, indexName).map(existing -> {
+                            if (existing != null) {
+                                acc.alreadyBoundProtos.add(toBindingProto(existing));
+                            } else {
+                                acc.toCreate.add(new BatchBindEntry(vsId, chunkerConfigId, embeddingModelId, dimensions));
+                            }
+                            return acc;
+                        });
+                    }));
+        }
+        return chain;
+    }
+
+    /** Phase-3 persistence: insert one binding row per "needs create" entry, all in one tx. */
+    private Uni<List<VectorSetIndexBindingEntity>> persistBatch(
+            List<BatchBindEntry> toCreate, String indexName, String accountId, String datasourceId) {
+        Uni<List<VectorSetIndexBindingEntity>> chain = Uni.createFrom().item(new java.util.ArrayList<>());
+        for (BatchBindEntry entry : toCreate) {
+            final BatchBindEntry e = entry;
+            chain = chain.chain(acc ->
+                    VectorSetEntity.<VectorSetEntity>findById(e.vsId).chain(vs -> {
+                        VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+                        row.id = UUID.randomUUID().toString();
+                        row.vectorSet = vs;
+                        row.indexName = indexName;
+                        row.accountId = accountId;
+                        row.datasourceId = datasourceId;
+                        row.status = "ACTIVE";
+                        return row.<VectorSetIndexBindingEntity>persist().map(persisted -> {
+                            acc.add(persisted);
+                            return acc;
+                        });
+                    }));
+        }
+        return chain;
+    }
+
+    private CreateIndexWithVectorSetsResponse buildBatchResponse(
+            String indexName,
+            List<VectorSetIndexBinding> alreadyBound,
+            List<VectorSetIndexBinding> newlyCreated) {
+        var b = CreateIndexWithVectorSetsResponse.newBuilder().setIndexName(indexName);
+        for (var p : alreadyBound) b.addBindings(p);
+        for (var p : newlyCreated) b.addBindings(p);
+        return b.build();
+    }
+
+    /** Captured scalars for one (vector_set, index) entry that needs to be created. */
+    private record BatchBindEntry(
+            String vsId,
+            String chunkerConfigId,
+            String embeddingModelId,
+            int dimensions) {
+    }
+
+    /** Aggregate phase-1 result for the batch RPC. */
+    private static final class BatchBindLookupResult {
+        final List<VectorSetIndexBinding> alreadyBoundProtos = new java.util.ArrayList<>();
+        final List<BatchBindEntry> toCreate = new java.util.ArrayList<>();
+    }
+
+    private static int parseOffset(String pageToken) {
+        if (pageToken == null || pageToken.isBlank()) return 0;
+        try {
+            int v = Integer.parseInt(pageToken);
+            return v < 0 ? 0 : v;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private VectorSetIndexBinding toBindingProto(VectorSetIndexBindingEntity row) {
+        VectorSetIndexBinding.Builder b = VectorSetIndexBinding.newBuilder()
+                .setId(row.id)
+                .setVectorSetId(row.vectorSet != null ? row.vectorSet.id : "")
+                .setIndexName(row.indexName)
+                .setStatus(parseBindingStatus(row.status));
+        if (row.accountId != null) b.setAccountId(row.accountId);
+        if (row.datasourceId != null) b.setDatasourceId(row.datasourceId);
+        if (row.createdAt != null) {
+            b.setCreatedAt(toTimestamp(row.createdAt));
+        }
+        if (row.updatedAt != null) {
+            b.setUpdatedAt(toTimestamp(row.updatedAt));
+        }
+        return b.build();
+    }
+
+    private static VectorSetBindingStatus parseBindingStatus(String status) {
+        if (status == null) return VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_UNSPECIFIED;
+        return switch (status) {
+            case "ACTIVE"  -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_ACTIVE;
+            case "PENDING" -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_PENDING;
+            case "ERROR"   -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_ERROR;
+            default        -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_UNSPECIFIED;
+        };
+    }
+
 
     // --- Proto conversion ---
 

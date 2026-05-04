@@ -100,4 +100,34 @@ public class VectorSetServiceImpl extends MutinyVectorSetServiceGrpc.VectorSetSe
     public Uni<ResolveVectorSetFromDirectiveResponse> resolveVectorSetFromDirective(ResolveVectorSetFromDirectiveRequest request) {
         return engine.resolveVectorSetFromDirective(request);
     }
+
+    /** Bind an existing VectorSet recipe to an OpenSearch index. */
+    @Override
+    public Uni<BindVectorSetToIndexResponse> bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
+        return engine.bindVectorSetToIndex(request);
+    }
+
+    /** Remove a VectorSet ↔ index binding (idempotent). */
+    @Override
+    public Uni<UnbindVectorSetFromIndexResponse> unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
+        return engine.unbindVectorSetFromIndex(request);
+    }
+
+    /** List indices a single VectorSet is bound to, paginated. */
+    @Override
+    public Uni<ListIndicesForVectorSetResponse> listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
+        return engine.listIndicesForVectorSet(request);
+    }
+
+    /** List VectorSets bound to a single index, paginated, with hydrated recipes. */
+    @Override
+    public Uni<ListVectorSetsForIndexResponse> listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
+        return engine.listVectorSetsForIndex(request);
+    }
+
+    /** Atomic: create a new index and bind one or more existing VectorSets to it. */
+    @Override
+    public Uni<CreateIndexWithVectorSetsResponse> createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
+        return engine.createIndexWithVectorSets(request);
+    }
 }

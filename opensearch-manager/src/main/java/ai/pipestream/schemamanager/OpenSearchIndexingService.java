@@ -91,9 +91,47 @@ public class OpenSearchIndexingService {
      * @return the asynchronous list of per-document responses
      */
     public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
-        // Batch path always uses NESTED strategy (the only one currently implemented).
-        // Future: inspect per-request strategy if batch contains mixed strategies.
-        return nestedStrategy.indexDocumentsBatch(batch);
+        if (batch.isEmpty()) {
+            return Uni.createFrom().item(List.of());
+        }
+
+        Map<IndexingStrategy, List<IndexedStreamRequest>> byStrategy = new LinkedHashMap<>();
+        for (int i = 0; i < batch.size(); i++) {
+            StreamIndexDocumentsRequest req = batch.get(i);
+            byStrategy.computeIfAbsent(req.getIndexingStrategy(), ignored -> new ArrayList<>())
+                    .add(new IndexedStreamRequest(i, req));
+        }
+
+        List<Uni<List<IndexedStreamResponse>>> tasks = new ArrayList<>(byStrategy.size());
+        for (Map.Entry<IndexingStrategy, List<IndexedStreamRequest>> entry : byStrategy.entrySet()) {
+            IndexingStrategyHandler handler = resolveStrategy(entry.getKey());
+            List<IndexedStreamRequest> indexedRequests = entry.getValue();
+            List<StreamIndexDocumentsRequest> requests = indexedRequests.stream()
+                    .map(IndexedStreamRequest::request)
+                    .toList();
+
+            tasks.add(handler.indexDocumentsBatch(requests)
+                    .map(responses -> {
+                        List<IndexedStreamResponse> indexedResponses = new ArrayList<>(responses.size());
+                        for (int j = 0; j < responses.size(); j++) {
+                            indexedResponses.add(new IndexedStreamResponse(indexedRequests.get(j).index(), responses.get(j)));
+                        }
+                        return indexedResponses;
+                    }));
+        }
+
+        return Uni.combine().all().unis(tasks)
+                .with(results -> {
+                    List<StreamIndexDocumentsResponse> ordered = new ArrayList<>(Collections.nCopies(batch.size(), null));
+                    for (Object result : results) {
+                        @SuppressWarnings("unchecked")
+                        List<IndexedStreamResponse> indexedResponses = (List<IndexedStreamResponse>) result;
+                        for (IndexedStreamResponse indexedResponse : indexedResponses) {
+                            ordered.set(indexedResponse.index(), indexedResponse.response());
+                        }
+                    }
+                    return ordered;
+                });
     }
 
     /**
@@ -110,6 +148,10 @@ public class OpenSearchIndexingService {
             default -> nestedStrategy;
         };
     }
+
+    private record IndexedStreamRequest(int index, StreamIndexDocumentsRequest request) {}
+
+    private record IndexedStreamResponse(int index, StreamIndexDocumentsResponse response) {}
 
     /**
      * Queue a document for batched indexing into OpenSearch.
