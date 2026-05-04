@@ -9,6 +9,8 @@ import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
+import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
+import com.google.protobuf.Timestamp;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
@@ -47,6 +49,9 @@ public class VectorSetServiceEngine {
 
     @Inject
     ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
+
+    @Inject
+    VectorSetProvisioner vectorSetProvisioner;
 
     /** CDI constructor. */
     public VectorSetServiceEngine() {
@@ -525,6 +530,265 @@ public class VectorSetServiceEngine {
             return Uni.createFrom().item(saved);
         });
     }
+
+    // ============================================================================
+    // BINDING RPCs — recipe ↔ index association (many-to-many)
+    // ============================================================================
+
+    /**
+     * Binds an existing VectorSet recipe to an OpenSearch index. The recipe
+     * must already exist; the index does not need to exist (the eager
+     * provisioner — task #79 — will create it as part of putMapping if
+     * needed).
+     *
+     * <p>Idempotent: re-binding the same (vector_set_id, index_name) pair
+     * returns the existing binding with {@code created=false}.
+     */
+    @WithTransaction
+    public Uni<BindVectorSetToIndexResponse> bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
+        if (request.getVectorSetId().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id is required").asRuntimeException());
+        }
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        final String vsId = request.getVectorSetId();
+        final String indexName = request.getIndexName();
+        final String accountId = request.hasAccountId() ? request.getAccountId() : null;
+        final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+
+        return VectorSetEntity.<VectorSetEntity>findById(vsId)
+                .onItem().transformToUni(vs -> {
+                    if (vs == null) {
+                        return Uni.createFrom().<BindVectorSetToIndexResponse>failure(Status.NOT_FOUND
+                                .withDescription("VectorSet not found: " + vsId)
+                                .asRuntimeException());
+                    }
+                    return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
+                            .onItem().transformToUni(existing -> {
+                                if (existing != null) {
+                                    return Uni.createFrom().item(BindVectorSetToIndexResponse.newBuilder()
+                                            .setBinding(toBindingProto(existing))
+                                            .setCreated(false)
+                                            .build());
+                                }
+                                // Eager OS-side provisioning hook (task #79; today no-op).
+                                // Kept INSIDE the transaction so a putMapping failure aborts
+                                // the binding row insert and we don't leave a phantom
+                                // binding pointing at a never-provisioned field.
+                                return vectorSetProvisioner
+                                        .ensureFieldsForDirectives(
+                                                ai.pipestream.data.v1.VectorSetDirectives.getDefaultInstance(),
+                                                indexName)
+                                        .chain(() -> {
+                                            VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+                                            row.id = UUID.randomUUID().toString();
+                                            row.vectorSet = vs;
+                                            row.indexName = indexName;
+                                            row.accountId = accountId;
+                                            row.datasourceId = datasourceId;
+                                            row.status = "ACTIVE";
+                                            return row.<VectorSetIndexBindingEntity>persist();
+                                        })
+                                        .map(persisted -> BindVectorSetToIndexResponse.newBuilder()
+                                                .setBinding(toBindingProto(persisted))
+                                                .setCreated(true)
+                                                .build());
+                            });
+                })
+                .onFailure().recoverWithUni(err -> {
+                    if (isUniqueVsIndexBindingViolation(err)) {
+                        // Concurrent insert won the race — re-read and return as not-created.
+                        return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
+                                .map(existing -> BindVectorSetToIndexResponse.newBuilder()
+                                        .setBinding(toBindingProto(existing))
+                                        .setCreated(false)
+                                        .build());
+                    }
+                    return Uni.createFrom().failure(err);
+                })
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /**
+     * Removes a VectorSet ↔ index binding. Idempotent: returns
+     * {@code unbound=false} when no such binding existed. Does NOT drop
+     * the OpenSearch field/side-index — data preservation is the default.
+     * (OpenSearch does not support removing fields from a mapping anyway;
+     * dropping a SEPARATE_INDICES side-index can be added later as an
+     * opt-in flag on this RPC.)
+     */
+    @WithTransaction
+    public Uni<UnbindVectorSetFromIndexResponse> unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
+        if (request.getVectorSetId().isBlank() || request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id and index_name are required").asRuntimeException());
+        }
+        final String indexName = request.getIndexName();
+        return VectorSetIndexBindingEntity.deleteBinding(request.getVectorSetId(), indexName)
+                .map(count -> UnbindVectorSetFromIndexResponse.newBuilder()
+                        .setUnbound(count != null && count > 0)
+                        .build())
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /** Lists indices a single VectorSet is bound to, paginated. */
+    @WithSession
+    public Uni<ListIndicesForVectorSetResponse> listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
+        if (request.getVectorSetId().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id is required").asRuntimeException());
+        }
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+        int offset = parseOffset(request.getPageToken());
+        return VectorSetIndexBindingEntity.listByVectorSetId(request.getVectorSetId(), offset, pageSize)
+                .map(rows -> {
+                    var b = ListIndicesForVectorSetResponse.newBuilder();
+                    for (var row : rows) {
+                        b.addBindings(toBindingProto(row));
+                    }
+                    if (rows.size() == pageSize) {
+                        b.setNextPageToken(String.valueOf(offset + pageSize));
+                    }
+                    return b.build();
+                });
+    }
+
+    /** Lists VectorSets bound to a single index, paginated, with hydrated recipes. */
+    @WithSession
+    public Uni<ListVectorSetsForIndexResponse> listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+        int offset = parseOffset(request.getPageToken());
+        return VectorSetIndexBindingEntity.listByIndexName(request.getIndexName(), offset, pageSize)
+                .map(rows -> {
+                    var b = ListVectorSetsForIndexResponse.newBuilder();
+                    for (var row : rows) {
+                        b.addEntries(ListVectorSetsForIndexResponse.Entry.newBuilder()
+                                .setBinding(toBindingProto(row))
+                                .setVectorSet(toVectorSetProto(row.vectorSet, row.indexName))
+                                .build());
+                    }
+                    if (rows.size() == pageSize) {
+                        b.setNextPageToken(String.valueOf(offset + pageSize));
+                    }
+                    return b.build();
+                });
+    }
+
+    /**
+     * All-or-nothing: bind every requested VectorSet to the given index.
+     * If any bind fails (NOT_FOUND, dimension mismatch, etc.) the
+     * transaction rolls back so the index ends up with all the requested
+     * bindings or none of them.
+     */
+    @WithTransaction
+    public Uni<CreateIndexWithVectorSetsResponse> createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
+        if (request.getIndexName().isBlank()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("index_name is required").asRuntimeException());
+        }
+        if (request.getVectorSetIdsList().isEmpty()) {
+            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
+                    .withDescription("at least one vector_set_id is required").asRuntimeException());
+        }
+        final String indexName = request.getIndexName();
+        final String accountId = request.hasAccountId() ? request.getAccountId() : null;
+        final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+
+        Uni<List<VectorSetIndexBindingEntity>> chain = Uni.createFrom().item(new java.util.ArrayList<>());
+        for (String vsId : request.getVectorSetIdsList()) {
+            final String capturedVsId = vsId;
+            chain = chain.flatMap(acc -> bindOneInTransaction(capturedVsId, indexName, accountId, datasourceId)
+                    .map(row -> { acc.add(row); return acc; }));
+        }
+        return chain
+                .map(rows -> {
+                    var b = CreateIndexWithVectorSetsResponse.newBuilder().setIndexName(indexName);
+                    for (var row : rows) {
+                        b.addBindings(toBindingProto(row));
+                    }
+                    return b.build();
+                })
+                .invoke(resp -> bindingCache.invalidate(indexName));
+    }
+
+    /** Single-bind helper used by createIndexWithVectorSets; same body as bindVectorSetToIndex
+     *  but returns the entity (not the response proto) so the caller can collect a list. */
+    private Uni<VectorSetIndexBindingEntity> bindOneInTransaction(
+            String vsId, String indexName, String accountId, String datasourceId) {
+        return VectorSetEntity.<VectorSetEntity>findById(vsId)
+                .onItem().transformToUni(vs -> {
+                    if (vs == null) {
+                        return Uni.createFrom().<VectorSetIndexBindingEntity>failure(Status.NOT_FOUND
+                                .withDescription("VectorSet not found: " + vsId)
+                                .asRuntimeException());
+                    }
+                    return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
+                            .onItem().transformToUni(existing -> {
+                                if (existing != null) {
+                                    return Uni.createFrom().item(existing);
+                                }
+                                return vectorSetProvisioner
+                                        .ensureFieldsForDirectives(
+                                                ai.pipestream.data.v1.VectorSetDirectives.getDefaultInstance(),
+                                                indexName)
+                                        .chain(() -> {
+                                            VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+                                            row.id = UUID.randomUUID().toString();
+                                            row.vectorSet = vs;
+                                            row.indexName = indexName;
+                                            row.accountId = accountId;
+                                            row.datasourceId = datasourceId;
+                                            row.status = "ACTIVE";
+                                            return row.<VectorSetIndexBindingEntity>persist();
+                                        });
+                            });
+                });
+    }
+
+    private static int parseOffset(String pageToken) {
+        if (pageToken == null || pageToken.isBlank()) return 0;
+        try {
+            int v = Integer.parseInt(pageToken);
+            return v < 0 ? 0 : v;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private VectorSetIndexBinding toBindingProto(VectorSetIndexBindingEntity row) {
+        VectorSetIndexBinding.Builder b = VectorSetIndexBinding.newBuilder()
+                .setId(row.id)
+                .setVectorSetId(row.vectorSet != null ? row.vectorSet.id : "")
+                .setIndexName(row.indexName)
+                .setStatus(parseBindingStatus(row.status));
+        if (row.accountId != null) b.setAccountId(row.accountId);
+        if (row.datasourceId != null) b.setDatasourceId(row.datasourceId);
+        if (row.createdAt != null) {
+            b.setCreatedAt(toTimestamp(row.createdAt));
+        }
+        if (row.updatedAt != null) {
+            b.setUpdatedAt(toTimestamp(row.updatedAt));
+        }
+        return b.build();
+    }
+
+    private static VectorSetBindingStatus parseBindingStatus(String status) {
+        if (status == null) return VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_UNSPECIFIED;
+        return switch (status) {
+            case "ACTIVE"  -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_ACTIVE;
+            case "PENDING" -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_PENDING;
+            case "ERROR"   -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_ERROR;
+            default        -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_UNSPECIFIED;
+        };
+    }
+
 
     // --- Proto conversion ---
 

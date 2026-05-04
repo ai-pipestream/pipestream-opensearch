@@ -106,4 +106,45 @@ public class VectorSetIndexBindingEntity extends PanacheEntityBase {
         }
         return list("indexName in ?1", indexNames);
     }
+
+    /**
+     * Lists bindings for a single VectorSet across all indexes, paginated.
+     *
+     * @param vectorSetId  vector set id
+     * @param offset       row offset (0-based)
+     * @param limit        page size, must be &gt; 0
+     * @return matching bindings ordered by index_name for stable pagination
+     */
+    public static Uni<List<VectorSetIndexBindingEntity>> listByVectorSetId(
+            String vectorSetId, int offset, int limit) {
+        return find("vectorSet.id = ?1 order by indexName", vectorSetId)
+                .page(offset / Math.max(limit, 1), Math.max(limit, 1))
+                .list();
+    }
+
+    /**
+     * Lists bindings for a single OpenSearch index across all VectorSets, paginated.
+     *
+     * @param indexName    OpenSearch index name
+     * @param offset       row offset (0-based)
+     * @param limit        page size, must be &gt; 0
+     * @return matching bindings ordered by vector set id for stable pagination
+     */
+    public static Uni<List<VectorSetIndexBindingEntity>> listByIndexName(
+            String indexName, int offset, int limit) {
+        return find("indexName = ?1 order by vectorSet.id", indexName)
+                .page(offset / Math.max(limit, 1), Math.max(limit, 1))
+                .list();
+    }
+
+    /**
+     * Deletes the binding for the (vector set, index) pair if it exists.
+     *
+     * @param vectorSetId vector set id
+     * @param indexName   OpenSearch index name
+     * @return number of rows deleted (0 or 1)
+     */
+    public static Uni<Long> deleteBinding(String vectorSetId, String indexName) {
+        return delete("vectorSet.id = ?1 and indexName = ?2", vectorSetId, indexName);
+    }
 }
