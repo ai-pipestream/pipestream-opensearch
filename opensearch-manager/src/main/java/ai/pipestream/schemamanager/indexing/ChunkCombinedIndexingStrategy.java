@@ -576,6 +576,11 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
             doc.put(fieldName, values);
         }
 
+        // Crawl provenance for per-run progress queries
+        if (chunk.hasCrawlId() && !chunk.getCrawlId().isEmpty()) {
+            doc.put("crawl_id", chunk.getCrawlId());
+        }
+
         return doc;
     }
 

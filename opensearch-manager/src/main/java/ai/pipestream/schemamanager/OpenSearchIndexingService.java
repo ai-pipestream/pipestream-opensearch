@@ -993,6 +993,102 @@ public class OpenSearchIndexingService {
     }
 
     /**
+     * Returns per-index document counts for the family of indices touched by
+     * a single crawl run, filtered by {@code term: { crawl_id: <crawl_id> }}.
+     *
+     * <p>The handler resolves the family by listing every index whose name
+     * is either the literal {@code base_index_name} or starts with
+     * {@code base_index_name + "--chunk--"} or {@code base_index_name + "--vs--"}
+     * (the two side-index naming conventions written by the eager provisioner
+     * + sink). For each member it runs a {@code _count} query with a
+     * {@code term} filter on {@code crawl_id} and returns the per-index count.
+     *
+     * <p>Per-index failures (index doesn't exist yet, transient OpenSearch
+     * error) are surfaced inside the response — the request as a whole only
+     * fails when the family cannot be enumerated. Counts for crawl_id values
+     * never written are 0 for every index, which is the correct progress
+     * signal during the early ramp-up of a fresh run.
+     *
+     * @param request crawl-scoped stats request
+     * @return per-index counts filtered by crawl_id
+     */
+    public Uni<ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse> getCrawlIndexStats(
+            ai.pipestream.opensearch.v1.GetCrawlIndexStatsRequest request) {
+        String crawlId = request.getCrawlId();
+        String baseIndex = request.getBaseIndexName();
+        if (crawlId == null || crawlId.isEmpty() || baseIndex == null || baseIndex.isEmpty()) {
+            return Uni.createFrom().item(ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder()
+                    .setSuccess(false)
+                    .setMessage("crawl_id and base_index_name are required")
+                    .build());
+        }
+
+        return Uni.createFrom().item(() -> {
+            ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.Builder respBuilder =
+                    ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder();
+            try {
+                // Enumerate the family: base + base--chunk--* + base--vs--*.
+                // We use cat/indices via the low-level client because
+                // .indices().get(index="X*") with a wildcard would fail when
+                // the base hasn't been written yet.
+                String[] patterns = new String[]{
+                        baseIndex,
+                        baseIndex + "--chunk--*",
+                        baseIndex + "--vs--*"
+                };
+                java.util.Set<String> familyMembers = new java.util.LinkedHashSet<>();
+                for (String pattern : patterns) {
+                    try {
+                        var resolveResp = openSearchAsyncClient.indices()
+                                .get(g -> g.index(pattern).ignoreUnavailable(true).allowNoIndices(true))
+                                .get();
+                        familyMembers.addAll(resolveResp.result().keySet());
+                    } catch (Exception e) {
+                        // index_not_found / no concrete indices: that's fine
+                        // for an early-run query; continue without this pattern.
+                        LOG.debugf("Family resolve for pattern %s yielded none: %s", pattern, e.getMessage());
+                    }
+                }
+
+                if (familyMembers.isEmpty()) {
+                    // Nothing exists yet — base + side indices haven't been
+                    // created. Return success=true with no counts; the caller
+                    // treats this as "still at zero, keep polling".
+                    respBuilder.setSuccess(true)
+                            .setMessage("No indices found yet for base " + baseIndex);
+                    return respBuilder.build();
+                }
+
+                // Run a count query per family member with the crawl_id term.
+                for (String idx : familyMembers) {
+                    var entry = ai.pipestream.opensearch.v1.CrawlIndexCount.newBuilder()
+                            .setIndexName(idx);
+                    try {
+                        final String ci = crawlId;
+                        var countResp = openSearchAsyncClient.count(c -> c
+                                .index(idx)
+                                .query(q -> q.term(t -> t.field("crawl_id").value(v -> v.stringValue(ci))))
+                        ).get();
+                        entry.setSuccess(true).setDocumentCount(countResp.count());
+                    } catch (Exception e) {
+                        entry.setSuccess(false)
+                                .setMessage("count failed for " + idx + ": " + e.getMessage());
+                    }
+                    respBuilder.addIndexCounts(entry.build());
+                }
+                respBuilder.setSuccess(true);
+                return respBuilder.build();
+            } catch (Exception e) {
+                LOG.warnf("Failed to compute crawl-scoped stats for crawl_id=%s base=%s: %s",
+                        crawlId, baseIndex, e.getMessage());
+                return respBuilder.setSuccess(false)
+                        .setMessage("Failed to compute crawl-scoped stats: " + e.getMessage())
+                        .build();
+            }
+        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+    }
+
+    /**
      * Deletes a single document from an index.
      *
      * @param request delete-document request

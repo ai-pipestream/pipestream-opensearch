@@ -199,6 +199,12 @@ public class OpenSearchManagerService extends MutinyOpenSearchManagerServiceGrpc
         return indexingService.getIndexStats(request);
     }
 
+    @Override
+    public Uni<ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse> getCrawlIndexStats(
+            ai.pipestream.opensearch.v1.GetCrawlIndexStatsRequest request) {
+        return indexingService.getCrawlIndexStats(request);
+    }
+
     /**
      * Returns the current mapping for an index.
      *
