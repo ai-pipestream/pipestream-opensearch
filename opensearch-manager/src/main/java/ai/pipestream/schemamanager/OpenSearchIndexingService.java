@@ -1060,6 +1060,12 @@ public class OpenSearchIndexingService {
                 }
 
                 // Run a count query per family member with the crawl_id term.
+                // Use the {@code crawl_id.keyword} subfield because the dynamic
+                // template maps {@code crawl_id} as {@code text} (analyzed),
+                // which tokenises UUIDs on the dashes and makes a {@code term}
+                // query against the parent field always return zero. The
+                // {@code .keyword} sibling carries the exact value for term
+                // matching. Same trick OSM aggs already use elsewhere.
                 for (String idx : familyMembers) {
                     var entry = ai.pipestream.opensearch.v1.CrawlIndexCount.newBuilder()
                             .setIndexName(idx);
@@ -1067,7 +1073,7 @@ public class OpenSearchIndexingService {
                         final String ci = crawlId;
                         var countResp = openSearchAsyncClient.count(c -> c
                                 .index(idx)
-                                .query(q -> q.term(t -> t.field("crawl_id").value(v -> v.stringValue(ci))))
+                                .query(q -> q.term(t -> t.field("crawl_id.keyword").value(v -> v.stringValue(ci))))
                         ).get();
                         entry.setSuccess(true).setDocumentCount(countResp.count());
                     } catch (Exception e) {
