@@ -375,6 +375,14 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
                 }
                 tasks.add(ensureSingleMapping(indexName, m, entry));
             }
+            // All mappings already verified in the binding cache — no
+            // round-trip needed. Mutiny's Uni.combine().all().unis(...) throws
+            // IllegalArgumentException on an empty list, which surfaces as
+            // INVALID_ARGUMENT to the sink and fails every doc once the cache
+            // is hot.
+            if (tasks.isEmpty()) {
+                return Uni.createFrom().voidItem();
+            }
             return Uni.combine().all().unis(tasks).discardItems().replaceWithVoid();
         });
     }
