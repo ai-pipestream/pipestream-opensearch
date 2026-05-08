@@ -19,6 +19,7 @@ import ai.pipestream.schemamanager.entity.IndexPlanEntity;
 import ai.pipestream.schemamanager.entity.IndexPlanVectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.indexing.IndexKnnProvisioner;
+import ai.pipestream.schemamanager.validation.PlanProducibilityValidator;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
 import com.google.protobuf.Timestamp;
 import io.grpc.Status;
@@ -77,6 +78,9 @@ public class IndexPlanServiceEngine {
 
     @Inject
     OpenSearchClient openSearchClient;
+
+    @Inject
+    PlanProducibilityValidator planProducibilityValidator;
 
     /** CDI constructor. */
     public IndexPlanServiceEngine() {
@@ -312,21 +316,25 @@ public class IndexPlanServiceEngine {
     }
 
     // =========================================================================
-    // validateProducibility (stub — task #3 implements the full walk)
+    // validateProducibility — graph-walk implementation
     // =========================================================================
 
     /**
      * Validates that a pipeline graph can produce every VectorSet referenced
-     * by its opensearch-sink plans. Currently a stub — always returns valid.
-     * Task #3 will implement the full graph walk.
+     * by its opensearch-sink plans. Delegates to
+     * {@link PlanProducibilityValidator} which walks the graph upstream from
+     * each sink, expands {@code plan_ids → vector_set_ids}, and reports any
+     * VS not produced upstream as a clearly-pathed error.
      *
-     * @param req validation request
-     * @return stub response: is_valid=true, empty errors and warnings
+     * <p>The validator opens its own Panache session — callers do not need
+     * to wrap this method in {@code @WithSession}.
+     *
+     * @param req validation request (graph_proto + optional cluster_id)
+     * @return response with is_valid + errors + warnings
      */
     public Uni<ValidatePlanProducibilityResponse> validateProducibility(
             ValidatePlanProducibilityRequest req) {
-        return Uni.createFrom().item(
-                ValidatePlanProducibilityResponse.newBuilder().setIsValid(true).build());
+        return planProducibilityValidator.validate(req);
     }
 
     // =========================================================================
