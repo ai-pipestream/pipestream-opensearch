@@ -177,10 +177,17 @@ class IndexPlanMatrixIT {
                 .as("NESTED plan with 2 VSes must be READY")
                 .isEqualTo(IndexPlanStatus.INDEX_PLAN_STATUS_READY);
 
-        // NESTED must NOT create side indices
-        String wrongSide = base + "--chunk--" + sanitize(CHUNKER_A);
-        assertThat(indexExists(wrongSide))
-                .as("NESTED must NOT create --chunk-- side index: " + wrongSide)
+        // NESTED keeps everything on the parent index — must exist, side indices must not.
+        assertThat(indexExists(base))
+                .as("NESTED must materialize the parent index: " + base)
+                .isTrue();
+        String wrongChunkSide = base + "--chunk--" + sanitize(CHUNKER_A);
+        assertThat(indexExists(wrongChunkSide))
+                .as("NESTED must NOT create --chunk-- side index: " + wrongChunkSide)
+                .isFalse();
+        String wrongVsSide = base + "--vs--" + sanitize(CHUNKER_A) + "--" + sanitize(EMBEDDER_X);
+        assertThat(indexExists(wrongVsSide))
+                .as("NESTED must NOT create --vs-- side index: " + wrongVsSide)
                 .isFalse();
     }
 
