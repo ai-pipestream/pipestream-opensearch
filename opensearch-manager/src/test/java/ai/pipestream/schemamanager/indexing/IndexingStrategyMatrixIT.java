@@ -1,12 +1,15 @@
 package ai.pipestream.schemamanager.indexing;
 
+import ai.pipestream.opensearch.v1.AssignSemanticConfigToIndexRequest;
 import ai.pipestream.opensearch.v1.BindVectorSetToIndexRequest;
 import ai.pipestream.opensearch.v1.CreateChunkerConfigRequest;
 import ai.pipestream.opensearch.v1.CreateEmbeddingModelConfigRequest;
+import ai.pipestream.opensearch.v1.CreateSemanticConfigRequest;
 import ai.pipestream.opensearch.v1.CreateVectorSetRequest;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
 import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.MutinySemanticConfigServiceGrpc;
 import ai.pipestream.opensearch.v1.MutinyVectorSetServiceGrpc;
 import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
@@ -57,6 +60,9 @@ class IndexingStrategyMatrixIT {
 
     @GrpcClient
     MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetService;
+
+    @GrpcClient
+    MutinySemanticConfigServiceGrpc.MutinySemanticConfigServiceStub semanticConfigService;
 
     @Inject
     OpenSearchClient openSearchClient;
@@ -183,6 +189,164 @@ class IndexingStrategyMatrixIT {
     }
 
     // ============================================================
+    // SCENARIO 4-6 — assignSemanticConfigToIndex × each strategy
+    // SemanticConfig with default options creates exactly one child
+    // VectorSet at SEMANTIC_CHUNK granularity. The chunkConfigId on
+    // that child is the canonical literal "semantic".
+    // ============================================================
+
+    @Test
+    void assignSemanticConfig_chunkCombined_createsChunkSemanticIndex() {
+        String base = uniqueIndex("matrix-sc-cc");
+        String semanticConfigId = createDefaultSemanticConfig("matrix-sc-cc");
+
+        semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
+                        .build()
+        ).await().indefinitely();
+
+        String idx = base + "--chunk--semantic";
+        assertThat(indexExists(idx))
+                .as("CHUNK_COMBINED for semantic config materializes <base>--chunk--semantic")
+                .isTrue();
+        assertThat(hasKnnField(idx, "em_" + sanitizeField(EMBEDDER_X)))
+                .as("the SemanticConfig's bound embedder field is provisioned on the chunk index")
+                .isTrue();
+
+        String wrongShape = base + "--vs--semantic--" + sanitize(EMBEDDER_X);
+        assertThat(indexExists(wrongShape))
+                .as("SEPARATE_INDICES shape must NOT exist when CHUNK_COMBINED was chosen")
+                .isFalse();
+    }
+
+    @Test
+    void assignSemanticConfig_separateIndices_createsVsSemanticIndex() {
+        String base = uniqueIndex("matrix-sc-si");
+        String semanticConfigId = createDefaultSemanticConfig("matrix-sc-si");
+
+        semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES)
+                        .build()
+        ).await().indefinitely();
+
+        String idx = base + "--vs--semantic--" + sanitize(EMBEDDER_X);
+        assertThat(indexExists(idx))
+                .as("SEPARATE_INDICES for semantic config materializes per-(chunkConfigId,embedder)")
+                .isTrue();
+        assertThat(hasKnnField(idx, "vector"))
+                .as("SEPARATE_INDICES carries the canonical \"vector\" KNN field")
+                .isTrue();
+
+        String wrongShape = base + "--chunk--semantic";
+        assertThat(indexExists(wrongShape))
+                .as("CHUNK_COMBINED shape must NOT exist when SEPARATE_INDICES was chosen")
+                .isFalse();
+    }
+
+    @Test
+    void assignSemanticConfig_nested_keepsParentIndexOnly() {
+        String base = uniqueIndex("matrix-sc-nested");
+        String semanticConfigId = createDefaultSemanticConfig("matrix-sc-nested");
+
+        semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(indexExists(base))
+                .as("NESTED keeps the SemanticConfig's vector set on the parent index")
+                .isTrue();
+        assertThat(indexExists(base + "--chunk--semantic"))
+                .as("NESTED must NOT create --chunk-- side index")
+                .isFalse();
+        assertThat(indexExists(base + "--vs--semantic--" + sanitize(EMBEDDER_X)))
+                .as("NESTED must NOT create --vs-- side index")
+                .isFalse();
+    }
+
+    // ============================================================
+    // EDGE CASE — assigning the same SemanticConfig to two different
+    // indices under different strategies materializes BOTH shapes,
+    // not one or the other (binding-row is per (vector_set, index)).
+    // ============================================================
+
+    @Test
+    void assignSemanticConfig_twoIndicesDifferentStrategies_eachIndexGetsItsOwnShape() {
+        String semanticConfigId = createDefaultSemanticConfig("matrix-sc-multi");
+        String baseCombined = uniqueIndex("matrix-sc-combined-only");
+        String baseSeparate = uniqueIndex("matrix-sc-separate-only");
+
+        semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(baseCombined)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
+                        .build()
+        ).await().indefinitely();
+
+        semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(baseSeparate)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES)
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(indexExists(baseCombined + "--chunk--semantic"))
+                .as("first index uses CHUNK_COMBINED — has --chunk--").isTrue();
+        assertThat(indexExists(baseCombined + "--vs--semantic--" + sanitize(EMBEDDER_X)))
+                .as("first index does NOT have --vs-- (its strategy was CHUNK_COMBINED)").isFalse();
+
+        assertThat(indexExists(baseSeparate + "--vs--semantic--" + sanitize(EMBEDDER_X)))
+                .as("second index uses SEPARATE_INDICES — has --vs--").isTrue();
+        assertThat(indexExists(baseSeparate + "--chunk--semantic"))
+                .as("second index does NOT have --chunk-- (its strategy was SEPARATE_INDICES)").isFalse();
+    }
+
+    // ============================================================
+    // EDGE CASE — re-assigning the same SemanticConfig to the same
+    // index (idempotent) doesn't double-provision and doesn't error.
+    // ============================================================
+
+    @Test
+    void assignSemanticConfig_runTwice_idempotent() {
+        String base = uniqueIndex("matrix-sc-idem");
+        String semanticConfigId = createDefaultSemanticConfig("matrix-sc-idem");
+
+        var first = semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
+                        .build()
+        ).await().indefinitely();
+
+        var second = semanticConfigService.assignSemanticConfigToIndex(
+                AssignSemanticConfigToIndexRequest.newBuilder()
+                        .setSemanticConfigId(semanticConfigId)
+                        .setBaseIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(first.getBindingsProvisioned())
+                .as("first call provisions the bindings")
+                .isPositive();
+        assertThat(second.getBindingsProvisioned())
+                .as("second call counts the same bindings (still 'provisioned' from the bind table's view) — never errors")
+                .isEqualTo(first.getBindingsProvisioned());
+    }
+
+    // ============================================================
     // NEGATIVE — bind referencing a missing VectorSet must fail loud
     // (no implicit create at bind time, no fallback)
     // ============================================================
@@ -229,6 +393,29 @@ class IndexingStrategyMatrixIT {
                 ).await().indefinitely();
             }
         }
+    }
+
+    /**
+     * Creates a SemanticConfig with default options:
+     * {@code storeSentenceVectors=false, computeCentroids=false} → emits
+     * exactly one child VectorSet at GRANULARITY_SEMANTIC_CHUNK whose
+     * chunkConfigId is the canonical literal {@code "semantic"}.
+     * Returns the configId (which is also the lookup key callers pass
+     * to assignSemanticConfigToIndex).
+     */
+    private String createDefaultSemanticConfig(String prefix) {
+        String configId = prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
+        semanticConfigService.createSemanticConfig(
+                CreateSemanticConfigRequest.newBuilder()
+                        .setName(configId)
+                        .setConfigId(configId)
+                        .setEmbeddingModelId(EMBEDDER_X)
+                        .setStoreSentenceVectors(false)
+                        .setComputeCentroids(false)
+                        .setSourceCel("document.body")
+                        .build()
+        ).await().indefinitely();
+        return configId;
     }
 
     private void createChunker(String configId) {

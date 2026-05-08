@@ -49,12 +49,22 @@ public class SemanticConfigServiceImpl extends MutinySemanticConfigServiceGrpc.S
     @Override
     public Uni<AssignSemanticConfigToIndexResponse> assignSemanticConfigToIndex(
             AssignSemanticConfigToIndexRequest request) {
-        return engine.assignToIndex(request.getSemanticConfigId(), request.getBaseIndexName())
-                .map(count -> AssignSemanticConfigToIndexResponse.newBuilder()
-                        .setBindingsProvisioned(count)
-                        .setMessage(count == 0
+        // Threading: the per-request indexing_strategy controls which physical
+        // shape (CHUNK_COMBINED / SEPARATE_INDICES / NESTED) materializes for
+        // every child VectorSet derived from the SemanticConfig (centroids +
+        // boundary). UNSPECIFIED falls through to the manager's server-side
+        // default (CHUNK_COMBINED) inside the engine's strategy resolver.
+        return engine.assignToIndexDetailed(
+                        request.getSemanticConfigId(),
+                        request.getBaseIndexName(),
+                        request.getIndexingStrategy())
+                .map(result -> AssignSemanticConfigToIndexResponse.newBuilder()
+                        .setBindingsProvisioned(result.bindingsProvisioned())
+                        .setMessage(result.bindingsProvisioned() == 0
                                 ? "No VectorSets to provision"
-                                : "Provisioned " + count + " binding(s) for index " + request.getBaseIndexName())
+                                : "Provisioned " + result.bindingsProvisioned()
+                                        + " binding(s) for index " + request.getBaseIndexName()
+                                        + " (strategy=" + request.getIndexingStrategy().name() + ")")
                         .build());
     }
 }
