@@ -80,6 +80,9 @@ public class IndexPlanServiceEngine {
     OpenSearchClient openSearchClient;
 
     @Inject
+    IndexKnnProvisioner indexKnnProvisioner;
+
+    @Inject
     PlanProducibilityValidator planProducibilityValidator;
 
     /** CDI constructor. */
@@ -439,9 +442,20 @@ public class IndexPlanServiceEngine {
             });
         }
 
-        // When there are no VSes, skip provisioning and go straight to READY
+        // When there are no VSes (chunker → sink shape with no embeddings),
+        // still pre-create the base OS index. Otherwise the plan would persist
+        // READY but the first sink write would rely on OS auto-create-on-write,
+        // which is the lazy-create pattern explicitly banned by the design.
         Uni<String> finalProvision = pws.scalars.isEmpty()
-                ? Uni.createFrom().item((String) null)
+                ? indexKnnProvisioner.ensureIndex(pws.plan.indexName)
+                        .map(v -> (String) null)
+                        .onFailure().recoverWithItem(err -> {
+                            LOG.warnf("IndexPlan %s base-index provisioning failed: %s",
+                                    pws.plan.id, err.getMessage());
+                            return err.getMessage() != null
+                                    ? err.getMessage()
+                                    : err.getClass().getSimpleName();
+                        })
                 : provisionChain;
 
         // Hop back to Vertx context before Phase 3 Panache call

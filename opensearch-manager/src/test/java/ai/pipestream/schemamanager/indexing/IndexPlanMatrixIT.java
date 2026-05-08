@@ -74,6 +74,34 @@ class IndexPlanMatrixIT {
     }
 
     // =========================================================================
+    // SCENARIO 0 - chunker → sink shape: plan with zero VSes
+    // The base OS index must still be pre-created at plan-save time so docs
+    // never rely on OpenSearch auto-create-on-write (the banned lazy pattern).
+    // =========================================================================
+
+    @Test
+    void emptyVectorSetIds_preCreatesBaseIndexForChunkerOnlyPipeline() {
+        String base = uniqueBase("ip-empty");
+
+        CreateIndexPlanResponse resp = indexPlanClient.createIndexPlan(
+                CreateIndexPlanRequest.newBuilder()
+                        .setName("ip-empty-test-" + UUID.randomUUID().toString().substring(0, 8))
+                        .setIndexName(base)
+                        .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
+                        // no vector_set_ids — chunker-only pipeline writing plain docs
+                        .build()
+        ).await().indefinitely();
+
+        assertThat(resp.getPlan().getStatus())
+                .as("plan with zero VSes must still be READY after base-index pre-create")
+                .isEqualTo(IndexPlanStatus.INDEX_PLAN_STATUS_READY);
+        assertThat(indexExists(base))
+                .as("plan with zero VSes must pre-create the base OS index: " + base
+                        + " (no fallback to lazy auto-create on first sink write)")
+                .isTrue();
+    }
+
+    // =========================================================================
     // SCENARIO 1 - CHUNK_COMBINED plan with 2 VSes (same chunker, diff embedders)
     // Expected: one <base>--chunk--<chunkerA> index with em_<X> and em_<Y> fields
     // =========================================================================
