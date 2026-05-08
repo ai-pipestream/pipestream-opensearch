@@ -1,7 +1,12 @@
 package ai.pipestream.schemamanager.vectorset;
 
 import ai.pipestream.data.v1.VectorSetDirectives;
+import ai.pipestream.opensearch.v1.IndexingStrategy;
+import ai.pipestream.schemamanager.indexing.ChunkCombinedIndexingStrategy;
 import ai.pipestream.schemamanager.indexing.IndexKnnProvisioner;
+import ai.pipestream.schemamanager.indexing.IndexingStrategyHandler;
+import ai.pipestream.schemamanager.indexing.NestedIndexingStrategy;
+import ai.pipestream.schemamanager.indexing.SeparateIndicesIndexingStrategy;
 import io.quarkus.arc.lookup.LookupIfProperty;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -9,41 +14,55 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 /**
- * Bind-time eager provisioner: when a VectorSet recipe is bound to an
- * OpenSearch index (via {@code BindVectorSetToIndex} or
- * {@code CreateIndexWithVectorSets}), this implementation calls
- * {@link IndexKnnProvisioner} to materialize the base index and the
- * recipe's per-recipe SEPARATE_INDICES side-index with the configured
- * {@code knn_vector} field. By the time the binding row is committed, an
- * indexer hitting the (vector_set, index) pair sees a fully-shaped target.
+ * Bind-time provisioner. Runs at config-save time (the
+ * {@code BindVectorSetToIndex} / {@code CreateIndexWithVectorSets} RPC
+ * call sites) — NOT during document indexing. By the time the binding
+ * row is committed, every index + KNN field the strategy needs has been
+ * materialized in OpenSearch, so the hot path is pure lookup with zero
+ * round trips. Lazy / on-write provisioning was removed because the per-doc
+ * cluster-state round trips destroyed throughput at bulk-ingest scale.
  *
- * <p>Activation: enabled by default ({@code schemamanager.eager-provisioning
+ * <p>Activation: enabled by default ({@code schemamanager.bind-time-provisioning
  * .enabled=true} or unset). Set the property to {@code false} to fall back
  * to {@link NoOpVectorSetProvisioner} — useful in tests that don't want to
  * issue OpenSearch metadata calls inside the bind path.
- *
- * <p>Strategy scope: this provisioner only warms the SEPARATE_INDICES path
- * because that's the canonical target for new recipes (see DESIGN.md and
- * the user statement on 2026-05-03: "the end result would be separate
- * indices though — each chunk id would be its own index with each vector
- * being a column"). The CHUNK_COMBINED and NESTED strategies still create
- * their fields lazily on first write — also via {@link IndexKnnProvisioner},
- * which means once that path runs once the field is cached for the rest of
- * the JVM's lifetime.
  */
 @ApplicationScoped
-@LookupIfProperty(name = "schemamanager.eager-provisioning.enabled",
+@LookupIfProperty(name = "schemamanager.bind-time-provisioning.enabled",
         stringValue = "true",
         lookupIfMissing = true)
-public class EagerVectorSetProvisioner implements VectorSetProvisioner {
+public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
 
-    private static final Logger LOG = Logger.getLogger(EagerVectorSetProvisioner.class);
+    private static final Logger LOG = Logger.getLogger(BindTimeVectorSetProvisioner.class);
 
     @Inject
     IndexKnnProvisioner indexKnnProvisioner;
 
+    @Inject
+    ChunkCombinedIndexingStrategy chunkCombinedHandler;
+
+    @Inject
+    SeparateIndicesIndexingStrategy separateIndicesHandler;
+
+    @Inject
+    NestedIndexingStrategy nestedHandler;
+
     /** CDI. */
-    public EagerVectorSetProvisioner() {
+    public BindTimeVectorSetProvisioner() {
+    }
+
+    /**
+     * Resolve the strategy handler for the given enum value. Mirrors
+     * {@code OpenSearchIndexingService.resolveStrategy} — UNSPECIFIED falls
+     * back to the server-side default (CHUNK_COMBINED).
+     */
+    private IndexingStrategyHandler handlerFor(IndexingStrategy strategy) {
+        return switch (strategy) {
+            case INDEXING_STRATEGY_CHUNK_COMBINED -> chunkCombinedHandler;
+            case INDEXING_STRATEGY_SEPARATE_INDICES -> separateIndicesHandler;
+            case INDEXING_STRATEGY_NESTED -> nestedHandler;
+            case INDEXING_STRATEGY_UNSPECIFIED, UNRECOGNIZED -> chunkCombinedHandler;
+        };
     }
 
     /**
@@ -85,7 +104,8 @@ public class EagerVectorSetProvisioner implements VectorSetProvisioner {
             String chunkerConfigId,
             String embeddingModelId,
             int vectorDimensions,
-            String indexName) {
+            String indexName,
+            IndexingStrategy strategy) {
         if (indexName == null || indexName.isBlank()) {
             return Uni.createFrom().failure(new IllegalArgumentException(
                     "ensureFieldsForVectorSet: indexName must be non-blank"));
@@ -103,25 +123,31 @@ public class EagerVectorSetProvisioner implements VectorSetProvisioner {
                     "VectorSet " + vectorSetId + " has non-positive vector_dimensions=" + vectorDimensions));
         }
 
-        // Provision BOTH naming conventions so the sink works whichever
-        // strategy is configured (CHUNK_COMBINED uses --chunk--<config>;
-        // SEPARATE_INDICES uses --vs--<config>--<embedder>). Mirrors what
-        // SemanticConfigServiceEngine.provisionAllSideIndices already does
-        // for child VectorSets — and matches the contract documented on
-        // AssignSemanticConfigToIndexRequest in the proto:
-        //   "Both are provisioned eagerly so whichever strategy the
-        //    pipeline uses finds the child index + KNN mapping already
-        //    in place."
-        final String separateIndex = deriveSeparateVsIndexName(indexName, chunkerConfigId, embeddingModelId);
-        final String combinedIndex = deriveChunkCombinedIndexName(indexName, chunkerConfigId);
-        final String combinedField = deriveCombinedFieldName(embeddingModelId);
+        // Dispatch to the strategy handler that owns this layout. Each
+        // handler creates ONLY its own shape (CHUNK_COMBINED: one
+        // <base>--chunk--<chunker> index with em_<embedder> field;
+        // SEPARATE_INDICES: one <base>--vs--<chunker>--<embedder> index
+        // with "vector" field; NESTED: nested vs_<vsId> field on the
+        // parent index). Provisioning both shapes unconditionally was
+        // the old behavior — gone, because empty side indices waste
+        // cluster-state metadata for layouts no caller will ever use.
+        IndexingStrategyHandler handler = handlerFor(strategy);
+        String resolvedIndex = handler.resolveIndexName(indexName, chunkerConfigId, embeddingModelId);
+        // For NESTED, the field name is keyed off the VectorSet's id (or name)
+        // rather than the embedding model id. Pass vsId for NESTED and the
+        // embedder id for the others — handler's resolveFieldName encapsulates
+        // the choice.
+        String fieldNameKey = strategy == IndexingStrategy.INDEXING_STRATEGY_NESTED
+                ? vectorSetId
+                : embeddingModelId;
 
-        LOG.infof("EagerVectorSetProvisioner: bind-time provisioning vs=%s base=%s separate=%s combined=%s combinedField=%s dim=%d",
-                vectorSetId, indexName, separateIndex, combinedIndex, combinedField, vectorDimensions);
+        LOG.infof("BindTimeVectorSetProvisioner: provisioning vs=%s base=%s strategy=%s resolved=%s field=%s dim=%d",
+                vectorSetId, indexName, strategy.name(), resolvedIndex,
+                handler.resolveFieldName(fieldNameKey), vectorDimensions);
 
         return indexKnnProvisioner.ensureIndex(indexName)
-                .chain(() -> indexKnnProvisioner.ensureKnnField(separateIndex, "vector", vectorDimensions))
-                .chain(() -> indexKnnProvisioner.ensureKnnField(combinedIndex, combinedField, vectorDimensions));
+                .chain(() -> handler.provisionKnnField(
+                        indexName, chunkerConfigId, fieldNameKey, vectorDimensions));
     }
 
     /**

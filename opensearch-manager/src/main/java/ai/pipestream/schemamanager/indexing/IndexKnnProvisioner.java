@@ -95,20 +95,20 @@ public class IndexKnnProvisioner {
      * Strict-verify variant of {@link #ensureIndex}: succeeds only if the
      * index has already been provisioned (cache hit). Throws otherwise.
      * NEVER touches OpenSearch. Use from hot paths (per-doc indexing) where
-     * silently creating an index would mask a missing eager-provisioning
+     * silently creating an index would mask a missing bind-time provisioning
      * step and add latency to every first-doc-per-(JVM, index) write.
      *
      * <p>Hot paths used to call {@link #ensureIndex} for safety. That made
      * the first doc per (JVM, index) pay 2-4 cluster-state round trips, and
-     * worse, masked the case where eager provisioning never ran (sink would
+     * worse, masked the case where bind-time provisioning never ran (sink would
      * silently create indices that nothing else expects). Strict-mode here
-     * fails fast: callers see "not eagerly provisioned" with a pointer to
+     * fails fast: callers see "not provisioned at bind time" with a pointer to
      * the eager RPCs.
      */
     public void requireIndex(String indexName) {
         if (!indexExistsCache.contains(indexName)) {
             throw new IllegalStateException(
-                    "Index '" + indexName + "' was not eagerly provisioned. "
+                    "Index '" + indexName + "' was not provisioned at bind time. "
                             + "Call BindVectorSetToIndex / AssignSemanticConfigToIndex / ProvisionIndex "
                             + "before indexing.");
         }
@@ -123,7 +123,7 @@ public class IndexKnnProvisioner {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
         if (!ensured.contains(cacheKey)) {
             throw new IllegalStateException(
-                    "KNN field not eagerly provisioned: index=" + indexName
+                    "KNN field not provisioned at bind time: index=" + indexName
                             + " field=" + fieldName + " dim=" + dimensions
                             + ". Call BindVectorSetToIndex / AssignSemanticConfigToIndex first.");
         }

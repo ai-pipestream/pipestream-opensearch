@@ -31,6 +31,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -165,8 +166,14 @@ class ProvisionIndexTest {
                 "Semantic-config provisioning should succeed: " + response.getMessage());
 
         // SemanticConfig with the defaults above has exactly one child VectorSet,
-        // so we expect exactly one binding row and exactly two side indices
-        // (one for CHUNK_COMBINED naming, one for SEPARATE_INDICES naming).
+        // and the binding materializes ONLY the chosen indexing strategy's
+        // shape (no more dual --chunk-- + --vs-- creation). ProvisionIndex
+        // is called without an explicit strategy here, so the binding lands
+        // on the manager's server-side default — currently CHUNK_COMBINED.
+        // That gives us:
+        //   - 1 binding row
+        //   - 1 CHUNK_COMBINED side index (--chunk--semantic) provisioned
+        //   - NO --vs-- side index (would only exist under SEPARATE_INDICES)
         assertEquals(1, response.getBindingsProvisioned(),
                 "Single VectorSet → 1 binding row");
 
@@ -174,20 +181,18 @@ class ProvisionIndexTest {
         // emits exactly one child VectorSet at GRANULARITY_SEMANTIC_CHUNK.
         // SemanticConfigServiceEngine.chunkConfigIdForGranularity maps that
         // granularity to the canonical literal "semantic" — the same value
-        // module-semantic-graph stamps on emitted chunks, and the same id
-        // SeparateIndicesIndexingStrategy.deriveVsIndexName /
-        // ChunkCombinedIndexingStrategy.deriveChunkIndexName slot in. Use the
-        // mapped value here rather than semanticConfigId so the test asserts
-        // the actual contract, not a wishful one.
+        // module-semantic-graph stamps on emitted chunks.
         String expectedCombined = withSemanticIndex + "--chunk--semantic";
-        String expectedSeparate = withSemanticIndex + "--vs--semantic--" + sanitize(embeddingId);
+        String unexpectedSeparate = withSemanticIndex + "--vs--semantic--" + sanitize(embeddingId);
 
         assertThat("indices_created must include the parent index",
                 response.getIndicesCreatedList(), hasItem(withSemanticIndex));
-        assertThat("indices_created must include the CHUNK_COMBINED side index",
+        assertThat("indices_created must include the CHUNK_COMBINED side index "
+                        + "(server-side default for UNSPECIFIED strategy)",
                 response.getIndicesCreatedList(), hasItem(expectedCombined));
-        assertThat("indices_created must include the SEPARATE_INDICES side index",
-                response.getIndicesCreatedList(), hasItem(expectedSeparate));
+        assertThat("indices_created must NOT include the SEPARATE_INDICES side index "
+                        + "(only created when the binding's strategy is SEPARATE_INDICES)",
+                response.getIndicesCreatedList(), not(hasItem(unexpectedSeparate)));
 
         // Every name returned in the response must actually exist in OpenSearch.
         // The whole point of the RPC is to make this true — anything less and

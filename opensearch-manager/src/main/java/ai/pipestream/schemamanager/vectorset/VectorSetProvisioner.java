@@ -1,6 +1,7 @@
 package ai.pipestream.schemamanager.vectorset;
 
 import ai.pipestream.data.v1.VectorSetDirectives;
+import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import io.smallrye.mutiny.Uni;
 
@@ -18,7 +19,7 @@ import io.smallrye.mutiny.Uni;
  * {@code ChunkCombinedIndexingStrategy.ensureFlatKnnField} continue to
  * own {@code knn_vector} field creation at indexing time, with race-safe
  * retry. This stub is intentionally not wired into any call path — it
- * exists so a future eager-provisioning implementation (task #79) can be
+ * exists so a future bind-time provisioning implementation (task #79) can be
  * dropped in without another refactor of call sites.
  *
  * <p><b>Future (task #79):</b> a real implementation will walk the
@@ -55,7 +56,7 @@ public interface VectorSetProvisioner {
     Uni<Void> ensureFieldsForDirectives(VectorSetDirectives directives, String indexName);
 
     /**
-     * Bind-time eager provisioning for a single (recipe, index) pair.
+     * Bind-time bind-time provisioning for a single (recipe, index) pair.
      *
      * <p>Called from {@code VectorSetServiceEngine.bindVectorSetToIndex}
      * (and its sibling {@code createIndexWithVectorSets}) <b>between</b> the
@@ -94,5 +95,6 @@ public interface VectorSetProvisioner {
             String chunkerConfigId,
             String embeddingModelId,
             int vectorDimensions,
-            String indexName);
+            String indexName,
+            IndexingStrategy strategy);
 }

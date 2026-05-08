@@ -56,6 +56,18 @@ public class SemanticConfigServiceEngine {
     @Inject
     ai.pipestream.schemamanager.indexing.IndexBindingCache bindingCache;
 
+    @Inject
+    ai.pipestream.schemamanager.vectorset.VectorSetProvisioner vectorSetProvisioner;
+
+    @Inject
+    ai.pipestream.schemamanager.indexing.ChunkCombinedIndexingStrategy chunkCombinedHandler;
+
+    @Inject
+    ai.pipestream.schemamanager.indexing.SeparateIndicesIndexingStrategy separateIndicesHandler;
+
+    @Inject
+    ai.pipestream.schemamanager.indexing.NestedIndexingStrategy nestedHandler;
+
     /**
      * Result of binding a SemanticConfig to a base index.
      *
@@ -140,13 +152,25 @@ public class SemanticConfigServiceEngine {
      * @return assignment result with binding count and side indices touched
      */
     public Uni<AssignmentResult> assignToIndexDetailed(String semanticConfigId, String baseIndexName) {
+        return assignToIndexDetailed(semanticConfigId, baseIndexName,
+                ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED);
+    }
+
+    /**
+     * Strategy-aware variant of {@link #assignToIndexDetailed(String, String)}.
+     * The supplied strategy is passed through to every per-spec provisioning
+     * call so the side-index shape (CHUNK_COMBINED vs SEPARATE_INDICES vs
+     * NESTED) materializes the layout the binding actually wants.
+     */
+    public Uni<AssignmentResult> assignToIndexDetailed(String semanticConfigId, String baseIndexName,
+                                                       ai.pipestream.opensearch.v1.IndexingStrategy strategy) {
         if (baseIndexName == null || baseIndexName.isBlank()) {
             return Uni.createFrom().failure(Status.INVALID_ARGUMENT
                     .withDescription("baseIndexName is required for assignment")
                     .asRuntimeException());
         }
         return persistBindings(semanticConfigId, baseIndexName)
-                .onItem().transformToUni(specs -> provisionAllSideIndices(specs, baseIndexName));
+                .onItem().transformToUni(specs -> provisionAllSideIndices(specs, baseIndexName, strategy));
     }
 
     /**
@@ -333,32 +357,53 @@ public class SemanticConfigServiceEngine {
      * the cache MUST drop the stale snapshot or the next index call will
      * miss the fresh bindings.
      */
-    private Uni<AssignmentResult> provisionAllSideIndices(List<SideIndexSpec> specs, String baseIndexName) {
+    private Uni<AssignmentResult> provisionAllSideIndices(List<SideIndexSpec> specs, String baseIndexName,
+                                                          ai.pipestream.opensearch.v1.IndexingStrategy strategy) {
         if (specs.isEmpty()) {
             return Uni.createFrom().item(new AssignmentResult(0, java.util.List.of()));
         }
-        java.util.List<String> touched = new java.util.ArrayList<>(specs.size() * 2);
+        java.util.List<String> touched = new java.util.ArrayList<>(specs.size());
         Uni<Void> chain = Uni.createFrom().voidItem();
         for (SideIndexSpec spec : specs) {
-            String combinedIndex = baseIndexName + "--chunk--"
-                    + IndexKnnProvisioner.sanitizeForIndexName(spec.chunkConfigId());
-            // CHUNK_COMBINED field naming — must match
-            // ChunkCombinedIndexingStrategy.sanitizeEmbeddingFieldName:
-            //   "em_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_")
-            String combinedField = "em_" + spec.embeddingId().replaceAll("[^a-zA-Z0-9_]", "_");
-            String separateIndex = baseIndexName + "--vs--"
-                    + IndexKnnProvisioner.sanitizeForIndexName(spec.chunkConfigId())
-                    + "--" + IndexKnnProvisioner.sanitizeForIndexName(spec.embeddingId());
-
+            // Delegate to the strategy-aware provisioner: ONE shape per
+            // (vector set × chosen strategy) materializes, not both as
+            // before. The provisioner's handlerFor maps the strategy enum
+            // to the IndexingStrategyHandler whose provisionKnnField owns
+            // the shape's index naming + KNN field setup.
+            final SideIndexSpec s = spec;
             chain = chain
-                    .chain(() -> indexKnnProvisioner.ensureKnnField(combinedIndex, combinedField, spec.dimensions()))
-                    .invoke(() -> touched.add(combinedIndex))
-                    .chain(() -> indexKnnProvisioner.ensureKnnField(separateIndex, "vector", spec.dimensions()))
-                    .invoke(() -> touched.add(separateIndex));
+                    .chain(() -> vectorSetProvisioner.ensureFieldsForVectorSet(
+                            s.vectorSetId(), s.chunkConfigId(), s.embeddingId(),
+                            s.dimensions(), baseIndexName, strategy))
+                    .invoke(() -> {
+                        // Track the resolved index name so callers (eg. ProvisionIndex)
+                        // can list what was touched. Resolve via the same handler the
+                        // provisioner used so the displayed name matches what was
+                        // actually created.
+                        ai.pipestream.schemamanager.indexing.IndexingStrategyHandler handler =
+                                handlerFor(strategy);
+                        touched.add(handler.resolveIndexName(baseIndexName,
+                                s.chunkConfigId(), s.embeddingId()));
+                    });
         }
         return chain
                 .invoke(() -> bindingCache.invalidate(baseIndexName))
                 .map(v -> new AssignmentResult(specs.size(), java.util.List.copyOf(touched)));
+    }
+
+    /**
+     * Local copy of the strategy → handler mapping. Mirrors
+     * {@code BindTimeVectorSetProvisioner.handlerFor}; UNSPECIFIED falls
+     * back to the server-side default (CHUNK_COMBINED).
+     */
+    private ai.pipestream.schemamanager.indexing.IndexingStrategyHandler handlerFor(
+            ai.pipestream.opensearch.v1.IndexingStrategy strategy) {
+        return switch (strategy) {
+            case INDEXING_STRATEGY_CHUNK_COMBINED -> chunkCombinedHandler;
+            case INDEXING_STRATEGY_SEPARATE_INDICES -> separateIndicesHandler;
+            case INDEXING_STRATEGY_NESTED -> nestedHandler;
+            case INDEXING_STRATEGY_UNSPECIFIED, UNRECOGNIZED -> chunkCombinedHandler;
+        };
     }
 
     /**

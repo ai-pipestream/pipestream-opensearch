@@ -559,6 +559,10 @@ public class VectorSetServiceEngine {
         final String indexName = request.getIndexName();
         final String accountId = request.hasAccountId() ? request.getAccountId() : null;
         final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+        // Strategy chosen for this binding's physical layout. UNSPECIFIED
+        // (default for unset) is treated as the server-side default in
+        // BindTimeVectorSetProvisioner.handlerFor (currently CHUNK_COMBINED).
+        final ai.pipestream.opensearch.v1.IndexingStrategy strategy = request.getIndexingStrategy();
 
         // Capture the calling Vert.x context now (gRPC dispatch puts us on
         // the event loop). Phase 2's OpenSearch I/O hops to a worker pool;
@@ -611,7 +615,8 @@ public class VectorSetServiceEngine {
                                     lookup.chunkerConfigId,
                                     lookup.embeddingModelId,
                                     lookup.dimensions,
-                                    indexName)
+                                    indexName,
+                                    strategy)
                             .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()));
 
                     if (lookup.alreadyBoundProto != null) {
@@ -783,10 +788,16 @@ public class VectorSetServiceEngine {
                     Uni<Void> provisionChain = Uni.createFrom().voidItem();
                     for (BatchBindEntry entry : batch.allEntries()) {
                         final BatchBindEntry e = entry;
+                        // CreateIndexWithVectorSetsRequest doesn't yet carry
+                        // indexing_strategy. Defaults to UNSPECIFIED → manager
+                        // server default (CHUNK_COMBINED). If a caller needs
+                        // per-batch strategy choice, add the field to the
+                        // request and thread it through here.
                         provisionChain = provisionChain.chain(() ->
                                 vectorSetProvisioner.ensureFieldsForVectorSet(
                                         e.vsId, e.chunkerConfigId, e.embeddingModelId,
-                                        e.dimensions, indexName));
+                                        e.dimensions, indexName,
+                                        ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED));
                     }
 
                     return provisionChain

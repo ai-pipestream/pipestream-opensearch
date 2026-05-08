@@ -31,6 +31,31 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     public ChunkCombinedIndexingStrategy() {
     }
 
+    @Override
+    public ai.pipestream.opensearch.v1.IndexingStrategy strategy() {
+        return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED;
+    }
+
+    @Override
+    public String resolveIndexName(String baseIndex, String chunkConfigId, String embeddingModelId) {
+        // CHUNK_COMBINED keys the index on chunker only — both embedders share
+        // the same physical index, with one KNN field per embedder.
+        return deriveChunkIndexName(baseIndex, chunkConfigId);
+    }
+
+    @Override
+    public String resolveFieldName(String embeddingModelId) {
+        return sanitizeEmbeddingFieldName(embeddingModelId);
+    }
+
+    @Override
+    public io.smallrye.mutiny.Uni<Void> provisionKnnField(String baseIndex, String chunkConfigId,
+                                                           String embeddingModelId, int dimensions) {
+        String indexName = resolveIndexName(baseIndex, chunkConfigId, embeddingModelId);
+        String fieldName = resolveFieldName(embeddingModelId);
+        return indexKnnProvisioner.ensureKnnField(indexName, fieldName, dimensions);
+    }
+
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
 
@@ -362,7 +387,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     /**
      * Ensures the chunk index exists with KNN-enabled vector fields for each embedding model.
      * Delegates to {@link IndexKnnProvisioner} — on the hot path this is O(1) cache
-     * lookups because eager provisioning at VectorSet-create time already populated the cache.
+     * lookups because bind-time provisioning at VectorSet-create time already populated the cache.
      */
     private Uni<Void> ensureChunkIndex(String chunkIndexName, Map<String, Integer> embeddingDimensions) {
         // STRICT: hot path no longer creates indices/fields. The eager paths
@@ -370,7 +395,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         // must have populated the cache before any doc reaches here. If they
         // didn't, fail loud — silently creating fields here was costing
         // seconds on the first doc per (JVM, index, field) and masking
-        // missing eager-provisioning steps elsewhere.
+        // missing bind-time provisioning steps elsewhere.
         return Uni.createFrom().item(() -> {
             for (Map.Entry<String, Integer> entry : embeddingDimensions.entrySet()) {
                 String fieldName = sanitizeEmbeddingFieldName(entry.getKey());

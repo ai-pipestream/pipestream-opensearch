@@ -40,6 +40,30 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
     @Override
+    public ai.pipestream.opensearch.v1.IndexingStrategy strategy() {
+        return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;
+    }
+
+    @Override
+    public String resolveIndexName(String baseIndex, String chunkConfigId, String embeddingModelId) {
+        return deriveVsIndexName(baseIndex, chunkConfigId, embeddingModelId);
+    }
+
+    @Override
+    public String resolveFieldName(String embeddingModelId) {
+        // SEPARATE_INDICES has one (chunker, embedder) per index; one vector field
+        // per index. Field name is the canonical literal "vector".
+        return "vector";
+    }
+
+    @Override
+    public Uni<Void> provisionKnnField(String baseIndex, String chunkConfigId,
+                                       String embeddingModelId, int dimensions) {
+        String indexName = resolveIndexName(baseIndex, chunkConfigId, embeddingModelId);
+        return indexKnnProvisioner.ensureKnnField(indexName, resolveFieldName(embeddingModelId), dimensions);
+    }
+
+    @Override
     public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
         if (!request.hasDocumentMap()) {
             return Uni.createFrom().item(IndexDocumentResponse.newBuilder()

@@ -1,6 +1,7 @@
 package ai.pipestream.schemamanager.vectorset;
 
 import ai.pipestream.data.v1.VectorSetDirectives;
+import ai.pipestream.opensearch.v1.IndexingStrategy;
 import io.quarkus.arc.DefaultBean;
 import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -9,11 +10,12 @@ import jakarta.enterprise.context.ApplicationScoped;
  * No-op {@link VectorSetProvisioner}; CDI fallback when no real provisioner
  * is registered.
  *
- * <p>Marked {@link DefaultBean} so {@link EagerVectorSetProvisioner} (or any
- * future replacement) wins automatic CDI selection without producer
- * scaffolding. Tests that don't want eager OpenSearch traffic can disable
- * the eager bean via {@code schemamanager.eager-provisioning.enabled=false}
- * in the test profile, at which point this no-op takes over.
+ * <p>Marked {@link DefaultBean} so {@link BindTimeVectorSetProvisioner} (or
+ * any future replacement) wins automatic CDI selection without producer
+ * scaffolding. Tests that don't want bind-time OpenSearch traffic can
+ * disable the real bean via
+ * {@code schemamanager.bind-time-provisioning.enabled=false} in the test
+ * profile, at which point this no-op takes over.
  *
  * <p>The doc-time directive-based path is still no-op everywhere — that
  * code path will be wired up when the chunker/embedder/sink pipeline starts
@@ -48,7 +50,8 @@ public class NoOpVectorSetProvisioner implements VectorSetProvisioner {
             String chunkerConfigId,
             String embeddingModelId,
             int vectorDimensions,
-            String indexName) {
+            String indexName,
+            IndexingStrategy strategy) {
         return Uni.createFrom().voidItem();
     }
 }
