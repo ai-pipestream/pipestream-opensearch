@@ -54,6 +54,11 @@ class NestedIndexingStrategyConcurrencyIT {
                                     .mapToObj(i -> managerService.indexDocument(IndexDocumentRequest.newBuilder()
                                             .setIndexName(indexName)
                                             .setDocument(document("doc-" + i, chunkerId, embeddingId))
+                                            // The class name says it: this IT covers the nested
+                                            // strategy's vector-set create race. Pin the strategy
+                                            // explicitly now that UNSPECIFIED no longer falls back
+                                            // to nested.
+                                            .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                                             .build()))
                                     .toList();
                             return Uni.join().all(writes).andCollectFailures();

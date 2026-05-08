@@ -170,9 +170,17 @@ class ProvisionIndexTest {
         assertEquals(1, response.getBindingsProvisioned(),
                 "Single VectorSet → 1 binding row");
 
-        String expectedCombined = withSemanticIndex + "--chunk--" + sanitize(semanticConfigId);
-        String expectedSeparate = withSemanticIndex + "--vs--" + sanitize(semanticConfigId)
-                + "--" + sanitize(embeddingId);
+        // The default SemanticConfig (storeSentenceVectors=false, computeCentroids=false)
+        // emits exactly one child VectorSet at GRANULARITY_SEMANTIC_CHUNK.
+        // SemanticConfigServiceEngine.chunkConfigIdForGranularity maps that
+        // granularity to the canonical literal "semantic" — the same value
+        // module-semantic-graph stamps on emitted chunks, and the same id
+        // SeparateIndicesIndexingStrategy.deriveVsIndexName /
+        // ChunkCombinedIndexingStrategy.deriveChunkIndexName slot in. Use the
+        // mapped value here rather than semanticConfigId so the test asserts
+        // the actual contract, not a wishful one.
+        String expectedCombined = withSemanticIndex + "--chunk--semantic";
+        String expectedSeparate = withSemanticIndex + "--vs--semantic--" + sanitize(embeddingId);
 
         assertThat("indices_created must include the parent index",
                 response.getIndicesCreatedList(), hasItem(withSemanticIndex));

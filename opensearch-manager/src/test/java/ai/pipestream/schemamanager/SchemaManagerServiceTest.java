@@ -177,6 +177,10 @@ class SchemaManagerServiceTest {
         void testStreamIndexDocuments() {
         String indexName = "test-stream-" + UUID.randomUUID();
 
+        // Stream-index test exercises the nested-on-parent path (uses
+        // .setDocument(...), not .setDocumentMap(...)). Pin the strategy
+        // explicitly — UNSPECIFIED now defaults to CHUNK_COMBINED which
+        // requires document_map and would fail this shape.
         StreamIndexDocumentsRequest req1 = StreamIndexDocumentsRequest.newBuilder()
                 .setRequestId("req-1")
                 .setIndexName(indexName)
@@ -184,6 +188,7 @@ class SchemaManagerServiceTest {
                         .setOriginalDocId("doc-1")
                         .setTitle("Stream Doc 1")
                         .build())
+                .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                 .build();
 
         StreamIndexDocumentsRequest req2 = StreamIndexDocumentsRequest.newBuilder()
@@ -193,6 +198,7 @@ class SchemaManagerServiceTest {
                         .setOriginalDocId("doc-2")
                         .setTitle("Stream Doc 2")
                         .build())
+                .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                 .build();
 
         List<StreamIndexDocumentsResponse> responses = openSearchManagerService.streamIndexDocuments(Multi.createFrom().items(req1, req2))

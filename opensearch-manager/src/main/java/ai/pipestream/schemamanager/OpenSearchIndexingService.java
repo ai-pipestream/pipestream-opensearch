@@ -136,16 +136,20 @@ public class OpenSearchIndexingService {
 
     /**
      * Resolves the strategy handler for a given indexing strategy enum value.
-     * UNSPECIFIED uses the nested strategy (backward compatible).
-     * CHUNK_COMBINED uses the chunk-combined strategy (flat chunk indices, multiple em_* KNN fields).
-     * SEPARATE_INDICES uses one flat index per (chunk config x embedding model), single "vector" KNN field.
+     * <p>
+     * UNSPECIFIED means the caller did not state a preference, so we apply the
+     * server-side default — currently CHUNK_COMBINED (one flat index per
+     * chunker config; multiple embedding-model KNN fields per chunk row;
+     * cross-model scoring on the same chunk without joins). Callers that
+     * explicitly want nested-on-parent storage must send INDEXING_STRATEGY_NESTED.
      */
     private IndexingStrategyHandler resolveStrategy(IndexingStrategy strategy) {
         return switch (strategy) {
-            case INDEXING_STRATEGY_UNSPECIFIED -> nestedStrategy;
+            case INDEXING_STRATEGY_UNSPECIFIED -> chunkCombinedStrategy;
             case INDEXING_STRATEGY_CHUNK_COMBINED -> chunkCombinedStrategy;
             case INDEXING_STRATEGY_SEPARATE_INDICES -> separateIndicesStrategy;
-            default -> nestedStrategy;
+            case INDEXING_STRATEGY_NESTED -> nestedStrategy;
+            default -> chunkCombinedStrategy;
         };
     }
 

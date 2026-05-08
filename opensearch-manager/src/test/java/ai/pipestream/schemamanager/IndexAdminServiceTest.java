@@ -104,6 +104,11 @@ class IndexAdminServiceTest {
                         .setIndexName(testIndexName)
                         .setDocument(doc)
                         .setDocumentId("admin-test-doc-001")
+                        // Explicit NESTED — this test exercises nested-on-parent
+                        // storage. Was relying on UNSPECIFIED→nested before; the
+                        // server-side default is now CHUNK_COMBINED, so callers
+                        // that genuinely want nested must say so.
+                        .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
         ).await().indefinitely();
 

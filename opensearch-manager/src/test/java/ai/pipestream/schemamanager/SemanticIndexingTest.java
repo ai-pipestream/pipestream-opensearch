@@ -117,6 +117,10 @@ class SemanticIndexingTest {
                         .setIndexName(testIndexName)
                         .setDocument(doc)
                         .setDocumentId("semantic-test-single")
+                        // This test exercises nested-on-parent semantic-set storage.
+                        // Server-side default is now CHUNK_COMBINED, so callers
+                        // wanting nested must say so explicitly.
+                        .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
         ).await().indefinitely();
 
@@ -173,6 +177,7 @@ class SemanticIndexingTest {
                         .setIndexName(testIndexName)
                         .setDocument(doc)
                         .setDocumentId("semantic-test-multi")
+                        .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
         ).await().indefinitely();
 
@@ -210,6 +215,7 @@ class SemanticIndexingTest {
                         .setIndexName(testIndexName)
                         .setDocument(doc)
                         .setDocumentId("semantic-test-plain")
+                        .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
         ).await().indefinitely();
 
