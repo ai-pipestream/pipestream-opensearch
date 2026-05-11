@@ -1,10 +1,10 @@
 package ai.pipestream.schemamanager.indexing;
 
+import ai.pipestream.apicurio.registry.protobuf.ProtobufChannel;
 import ai.pipestream.apicurio.registry.protobuf.ProtobufEmitter;
 import ai.pipestream.repository.v1.DocumentIndexedEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.reactive.messaging.Channel;
 import org.jboss.logging.Logger;
 
 /**
@@ -31,7 +31,7 @@ public class IndexingReceiptEmitter {
     private static final Logger LOG = Logger.getLogger(IndexingReceiptEmitter.class);
 
     @Inject
-    @Channel("indexing-receipts-out")
+    @ProtobufChannel("indexing-receipts-out")
     ProtobufEmitter<DocumentIndexedEvent> emitter;
 
     /**
