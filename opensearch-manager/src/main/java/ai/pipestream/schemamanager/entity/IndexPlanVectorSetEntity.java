@@ -1,11 +1,9 @@
 package ai.pipestream.schemamanager.entity;
 
-import io.quarkus.hibernate.reactive.panache.PanacheEntityBase;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.hibernate.orm.panache.PanacheEntityBase;
 import jakarta.persistence.*;
 
 import java.io.Serializable;
-import java.util.List;
 import java.util.Objects;
 
 /**
@@ -45,42 +43,6 @@ public class IndexPlanVectorSetEntity extends PanacheEntityBase {
     /** Order within the plan. Unique per plan. */
     @Column(name = "sort_order", nullable = false)
     public int sortOrder;
-
-    // --- Static finders ---
-
-    /**
-     * Lists membership rows for a plan, ordered by {@link #sortOrder}.
-     * Caller pulls the corresponding VectorSet rows separately if needed.
-     *
-     * @param planId plan id
-     * @return ordered membership rows (possibly empty)
-     */
-    public static Uni<List<IndexPlanVectorSetEntity>> findByPlanIdOrdered(String planId) {
-        return list("planId = ?1 order by sortOrder", planId);
-    }
-
-    /**
-     * Lists membership rows referencing a vector set across all plans.
-     * Used by VectorSet delete to detect "still in use" before allowing
-     * the delete to proceed.
-     *
-     * @param vectorSetId vector set id
-     * @return matching membership rows (possibly empty)
-     */
-    public static Uni<List<IndexPlanVectorSetEntity>> findByVectorSetId(String vectorSetId) {
-        return list("vectorSetId", vectorSetId);
-    }
-
-    /**
-     * Deletes all membership rows for a plan. Used during Update when the
-     * caller replaces the membership list wholesale.
-     *
-     * @param planId plan id
-     * @return number of rows deleted
-     */
-    public static Uni<Long> deleteByPlanId(String planId) {
-        return delete("planId", planId);
-    }
 
     /** Composite primary key for {@link IndexPlanVectorSetEntity}. */
     public static class PK implements Serializable {

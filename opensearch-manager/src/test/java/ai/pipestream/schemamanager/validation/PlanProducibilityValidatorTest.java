@@ -18,7 +18,6 @@ import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import com.google.protobuf.Struct;
 import com.google.protobuf.Value;
 import com.google.protobuf.util.JsonFormat;
-import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -112,7 +111,7 @@ class PlanProducibilityValidatorTest {
         PipelineGraph graph = graphChunkerEmbedderSink("ck-1", "emb-1", List.of("ghost-plan"));
 
         PlanProducibilityValidator.Lookup lookup = mock(PlanProducibilityValidator.Lookup.class);
-        when(lookup.findPlan(eq("ghost-plan"))).thenReturn(Uni.createFrom().nullItem());
+        when(lookup.findPlan(eq("ghost-plan"))).thenReturn(null);
 
         ValidatePlanProducibilityResponse resp = run(graph, lookup);
         assertThat(resp.getIsValid())
@@ -305,7 +304,7 @@ class PlanProducibilityValidatorTest {
 
     private static ValidatePlanProducibilityResponse run(PipelineGraph graph,
                                                          PlanProducibilityValidator.Lookup lookup) {
-        return PlanProducibilityValidator.validate(graph, lookup).await().indefinitely();
+        return PlanProducibilityValidator.validate(graph, lookup);
     }
 
     /**
@@ -319,12 +318,12 @@ class PlanProducibilityValidatorTest {
             List<VectorSetEntity> vectorSets) {
         PlanProducibilityValidator.Lookup l = mock(PlanProducibilityValidator.Lookup.class);
         for (IndexPlanEntity p : plans) {
-            when(l.findPlan(eq(p.id))).thenReturn(Uni.createFrom().item(p));
+            when(l.findPlan(eq(p.id))).thenReturn(p);
         }
         // For any unstubbed plan id (not in the list), return null.
         when(l.findPlan(org.mockito.ArgumentMatchers.argThat(id ->
                 id != null && plans.stream().noneMatch(p -> p.id.equals(id)))))
-                .thenReturn(Uni.createFrom().nullItem());
+                .thenReturn(null);
 
         // Group memberships by plan id.
         for (IndexPlanEntity p : plans) {
@@ -332,10 +331,10 @@ class PlanProducibilityValidatorTest {
             for (IndexPlanVectorSetEntity m : memberships) {
                 if (m.planId.equals(p.id)) rows.add(m);
             }
-            when(l.findPlanMembership(eq(p.id))).thenReturn(Uni.createFrom().item(rows));
+            when(l.findPlanMembership(eq(p.id))).thenReturn(rows);
         }
         for (VectorSetEntity vs : vectorSets) {
-            when(l.findVectorSet(eq(vs.id))).thenReturn(Uni.createFrom().item(vs));
+            when(l.findVectorSet(eq(vs.id))).thenReturn(vs);
         }
         return l;
     }

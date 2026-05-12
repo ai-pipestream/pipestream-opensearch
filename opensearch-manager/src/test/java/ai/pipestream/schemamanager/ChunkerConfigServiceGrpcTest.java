@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
  * gRPC tests for ChunkerConfigService.
- * Uses @GrpcClient to inject the Mutiny stub (NOT the service implementation).
+ * Uses @GrpcClient to inject the plain blocking stub (NOT the service implementation).
  * See: https://quarkus.io/guides/grpc-service-implementation#testing-your-services
  */
 @QuarkusTest
@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class ChunkerConfigServiceGrpcTest {
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerConfigClient;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerConfigClient;
 
     private static Struct chunkerConfigJson(String algorithm, String sourceField, int chunkSize, int chunkOverlap) {
         return Struct.newBuilder()
@@ -48,7 +48,7 @@ class ChunkerConfigServiceGrpcTest {
                 .setConfigJson(configJson)
                 .build();
 
-        var createResp = chunkerConfigClient.createChunkerConfig(createReq).await().indefinitely();
+        var createResp = chunkerConfigClient.createChunkerConfig(createReq);
         assertThat(createResp.getConfig(), notNullValue());
         assertThat(createResp.getConfig().getId(), allOf(notNullValue(), not(emptyString())));
         assertThat(createResp.getConfig().getName(), equalTo(name));
@@ -60,13 +60,13 @@ class ChunkerConfigServiceGrpcTest {
 
         var getResp = chunkerConfigClient.getChunkerConfig(
                 GetChunkerConfigRequest.newBuilder().setId(id).build()
-        ).await().indefinitely();
+        );
         assertThat(getResp.getConfig().getName(), equalTo(name));
         assertThat(getResp.getConfig().getConfigId(), equalTo(uniqueConfigId));
 
         var getByNameResp = chunkerConfigClient.getChunkerConfig(
                 GetChunkerConfigRequest.newBuilder().setId(name).setByName(true).build()
-        ).await().indefinitely();
+        );
         assertThat(getByNameResp.getConfig().getId(), equalTo(id));
     }
 
@@ -83,7 +83,7 @@ class ChunkerConfigServiceGrpcTest {
                         .setName(name)
                         .setConfigJson(configJson)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(createResp.getConfig().getConfigId(), equalTo(expectedConfigId));
     }
 
@@ -99,7 +99,7 @@ class ChunkerConfigServiceGrpcTest {
                         .setConfigId(uniqueConfigId)
                         .setConfigJson(configJson)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(createResp.getConfig().getConfigId(), equalTo(uniqueConfigId));
     }
 
@@ -116,7 +116,7 @@ class ChunkerConfigServiceGrpcTest {
                         .setConfigId(initialConfigId)
                         .setConfigJson(configJson)
                         .build()
-        ).await().indefinitely();
+        );
         String id = createResp.getConfig().getId();
 
         var updateResp = chunkerConfigClient.updateChunkerConfig(
@@ -125,19 +125,19 @@ class ChunkerConfigServiceGrpcTest {
                         .setName(name + "-updated")
                         .setConfigId(updatedConfigId)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(updateResp.getConfig().getName(), equalTo(name + "-updated"));
         assertThat(updateResp.getConfig().getConfigId(), equalTo(updatedConfigId));
 
         var deleteResp = chunkerConfigClient.deleteChunkerConfig(
                 DeleteChunkerConfigRequest.newBuilder().setId(id).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
 
         assertThrows(StatusRuntimeException.class, () ->
                 chunkerConfigClient.getChunkerConfig(
                         GetChunkerConfigRequest.newBuilder().setId(id).build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -145,7 +145,7 @@ class ChunkerConfigServiceGrpcTest {
     void listChunkerConfigs() {
         var listResp = chunkerConfigClient.listChunkerConfigs(
                 ListChunkerConfigsRequest.newBuilder().setPageSize(10).build()
-        ).await().indefinitely();
+        );
         assertThat(listResp.getConfigsList(), notNullValue());
     }
 
@@ -156,7 +156,7 @@ class ChunkerConfigServiceGrpcTest {
                         GetChunkerConfigRequest.newBuilder()
                                 .setId("non-existent-id-" + UUID.randomUUID())
                                 .build()
-                ).await().indefinitely()
+                )
         );
     }
 }

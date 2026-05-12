@@ -3,10 +3,10 @@ package ai.pipestream.schemamanager;
 import ai.pipestream.opensearch.v1.CreateChunkerConfigRequest;
 import ai.pipestream.opensearch.v1.CreateEmbeddingModelConfigRequest;
 import ai.pipestream.opensearch.v1.CreateSemanticConfigRequest;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinySemanticConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.OpenSearchManagerServiceGrpc;
+import ai.pipestream.opensearch.v1.SemanticConfigServiceGrpc;
 import ai.pipestream.opensearch.v1.ProvisionIndexRequest;
 import ai.pipestream.opensearch.v1.ProvisionIndexResponse;
 import io.grpc.StatusRuntimeException;
@@ -61,16 +61,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ProvisionIndexTest {
 
     @GrpcClient
-    MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub managerService;
+    OpenSearchManagerServiceGrpc.OpenSearchManagerServiceBlockingStub managerService;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerConfigService;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerConfigService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingConfigService;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingConfigService;
 
     @GrpcClient
-    MutinySemanticConfigServiceGrpc.MutinySemanticConfigServiceStub semanticConfigService;
+    SemanticConfigServiceGrpc.SemanticConfigServiceBlockingStub semanticConfigService;
 
     @Inject
     OpenSearchClient openSearchClient;
@@ -96,14 +96,14 @@ class ProvisionIndexTest {
                         .setId(chunkerId).setName(chunkerId).setConfigId(chunkerId)
                         .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
                         .build()
-        ).await().indefinitely();
+        );
 
         embeddingConfigService.createEmbeddingModelConfig(
                 CreateEmbeddingModelConfigRequest.newBuilder()
                         .setId(embeddingId).setName(embeddingId)
                         .setModelIdentifier("ALL_MINILM_L6_V2").setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
 
         // SemanticConfig with storeSentenceVectors=false + computeCentroids=false
         // produces exactly ONE child VectorSet (GRANULARITY_SEMANTIC_CHUNK).
@@ -118,7 +118,7 @@ class ProvisionIndexTest {
                         .setComputeCentroids(false)
                         .setSourceCel("document.body")
                         .build()
-        ).await().indefinitely();
+        );
     }
 
     @AfterAll
@@ -140,7 +140,7 @@ class ProvisionIndexTest {
                 ProvisionIndexRequest.newBuilder()
                         .setIndexName(parentOnlyIndex)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(),
                 "Parent-only provisioning should succeed: " + response.getMessage());
@@ -160,7 +160,7 @@ class ProvisionIndexTest {
                         .setIndexName(withSemanticIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(),
                 "Semantic-config provisioning should succeed: " + response.getMessage());
@@ -212,7 +212,7 @@ class ProvisionIndexTest {
                         .setIndexName(idempotentIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
         assertTrue(first.getSuccess(), "First call should succeed: " + first.getMessage());
 
         // Second call: must succeed and return the SAME logical result. The
@@ -224,7 +224,7 @@ class ProvisionIndexTest {
                         .setIndexName(idempotentIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(second.getSuccess(),
                 "Second (idempotent) call should succeed: " + second.getMessage());
@@ -241,7 +241,7 @@ class ProvisionIndexTest {
         StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
                 managerService.provisionIndex(
                         ProvisionIndexRequest.newBuilder().setIndexName("").build()
-                ).await().indefinitely());
+                ));
         assertThat(ex.getMessage(), containsString("INVALID_ARGUMENT"));
         assertThat(ex.getMessage(), containsString("index_name"));
     }
@@ -252,7 +252,7 @@ class ProvisionIndexTest {
         StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
                 managerService.provisionIndex(
                         ProvisionIndexRequest.newBuilder().setIndexName("BadIndexName").build()
-                ).await().indefinitely());
+                ));
         assertThat(ex.getMessage(), containsString("INVALID_ARGUMENT"));
         assertThat(ex.getMessage(), containsString("lowercase"));
         assertFalse(indexExists("BadIndexName"),
@@ -273,7 +273,7 @@ class ProvisionIndexTest {
                         .setIndexName(name)
                         .addSemanticConfigIds("definitely-does-not-exist-" + UUID.randomUUID())
                         .build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getSuccess(),
                 "Unknown semantic config should NOT be reported as success");

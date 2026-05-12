@@ -5,7 +5,6 @@ import ai.pipestream.opensearch.v1.IndexDocumentResponse;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
 import ai.pipestream.opensearch.v1.StreamIndexDocumentsResponse;
-import io.smallrye.mutiny.Uni;
 
 import java.util.List;
 
@@ -79,10 +78,9 @@ public interface IndexingStrategyHandler {
      * @param chunkConfigId the chunker config id
      * @param embeddingModelId the embedding model id
      * @param dimensions the vector dimension of the embedding model
-     * @return Uni completing when the index + field are ready, failing loud on any error
      */
-    Uni<Void> provisionKnnField(String baseIndex, String chunkConfigId,
-                                 String embeddingModelId, int dimensions);
+    void provisionKnnField(String baseIndex, String chunkConfigId,
+                           String embeddingModelId, int dimensions);
 
     // ---------- Runtime indexing ----------
 
@@ -92,7 +90,7 @@ public interface IndexingStrategyHandler {
      * @param request indexing request
      * @return indexing outcome
      */
-    Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request);
+    IndexDocumentResponse indexDocument(IndexDocumentRequest request);
 
     /**
      * Index a batch of documents using this strategy's vector storage layout.
@@ -100,5 +98,5 @@ public interface IndexingStrategyHandler {
      * @param batch stream indexing requests
      * @return one response per request, aligned with input order
      */
-    Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch);
+    List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch);
 }

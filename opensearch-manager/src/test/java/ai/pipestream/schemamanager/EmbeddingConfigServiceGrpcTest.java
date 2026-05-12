@@ -15,7 +15,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * gRPC tests for EmbeddingConfigService.
- * Uses @GrpcClient to inject the Mutiny stub (NOT the service implementation).
+ * Uses @GrpcClient to inject the plain blocking stub (NOT the service implementation).
  * See: https://quarkus.io/guides/grpc-service-implementation#testing-your-services
  */
 @QuarkusTest
@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class EmbeddingConfigServiceGrpcTest {
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingConfigClient;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingConfigClient;
 
     @Test
     void createAndGetEmbeddingModelConfig() {
@@ -36,7 +36,7 @@ class EmbeddingConfigServiceGrpcTest {
                 .setDimensions(384)
                 .build();
 
-        var createResp = embeddingConfigClient.createEmbeddingModelConfig(createReq).await().indefinitely();
+        var createResp = embeddingConfigClient.createEmbeddingModelConfig(createReq);
         assertThat(createResp.getConfig(), notNullValue());
         assertThat(createResp.getConfig().getId(), allOf(notNullValue(), not(emptyString())));
         assertThat(createResp.getConfig().getName(), equalTo(name));
@@ -48,13 +48,13 @@ class EmbeddingConfigServiceGrpcTest {
 
         var getResp = embeddingConfigClient.getEmbeddingModelConfig(
                 GetEmbeddingModelConfigRequest.newBuilder().setId(id).build()
-        ).await().indefinitely();
+        );
         assertThat(getResp.getConfig().getName(), equalTo(name));
         assertThat(getResp.getConfig().getModelIdentifier(), equalTo(modelId));
 
         var getByNameResp = embeddingConfigClient.getEmbeddingModelConfig(
                 GetEmbeddingModelConfigRequest.newBuilder().setId(name).setByName(true).build()
-        ).await().indefinitely();
+        );
         assertThat(getByNameResp.getConfig().getId(), equalTo(id));
     }
 
@@ -67,7 +67,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("old/model")
                         .setDimensions(256)
                         .build()
-        ).await().indefinitely();
+        );
         String id = createResp.getConfig().getId();
 
         var updateResp = embeddingConfigClient.updateEmbeddingModelConfig(
@@ -76,19 +76,19 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("new/model")
                         .setDimensions(768)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(updateResp.getConfig().getModelIdentifier(), equalTo("new/model"));
         assertThat(updateResp.getConfig().getDimensions(), equalTo(768));
 
         var deleteResp = embeddingConfigClient.deleteEmbeddingModelConfig(
                 DeleteEmbeddingModelConfigRequest.newBuilder().setId(id).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
 
         assertThrows(StatusRuntimeException.class, () ->
                 embeddingConfigClient.getEmbeddingModelConfig(
                         GetEmbeddingModelConfigRequest.newBuilder().setId(id).build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -96,7 +96,7 @@ class EmbeddingConfigServiceGrpcTest {
     void listEmbeddingModelConfigs() {
         var listResp = embeddingConfigClient.listEmbeddingModelConfigs(
                 ListEmbeddingModelConfigsRequest.newBuilder().setPageSize(10).build()
-        ).await().indefinitely();
+        );
         assertThat(listResp.getConfigsList(), notNullValue());
     }
 
@@ -109,7 +109,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("test/model")
                         .setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
         String configId = createConfigResp.getConfig().getId();
 
         String indexName = "test-index-" + UUID.randomUUID();
@@ -122,7 +122,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setFieldName(fieldName)
                         .setResultSetName("default")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(createBindingResp.getBinding(), notNullValue());
         assertThat(createBindingResp.getBinding().getId(), allOf(notNullValue(), not(emptyString())));
         assertThat(createBindingResp.getBinding().getIndexName(), equalTo(indexName));
@@ -135,7 +135,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setIndexName(indexName)
                         .setFieldName(fieldName)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(getByIndexFieldResp.getBinding().getEmbeddingModelConfigId(), equalTo(configId));
     }
 
@@ -148,7 +148,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("test/model-primary")
                         .setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
 
         String configNameSecondary = "binding-secondary-model-" + UUID.randomUUID();
         var secondaryConfigResp = embeddingConfigClient.createEmbeddingModelConfig(
@@ -157,7 +157,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("test/model-secondary")
                         .setDimensions(768)
                         .build()
-        ).await().indefinitely();
+        );
 
         String indexName = "multi-result-set-index-" + UUID.randomUUID();
         String fieldName = "embeddings_dynamic";
@@ -169,7 +169,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setFieldName(fieldName)
                         .setResultSetName("default")
                         .build()
-        ).await().indefinitely();
+        );
 
         var altBindingResp = embeddingConfigClient.createIndexEmbeddingBinding(
                 CreateIndexEmbeddingBindingRequest.newBuilder()
@@ -178,7 +178,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setFieldName(fieldName)
                         .setResultSetName("alt-run")
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(defaultBindingResp.getBinding().getResultSetName(), equalTo("default"));
         assertThat(altBindingResp.getBinding().getResultSetName(), equalTo("alt-run"));
@@ -188,14 +188,14 @@ class EmbeddingConfigServiceGrpcTest {
                 GetIndexEmbeddingBindingRequest.newBuilder()
                         .setId(defaultBindingResp.getBinding().getId())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resolveDefaultResp.getBinding().getResultSetName(), equalTo("default"));
 
         var resolveAltResp = embeddingConfigClient.getIndexEmbeddingBinding(
                 GetIndexEmbeddingBindingRequest.newBuilder()
                         .setId(altBindingResp.getBinding().getId())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resolveAltResp.getBinding().getResultSetName(), equalTo("alt-run"));
 
         var byIndexFieldResp = embeddingConfigClient.getIndexEmbeddingBinding(
@@ -203,7 +203,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setIndexName(indexName)
                         .setFieldName(fieldName)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(byIndexFieldResp.getBinding().getResultSetName(), equalTo("default"));
 
         var allBindingsResp = embeddingConfigClient.listIndexEmbeddingBindings(
@@ -211,7 +211,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setIndexName(indexName)
                         .setPageSize(10)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(allBindingsResp.getBindingsCount(), greaterThanOrEqualTo(2));
         assertThat(allBindingsResp.getBindingsList().stream().anyMatch(b -> "default".equals(b.getResultSetName())), is(true));
@@ -219,17 +219,17 @@ class EmbeddingConfigServiceGrpcTest {
 
         embeddingConfigClient.deleteIndexEmbeddingBinding(
                 DeleteIndexEmbeddingBindingRequest.newBuilder().setId(defaultBindingResp.getBinding().getId()).build()
-        ).await().indefinitely();
+        );
         embeddingConfigClient.deleteIndexEmbeddingBinding(
                 DeleteIndexEmbeddingBindingRequest.newBuilder().setId(altBindingResp.getBinding().getId()).build()
-        ).await().indefinitely();
+        );
 
         embeddingConfigClient.deleteEmbeddingModelConfig(
                 DeleteEmbeddingModelConfigRequest.newBuilder().setId(primaryConfigResp.getConfig().getId()).build()
-        ).await().indefinitely();
+        );
         embeddingConfigClient.deleteEmbeddingModelConfig(
                 DeleteEmbeddingModelConfigRequest.newBuilder().setId(secondaryConfigResp.getConfig().getId()).build()
-        ).await().indefinitely();
+        );
     }
 
     @Test
@@ -239,7 +239,7 @@ class EmbeddingConfigServiceGrpcTest {
                         GetEmbeddingModelConfigRequest.newBuilder()
                                 .setId("non-existent-id-" + UUID.randomUUID())
                                 .build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -252,7 +252,7 @@ class EmbeddingConfigServiceGrpcTest {
                                 .setEmbeddingModelConfigId("non-existent-config")
                                 .setFieldName("field")
                                 .build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -267,7 +267,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("test/model")
                         .setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
         String configId = createConfigResp.getConfig().getId();
 
         String indexName = "crud-index-" + UUID.randomUUID();
@@ -280,7 +280,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setFieldName(fieldName)
                         .setResultSetName("default")
                         .build()
-        ).await().indefinitely();
+        );
         String bindingId = createBindingResp.getBinding().getId();
 
         var updateResp = embeddingConfigClient.updateIndexEmbeddingBinding(
@@ -288,23 +288,23 @@ class EmbeddingConfigServiceGrpcTest {
                         .setId(bindingId)
                         .setResultSetName("updated-result-set")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(updateResp.getBinding().getResultSetName(), equalTo("updated-result-set"));
 
         var deleteResp = embeddingConfigClient.deleteIndexEmbeddingBinding(
                 DeleteIndexEmbeddingBindingRequest.newBuilder().setId(bindingId).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
 
         assertThrows(StatusRuntimeException.class, () ->
                 embeddingConfigClient.getIndexEmbeddingBinding(
                         GetIndexEmbeddingBindingRequest.newBuilder().setId(bindingId).build()
-                ).await().indefinitely()
+                )
         );
 
         embeddingConfigClient.deleteEmbeddingModelConfig(
                 DeleteEmbeddingModelConfigRequest.newBuilder().setId(configId).build()
-        ).await().indefinitely();
+        );
     }
 
     @Test
@@ -316,7 +316,7 @@ class EmbeddingConfigServiceGrpcTest {
                         .setModelIdentifier("list/model")
                         .setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
         String configId = createConfigResp.getConfig().getId();
 
         String indexName = "list-index-" + UUID.randomUUID();
@@ -326,14 +326,14 @@ class EmbeddingConfigServiceGrpcTest {
                         .setEmbeddingModelConfigId(configId)
                         .setFieldName("embeddings_384")
                         .build()
-        ).await().indefinitely();
+        );
 
         var listResp = embeddingConfigClient.listIndexEmbeddingBindings(
                 ListIndexEmbeddingBindingsRequest.newBuilder()
                         .setIndexName(indexName)
                         .setPageSize(10)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(listResp.getBindingsList(), notNullValue());
         assertThat(listResp.getBindingsList().stream().anyMatch(b -> indexName.equals(b.getIndexName())), is(true));
     }

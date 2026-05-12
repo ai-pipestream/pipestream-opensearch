@@ -16,10 +16,10 @@ import ai.pipestream.opensearch.v1.IndexSettings;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.opensearch.v1.ListIndexPlansRequest;
 import ai.pipestream.opensearch.v1.ListIndexPlansResponse;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyIndexPlanServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyVectorSetServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.IndexPlanServiceGrpc;
+import ai.pipestream.opensearch.v1.VectorSetServiceGrpc;
 import ai.pipestream.opensearch.v1.UpdateIndexPlanRequest;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
 import com.google.protobuf.Struct;
@@ -27,7 +27,6 @@ import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
-import io.smallrye.mutiny.Uni;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -40,9 +39,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for {@link IndexPlanServiceEngine} via the gRPC layer.
@@ -56,16 +56,16 @@ import static org.mockito.Mockito.when;
 class IndexPlanServiceEngineTest {
 
     @GrpcClient
-    MutinyIndexPlanServiceGrpc.MutinyIndexPlanServiceStub indexPlanClient;
+    IndexPlanServiceGrpc.IndexPlanServiceBlockingStub indexPlanClient;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerClient;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerClient;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingClient;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingClient;
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetClient;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetClient;
 
     @InjectMock
     VectorSetProvisioner provisioner;
@@ -77,10 +77,10 @@ class IndexPlanServiceEngineTest {
 
     @BeforeEach
     void setupProvisionerMock() {
-        // Default: provisioner succeeds (returns void)
-        when(provisioner.ensureFieldsForVectorSet(
-                anyString(), anyString(), anyString(), anyInt(), anyString(), any()))
-                .thenReturn(Uni.createFrom().voidItem());
+        // Default: provisioner succeeds (void method, no stubbing required —
+        // explicit doNothing() keeps intent visible alongside the @InjectMock).
+        doNothing().when(provisioner).ensureFieldsForVectorSet(
+                anyString(), anyString(), anyString(), anyInt(), anyString(), any());
     }
 
     @BeforeEach
@@ -89,20 +89,20 @@ class IndexPlanServiceEngineTest {
             chunkerClient.createChunkerConfig(CreateChunkerConfigRequest.newBuilder()
                     .setId(chunkerAId).setName(chunkerAId).setConfigId(chunkerAId)
                     .setConfigJson(Struct.newBuilder().build())
-                    .build()).await().indefinitely();
+                    .build());
         } catch (StatusRuntimeException ignored) { /* already exists */ }
         try {
             chunkerClient.createChunkerConfig(CreateChunkerConfigRequest.newBuilder()
                     .setId(chunkerBId).setName(chunkerBId).setConfigId(chunkerBId)
                     .setConfigJson(Struct.newBuilder().build())
-                    .build()).await().indefinitely();
+                    .build());
         } catch (StatusRuntimeException ignored) { /* already exists */ }
         try {
             embeddingClient.createEmbeddingModelConfig(CreateEmbeddingModelConfigRequest.newBuilder()
                     .setId(embedderXId).setName(embedderXId)
                     .setModelIdentifier("test/model-ip")
                     .setDimensions(384)
-                    .build()).await().indefinitely();
+                    .build());
         } catch (StatusRuntimeException ignored) { /* already exists */ }
     }
 
@@ -117,7 +117,7 @@ class IndexPlanServiceEngineTest {
                         .setFieldName("embeddings_" + UUID.randomUUID().toString().substring(0, 6))
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
     }
 
     // --- Tests ---
@@ -134,7 +134,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addAllVectorSetIds(List.of(vsId))
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getId())
                 .as("plan id must be assigned by the server")
@@ -165,7 +165,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addAllVectorSetIds(List.of(fakeVsId))
                         .build()
-        ).await().indefinitely())
+        ))
                 .as("missing VS id must surface as INVALID_ARGUMENT, not a silent skip")
                 .isInstanceOf(StatusRuntimeException.class)
                 .hasMessageContaining("INVALID_ARGUMENT");
@@ -186,9 +186,9 @@ class IndexPlanServiceEngineTest {
                 .addVectorSetIds(vsId)
                 .build();
 
-        indexPlanClient.createIndexPlan(req).await().indefinitely(); // first succeeds
+        indexPlanClient.createIndexPlan(req); // first succeeds
 
-        assertThatThrownBy(() -> indexPlanClient.createIndexPlan(req).await().indefinitely())
+        assertThatThrownBy(() -> indexPlanClient.createIndexPlan(req))
                 .as("second create with the same name must fail with ALREADY_EXISTS")
                 .isInstanceOf(StatusRuntimeException.class)
                 .hasMessageContaining("ALREADY_EXISTS");
@@ -199,11 +199,10 @@ class IndexPlanServiceEngineTest {
         String vsId = createVsViaGrpc(chunkerAId, embedderXId).getVectorSet().getId();
         String planName = "test-plan-fail-" + UUID.randomUUID().toString().substring(0, 8);
 
-        // Make provisioner throw
-        when(provisioner.ensureFieldsForVectorSet(
-                anyString(), anyString(), anyString(), anyInt(), anyString(), any()))
-                .thenReturn(Uni.createFrom().failure(
-                        new RuntimeException("simulated dimension mismatch")));
+        // Make provisioner throw (void method — doThrow is the correct stub form)
+        doThrow(new RuntimeException("simulated dimension mismatch"))
+                .when(provisioner).ensureFieldsForVectorSet(
+                        anyString(), anyString(), anyString(), anyInt(), anyString(), any());
 
         CreateIndexPlanResponse resp = indexPlanClient.createIndexPlan(
                 CreateIndexPlanRequest.newBuilder()
@@ -212,7 +211,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsId)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("provisioning failure must flip status to FAILED, not throw to caller")
@@ -239,7 +238,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsA)
                         .build()
-        ).await().indefinitely();
+        );
         String planId = created.getPlan().getId();
 
         // Update: replace with vsB
@@ -249,7 +248,7 @@ class IndexPlanServiceEngineTest {
                         .setReplaceVectorSetIds(true)
                         .addVectorSetIds(vsB)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(updateResp.getPlan().getVectorSetIdsList())
                 .as("membership must be replaced: only vsB should remain")
@@ -271,7 +270,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsA)
                         .build()
-        ).await().indefinitely();
+        );
         String planId = created.getPlan().getId();
 
         var updateResp = indexPlanClient.updateIndexPlan(
@@ -279,7 +278,7 @@ class IndexPlanServiceEngineTest {
                         .setId(planId)
                         // replaceVectorSetIds defaults to false -> membership unchanged
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(updateResp.getPlan().getVectorSetIdsList())
                 .as("when replace_vector_set_ids=false, membership stays as-is")
@@ -301,7 +300,7 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsA)
                         .build()
-        ).await().indefinitely();
+        );
         String planId = created.getPlan().getId();
 
         DeleteIndexPlanResponse deleteResp = indexPlanClient.deleteIndexPlan(
@@ -309,7 +308,7 @@ class IndexPlanServiceEngineTest {
                         .setId(planId)
                         .setDeleteIndices(false)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(deleteResp.getDeleted())
                 .as("deleted flag must be true when the plan existed")
@@ -319,7 +318,7 @@ class IndexPlanServiceEngineTest {
         assertThatThrownBy(() -> indexPlanClient.getIndexPlan(
                 GetIndexPlanRequest.newBuilder()
                         .setId(planId).build()
-        ).await().indefinitely())
+        ))
                 .as("get after delete must surface NOT_FOUND")
                 .isInstanceOf(StatusRuntimeException.class)
                 .hasMessageContaining("NOT_FOUND");
@@ -336,7 +335,7 @@ class IndexPlanServiceEngineTest {
                     .setIndexName("test-list-idx-" + suffix + "-" + i)
                     .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                     .addVectorSetIds(vsA)
-                    .build()).await().indefinitely();
+                    .build());
         }
 
         ListIndexPlansResponse page = indexPlanClient.listIndexPlans(
@@ -344,7 +343,7 @@ class IndexPlanServiceEngineTest {
                         .setPage(0)
                         .setPageSize(2)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(page.getPlansList())
                 .as("page size 2 must return at most 2 plans")
@@ -367,7 +366,7 @@ class IndexPlanServiceEngineTest {
                         .addVectorSetIds(vsA)
                         // hnsw and index_settings intentionally omitted
                         .build()
-        ).await().indefinitely();
+        );
 
         IndexPlan plan = resp.getPlan();
         assertThat(plan.getHnsw().getEngine())
@@ -410,7 +409,7 @@ class IndexPlanServiceEngineTest {
                                 .setRefreshInterval("-1")
                                 .build())
                         .build()
-        ).await().indefinitely();
+        );
 
         IndexPlan plan = resp.getPlan();
         assertThat(plan.getHnsw().getM())
@@ -436,9 +435,9 @@ class IndexPlanServiceEngineTest {
         String planName = "test-plan-recover-" + UUID.randomUUID().toString().substring(0, 8);
 
         // First: provisioner fails -> plan is FAILED
-        when(provisioner.ensureFieldsForVectorSet(
-                anyString(), anyString(), anyString(), anyInt(), anyString(), any()))
-                .thenReturn(Uni.createFrom().failure(new RuntimeException("transient OS error")));
+        doThrow(new RuntimeException("transient OS error"))
+                .when(provisioner).ensureFieldsForVectorSet(
+                        anyString(), anyString(), anyString(), anyInt(), anyString(), any());
 
         CreateIndexPlanResponse created = indexPlanClient.createIndexPlan(
                 CreateIndexPlanRequest.newBuilder()
@@ -447,22 +446,22 @@ class IndexPlanServiceEngineTest {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsA)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(created.getPlan().getStatus())
                 .as("initial create must be FAILED when provisioner throws")
                 .isEqualTo(IndexPlanStatus.INDEX_PLAN_STATUS_FAILED);
 
-        // Second: fix the provisioner mock -> update recovers the plan
-        when(provisioner.ensureFieldsForVectorSet(
-                anyString(), anyString(), anyString(), anyInt(), anyString(), any()))
-                .thenReturn(Uni.createFrom().voidItem());
+        // Second: fix the provisioner mock -> update recovers the plan.
+        // Re-stub via doNothing() (void methods can't take .thenReturn).
+        doNothing().when(provisioner).ensureFieldsForVectorSet(
+                anyString(), anyString(), anyString(), anyInt(), anyString(), any());
 
         var updateResp = indexPlanClient.updateIndexPlan(
                 UpdateIndexPlanRequest.newBuilder()
                         .setId(created.getPlan().getId())
                         .build() // no field changes - just retry provisioning
-        ).await().indefinitely();
+        );
 
         assertThat(updateResp.getPlan().getStatus())
                 .as("update after fixing provisioner must flip status to READY")

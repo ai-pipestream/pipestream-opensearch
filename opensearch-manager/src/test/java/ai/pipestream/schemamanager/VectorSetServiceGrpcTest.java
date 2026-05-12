@@ -25,13 +25,13 @@ import static org.junit.jupiter.api.Assertions.*;
 class VectorSetServiceGrpcTest {
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetClient;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetClient;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerClient;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerClient;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingClient;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingClient;
 
     // --- Helper methods ---
 
@@ -48,7 +48,7 @@ class VectorSetServiceGrpcTest {
                         .setConfigId("token-body-512-50-" + suffix)
                         .setConfigJson(configJson)
                         .build()
-        ).await().indefinitely();
+        );
         return resp.getConfig().getId();
     }
 
@@ -59,7 +59,7 @@ class VectorSetServiceGrpcTest {
                         .setModelIdentifier("test/model-" + suffix)
                         .setDimensions(dimensions)
                         .build()
-        ).await().indefinitely();
+        );
         return resp.getConfig().getId();
     }
 
@@ -80,7 +80,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         var vs = createResp.getVectorSet();
         assertThat(vs.getId(), allOf(notNullValue(), not(emptyString())));
@@ -97,13 +97,13 @@ class VectorSetServiceGrpcTest {
         // Get by ID
         var getResp = vectorSetClient.getVectorSet(
                 GetVectorSetRequest.newBuilder().setId(vs.getId()).build()
-        ).await().indefinitely();
+        );
         assertThat(getResp.getVectorSet().getName(), equalTo("vs-create-" + uid));
 
         // Get by name
         var getByNameResp = vectorSetClient.getVectorSet(
                 GetVectorSetRequest.newBuilder().setId("vs-create-" + uid).setByName(true).build()
-        ).await().indefinitely();
+        );
         assertThat(getByNameResp.getVectorSet().getId(), equalTo(vs.getId()));
     }
 
@@ -122,7 +122,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getVectorSet().getId(), allOf(notNullValue(), not(emptyString())));
         assertThat(resp.getVectorSet().getVectorDimensions(), equalTo(768));
@@ -144,7 +144,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         // Second with same (index, field, result_set) should fail
         assertThrows(StatusRuntimeException.class, () ->
@@ -157,7 +157,7 @@ class VectorSetServiceGrpcTest {
                                 .setFieldName("embeddings")
                                 .setSourceField("body")
                                 .build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -176,7 +176,7 @@ class VectorSetServiceGrpcTest {
                                 .setFieldName("embeddings")
                                 .setSourceField("body")
                                 .build()
-                ).await().indefinitely()
+                )
         );
         assertThat(ex.getStatus().getCode().name(), equalTo("NOT_FOUND"));
     }
@@ -196,7 +196,7 @@ class VectorSetServiceGrpcTest {
                                 .setFieldName("embeddings")
                                 .setSourceField("body")
                                 .build()
-                ).await().indefinitely()
+                )
         );
         assertThat(ex.getStatus().getCode().name(), equalTo("NOT_FOUND"));
     }
@@ -217,7 +217,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
         String vsId = createResp.getVectorSet().getId();
         assertThat(createResp.getVectorSet().getVectorDimensions(), equalTo(384));
 
@@ -228,7 +228,7 @@ class VectorSetServiceGrpcTest {
                         .setName("vs-upd-renamed-" + uid)
                         .setSourceField("title")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(updateResp.getVectorSet().getName(), equalTo("vs-upd-renamed-" + uid));
         assertThat(updateResp.getVectorSet().getSourceField(), equalTo("title"));
         assertThat(updateResp.getVectorSet().getVectorDimensions(), equalTo(384));
@@ -239,7 +239,7 @@ class VectorSetServiceGrpcTest {
                         .setId(vsId)
                         .setEmbeddingModelConfigId(embeddingId768)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(update2Resp.getVectorSet().getEmbeddingModelConfigId(), equalTo(embeddingId768));
         assertThat(update2Resp.getVectorSet().getVectorDimensions(), equalTo(768));
     }
@@ -252,7 +252,7 @@ class VectorSetServiceGrpcTest {
                                 .setId("non-existent-" + UUID.randomUUID())
                                 .setName("anything")
                                 .build()
-                ).await().indefinitely()
+                )
         );
         assertThat(ex.getStatus().getCode().name(), equalTo("NOT_FOUND"));
     }
@@ -272,19 +272,19 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
         String vsId = createResp.getVectorSet().getId();
 
         var deleteResp = vectorSetClient.deleteVectorSet(
                 DeleteVectorSetRequest.newBuilder().setId(vsId).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
 
         // Verify not found after delete
         assertThrows(StatusRuntimeException.class, () ->
                 vectorSetClient.getVectorSet(
                         GetVectorSetRequest.newBuilder().setId(vsId).build()
-                ).await().indefinitely()
+                )
         );
     }
 
@@ -292,7 +292,7 @@ class VectorSetServiceGrpcTest {
     void deleteNonExistent_returnsFalse() {
         var resp = vectorSetClient.deleteVectorSet(
                 DeleteVectorSetRequest.newBuilder().setId("non-existent-" + UUID.randomUUID()).build()
-        ).await().indefinitely();
+        );
         assertThat(resp.getSuccess(), is(false));
     }
 
@@ -300,7 +300,7 @@ class VectorSetServiceGrpcTest {
     void listVectorSets() {
         var listResp = vectorSetClient.listVectorSets(
                 ListVectorSetsRequest.newBuilder().setPageSize(10).build()
-        ).await().indefinitely();
+        );
         assertThat(listResp.getVectorSetsList(), notNullValue());
     }
 
@@ -323,7 +323,7 @@ class VectorSetServiceGrpcTest {
                         .setResultSetName("custom-set")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         var resolveResp = vectorSetClient.resolveVectorSet(
                 ResolveVectorSetRequest.newBuilder()
@@ -331,7 +331,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setResultSetName("custom-set")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resolveResp.getFound(), is(true));
         assertThat(resolveResp.getVectorSet().getVectorDimensions(), equalTo(384));
     }
@@ -353,7 +353,7 @@ class VectorSetServiceGrpcTest {
                         .setResultSetName("default")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         // Resolve with non-existent result set → should fall back to "default"
         var resolveResp = vectorSetClient.resolveVectorSet(
@@ -362,7 +362,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setResultSetName("non-existent-set")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resolveResp.getFound(), is(true));
         assertThat(resolveResp.getVectorSet().getResultSetName(), equalTo("default"));
     }
@@ -374,7 +374,7 @@ class VectorSetServiceGrpcTest {
                         .setIndexName("non-existent-index-" + UUID.randomUUID())
                         .setFieldName("embeddings")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resolveResp.getFound(), is(false));
     }
 
@@ -392,13 +392,13 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("document.search_metadata.body")
                         .build()
-        ).await().indefinitely();
+        );
 
         var dirResp = vectorSetClient.resolveVectorSetFromDirective(
                 ResolveVectorSetFromDirectiveRequest.newBuilder()
                         .setVectorSetId(created.getVectorSet().getId())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(dirResp.getResolved(), is(true));
         assertThat(dirResp.getVectorSet().getId(), equalTo(created.getVectorSet().getId()));
         assertThat(dirResp.getVectorSet().getVectorDimensions(), equalTo(512));
@@ -421,7 +421,7 @@ class VectorSetServiceGrpcTest {
                                 .setIndexName("ix-" + uid)
                                 .build())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(dirResp.getResolved(), is(true));
         assertThat(dirResp.getVectorSet().getVectorDimensions(), equalTo(256));
         assertThat(dirResp.getVectorSet().getProvenance(), equalTo(VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE));
@@ -445,13 +445,13 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         // Try to delete chunker config → should be blocked
         var ex = assertThrows(StatusRuntimeException.class, () ->
                 chunkerClient.deleteChunkerConfig(
                         DeleteChunkerConfigRequest.newBuilder().setId(chunkerId).build()
-                ).await().indefinitely()
+                )
         );
         assertThat(ex.getStatus().getCode().name(), equalTo("FAILED_PRECONDITION"));
         assertThat(ex.getStatus().getDescription(), containsString("referenced by"));
@@ -459,11 +459,11 @@ class VectorSetServiceGrpcTest {
         // Delete VectorSet first, then chunker config should succeed
         vectorSetClient.deleteVectorSet(
                 DeleteVectorSetRequest.newBuilder().setId(createResp.getVectorSet().getId()).build()
-        ).await().indefinitely();
+        );
 
         var deleteResp = chunkerClient.deleteChunkerConfig(
                 DeleteChunkerConfigRequest.newBuilder().setId(chunkerId).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
     }
 
@@ -482,13 +482,13 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
 
         // Try to delete embedding config → should be blocked
         var ex = assertThrows(StatusRuntimeException.class, () ->
                 embeddingClient.deleteEmbeddingModelConfig(
                         DeleteEmbeddingModelConfigRequest.newBuilder().setId(embeddingId).build()
-                ).await().indefinitely()
+                )
         );
         assertThat(ex.getStatus().getCode().name(), equalTo("FAILED_PRECONDITION"));
         assertThat(ex.getStatus().getDescription(), containsString("referenced by"));
@@ -496,11 +496,11 @@ class VectorSetServiceGrpcTest {
         // Delete VectorSet first, then embedding config should succeed
         vectorSetClient.deleteVectorSet(
                 DeleteVectorSetRequest.newBuilder().setId(createResp.getVectorSet().getId()).build()
-        ).await().indefinitely();
+        );
 
         var deleteResp = embeddingClient.deleteEmbeddingModelConfig(
                 DeleteEmbeddingModelConfigRequest.newBuilder().setId(embeddingId).build()
-        ).await().indefinitely();
+        );
         assertThat(deleteResp.getSuccess(), is(true));
     }
 
@@ -521,7 +521,7 @@ class VectorSetServiceGrpcTest {
                         .setFieldName("embeddings")
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(resp.getVectorSet().getVectorDimensions(), equalTo(384));
 
         // Switch to 768-dim model
@@ -531,7 +531,7 @@ class VectorSetServiceGrpcTest {
                         .setId(resp.getVectorSet().getId())
                         .setEmbeddingModelConfigId(embeddingId768)
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(updateResp.getVectorSet().getVectorDimensions(), equalTo(768));
     }
 
@@ -558,7 +558,7 @@ class VectorSetServiceGrpcTest {
                         .setSourceField("body")
                         .setMetadata(metadata)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getVectorSet().hasMetadata(), is(true));
         assertThat(resp.getVectorSet().getMetadata().getFieldsMap().get("purpose").getStringValue(),

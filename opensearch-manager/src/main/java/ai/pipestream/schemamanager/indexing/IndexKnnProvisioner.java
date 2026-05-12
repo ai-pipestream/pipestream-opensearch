@@ -1,8 +1,6 @@
 package ai.pipestream.schemamanager.indexing;
 
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -139,14 +137,11 @@ public class IndexKnnProvisioner {
      * @param indexName target OpenSearch index name
      * @return completion when provisioning finishes (possibly no-op when cached)
      */
-    public Uni<Void> ensureIndex(String indexName) {
+    public void ensureIndex(String indexName) {
         if (indexExistsCache.contains(indexName)) {
-            return Uni.createFrom().voidItem();
+            return;
         }
-        return Uni.createFrom().item(() -> {
-            provisionIndexBlocking(indexName);
-            return (Void) null;
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        provisionIndexBlocking(indexName);
     }
 
     private void provisionIndexBlocking(String indexName) {
@@ -193,17 +188,13 @@ public class IndexKnnProvisioner {
      * @param dimensions vector dimension for the field
      * @return completion when provisioning finishes (possibly no-op when cached)
      */
-    public Uni<Void> ensureKnnField(String indexName, String fieldName, int dimensions) {
+    public void ensureKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
         if (ensured.contains(cacheKey)) {
-            return Uni.createFrom().voidItem();
+            return;
         }
-        // Off the event loop — OpenSearch client calls can block on the HTTP round trip.
-        return Uni.createFrom().item(() -> {
-            provisionBlocking(indexName, fieldName, dimensions);
-            ensured.add(cacheKey);
-            return (Void) null;
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        provisionBlocking(indexName, fieldName, dimensions);
+        ensured.add(cacheKey);
     }
 
     private void provisionBlocking(String indexName, String fieldName, int dimensions) {

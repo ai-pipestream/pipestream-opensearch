@@ -19,14 +19,10 @@ import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
+import ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository;
 import ai.pipestream.schemamanager.config.OpenSearchManagerRuntimeConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import io.vertx.core.Context;
-import io.vertx.core.Vertx;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
@@ -70,6 +66,9 @@ public class OpenSearchIndexingService {
     @Inject
     OpenSearchManagerRuntimeConfig managerRuntimeConfig;
 
+    @Inject
+    VectorSetIndexBindingRepository vsIndexBindingRepo;
+
     /** CDI; dependencies injected after construction. */
     public OpenSearchIndexingService() {}
 
@@ -79,7 +78,7 @@ public class OpenSearchIndexingService {
      * @param request indexing request containing the target index and document payload
      * @return the asynchronous indexing result
      */
-    public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
+    public IndexDocumentResponse indexDocument(IndexDocumentRequest request) {
         IndexingStrategyHandler strategy = resolveStrategy(request.getIndexingStrategy());
         return strategy.indexDocument(request);
     }
@@ -90,9 +89,9 @@ public class OpenSearchIndexingService {
      * @param batch batch of streaming indexing requests
      * @return the asynchronous list of per-document responses
      */
-    public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
+    public List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
-            return Uni.createFrom().item(List.of());
+            return List.of();
         }
 
         Map<IndexingStrategy, List<IndexedStreamRequest>> byStrategy = new LinkedHashMap<>();
@@ -102,7 +101,7 @@ public class OpenSearchIndexingService {
                     .add(new IndexedStreamRequest(i, req));
         }
 
-        List<Uni<List<IndexedStreamResponse>>> tasks = new ArrayList<>(byStrategy.size());
+        List<StreamIndexDocumentsResponse> ordered = new ArrayList<>(Collections.nCopies(batch.size(), null));
         for (Map.Entry<IndexingStrategy, List<IndexedStreamRequest>> entry : byStrategy.entrySet()) {
             IndexingStrategyHandler handler = resolveStrategy(entry.getKey());
             List<IndexedStreamRequest> indexedRequests = entry.getValue();
@@ -110,28 +109,12 @@ public class OpenSearchIndexingService {
                     .map(IndexedStreamRequest::request)
                     .toList();
 
-            tasks.add(handler.indexDocumentsBatch(requests)
-                    .map(responses -> {
-                        List<IndexedStreamResponse> indexedResponses = new ArrayList<>(responses.size());
-                        for (int j = 0; j < responses.size(); j++) {
-                            indexedResponses.add(new IndexedStreamResponse(indexedRequests.get(j).index(), responses.get(j)));
-                        }
-                        return indexedResponses;
-                    }));
+            List<StreamIndexDocumentsResponse> responses = handler.indexDocumentsBatch(requests);
+            for (int j = 0; j < responses.size(); j++) {
+                ordered.set(indexedRequests.get(j).index(), responses.get(j));
+            }
         }
-
-        return Uni.combine().all().unis(tasks)
-                .with(results -> {
-                    List<StreamIndexDocumentsResponse> ordered = new ArrayList<>(Collections.nCopies(batch.size(), null));
-                    for (Object result : results) {
-                        @SuppressWarnings("unchecked")
-                        List<IndexedStreamResponse> indexedResponses = (List<IndexedStreamResponse>) result;
-                        for (IndexedStreamResponse indexedResponse : indexedResponses) {
-                            ordered.set(indexedResponse.index(), indexedResponse.response());
-                        }
-                    }
-                    return ordered;
-                });
+        return ordered;
     }
 
     /**
@@ -169,6 +152,20 @@ public class OpenSearchIndexingService {
         bulkQueueSet.submitFireAndForget(indexName, docId, document);
     }
 
+    /**
+     * Blocks until the async OpenSearch delete completes, ignoring failures
+     * (Kafka consumer ACK semantics treat deletes as idempotent).
+     */
+    private void awaitDeleteQuietly(java.util.concurrent.CompletionStage<?> stage, String description) {
+        try {
+            stage.toCompletableFuture().get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.ExecutionException ee) {
+            LOG.warnf(ee.getCause(), "OpenSearch delete failed (%s, ack anyway; idempotent consumer)", description);
+        }
+    }
+
     // ===== Entity indexing methods (drives, nodes, modules, pipedocs, etc.) =====
 
     /**
@@ -178,7 +175,7 @@ public class OpenSearchIndexingService {
      * @param key Kafka key used as the OpenSearch document id
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexDrive(Drive drive, java.util.UUID key) {
+    public void indexDrive(Drive drive, java.util.UUID key) {
         Map<String, Object> document = new HashMap<>();
         document.put("name", drive.getName());
         document.put("description", drive.getDescription());
@@ -186,7 +183,6 @@ public class OpenSearchIndexingService {
         if (drive.hasCreatedAt()) document.put("created_at", drive.getCreatedAt().getSeconds() * 1000);
         document.put("indexed_at", System.currentTimeMillis());
         queueForIndexing(Index.FILESYSTEM_DRIVES.getIndexName(), key.toString(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -195,12 +191,18 @@ public class OpenSearchIndexingService {
      * @param key Kafka key used as the OpenSearch document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deleteDrive(java.util.UUID key) {
+    public void deleteDrive(java.util.UUID key) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_DRIVES.getIndexName()).id(key.toString()))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_DRIVES.getIndexName()).id(key.toString())),
+                    "drive " + key);
+        } catch (IOException e) {
+            // TODO(named-exception): replace with OpenSearchSubmitException(indexName, docId, op, cause)
+            // so the engine's failure classifier can branch on "transport vs. logical" without
+            // string-matching getMessage(). Apply across every other awaitDeleteQuietly/wrap site
+            // in this file once defined.
+            throw new RuntimeException("OpenSearch delete submission failed for drive " + key, e);
+        }
     }
 
     /**
@@ -211,8 +213,8 @@ public class OpenSearchIndexingService {
      * @param kafkaKey Kafka key used as the OpenSearch document id
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey) {
-        return indexNode(node, drive, kafkaKey, null, 30);
+    public void indexNode(Node node, String drive, UUID kafkaKey) {
+        indexNode(node, drive, kafkaKey, null, 30);
     }
 
     /**
@@ -223,7 +225,7 @@ public class OpenSearchIndexingService {
      * @param kafkaKey Kafka key used as the OpenSearch document id for the filesystem entry
      * @return a completion signal after the relevant indexing or delete work is queued
      */
-    public Uni<Void> indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
+    public void indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
         String operation = event.hasCreated() ? "CREATED"
                 : event.hasUpdated() ? "UPDATED"
                 : event.hasDeleted() ? "DELETED" : "UNKNOWN";
@@ -301,7 +303,8 @@ public class OpenSearchIndexingService {
 
         // --- Search index: delete if document removed ---
         if (event.hasDeleted()) {
-            return deleteFilesystemNodeByKafkaKey(kafkaKey);
+            deleteFilesystemNodeByKafkaKey(kafkaKey);
+            return;
         }
 
         // Filesystem nodes index — file browser search (name, path, type, drive, tree nav)
@@ -311,7 +314,6 @@ public class OpenSearchIndexingService {
         filesystemDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
         queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), filesystemDoc);
 
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -324,7 +326,7 @@ public class OpenSearchIndexingService {
      * @param retentionIntentDays retention hint stored on the indexed document
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexNode(Node node, String drive, UUID kafkaKey, String datasourceId, int retentionIntentDays) {
+    public void indexNode(Node node, String drive, UUID kafkaKey, String datasourceId, int retentionIntentDays) {
         Map<String, Object> document = new HashMap<>();
         document.put(NodeFields.NODE_ID.getFieldName(), kafkaKey.toString());
         document.put(CommonFields.NAME.getFieldName(), node.getName());
@@ -343,7 +345,6 @@ public class OpenSearchIndexingService {
         document.put(CommonFields.UPDATED_AT.getFieldName(), node.getUpdatedAt().getSeconds() * 1000);
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
         queueForIndexing(Index.FILESYSTEM_NODES.getIndexName(), kafkaKey.toString(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -352,18 +353,13 @@ public class OpenSearchIndexingService {
      * @param kafkaKey Kafka key used as the OpenSearch document id
      * @return a completion signal for the idempotent delete attempt
      */
-    public Uni<Void> deleteFilesystemNodeByKafkaKey(UUID kafkaKey) {
+    public void deleteFilesystemNodeByKafkaKey(UUID kafkaKey) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_NODES.getIndexName()).id(kafkaKey.toString()))
-            ).replaceWithVoid()
-                    .onFailure().recoverWithUni(err -> {
-                        LOG.warnf(err, "OpenSearch delete for filesystem node id=%s (ack anyway; idempotent consumer)",
-                                kafkaKey);
-                        return Uni.createFrom().voidItem();
-                    });
-        } catch (Exception e) {
-            return Uni.createFrom().voidItem();
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_NODES.getIndexName()).id(kafkaKey.toString())),
+                    "filesystem node " + kafkaKey);
+        } catch (Exception ignored) {
+            // Idempotent consumer: ACK even when the submission itself blew up.
         }
     }
 
@@ -375,13 +371,16 @@ public class OpenSearchIndexingService {
      * @return a completion signal for the delete request
      */
     @Deprecated
-    public Uni<Void> deleteNode(String nodeId, String drive) {
+    public void deleteNode(String nodeId, String drive) {
         String docId = drive + "/" + nodeId;
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_NODES.getIndexName()).id(docId))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.FILESYSTEM_NODES.getIndexName()).id(docId)),
+                    "legacy node " + docId);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for legacy node " + docId, e);
+        }
     }
 
     /**
@@ -390,13 +389,12 @@ public class OpenSearchIndexingService {
      * @param module module definition to index
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexModule(ModuleDefinition module) {
+    public void indexModule(ModuleDefinition module) {
         Map<String, Object> document = new HashMap<>();
         document.put(ModuleFields.MODULE_ID.getFieldName(), module.getModuleId());
         document.put(ModuleFields.IMPLEMENTATION_NAME.getFieldName(), module.getImplementationName());
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
         queueForIndexing(Index.REPOSITORY_MODULES.getIndexName(), module.getModuleId(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -405,12 +403,15 @@ public class OpenSearchIndexingService {
      * @param moduleId module identifier used as the OpenSearch document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deleteModule(String moduleId) {
+    public void deleteModule(String moduleId) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_MODULES.getIndexName()).id(moduleId))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_MODULES.getIndexName()).id(moduleId)),
+                    "module " + moduleId);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for module " + moduleId, e);
+        }
     }
 
     /**
@@ -419,7 +420,7 @@ public class OpenSearchIndexingService {
      * @param notification PipeDoc update payload to project into OpenSearch
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexPipeDoc(PipeDocUpdateNotification notification) {
+    public void indexPipeDoc(PipeDocUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(PipeDocFields.STORAGE_ID.getFieldName(), notification.getStorageId());
         document.put(PipeDocFields.DOC_ID.getFieldName(), notification.getDocId());
@@ -454,7 +455,6 @@ public class OpenSearchIndexingService {
         document.put(CommonFields.UPDATED_AT.getFieldName(), notification.getUpdatedAt().getSeconds() * 1000);
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
         queueForIndexing(Index.REPOSITORY_PIPEDOCS.getIndexName(), notification.getStorageId(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -463,12 +463,15 @@ public class OpenSearchIndexingService {
      * @param storageId storage identifier used as the OpenSearch document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deletePipeDoc(String storageId) {
+    public void deletePipeDoc(String storageId) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PIPEDOCS.getIndexName()).id(storageId))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PIPEDOCS.getIndexName()).id(storageId)),
+                    "pipedoc " + storageId);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for pipedoc " + storageId, e);
+        }
     }
 
     /**
@@ -477,7 +480,7 @@ public class OpenSearchIndexingService {
      * @param event uploaded-document event payload
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexDocumentUpload(DocumentUploadedEvent event) {
+    public void indexDocumentUpload(DocumentUploadedEvent event) {
         Map<String, Object> document = new HashMap<>();
         document.put("doc_id", event.getDocId());
         document.put("s3_key", event.getS3Key()); // TODO: remove after full re-crawl; storage_key supersedes this
@@ -501,7 +504,6 @@ public class OpenSearchIndexingService {
         document.put("uploaded_at", System.currentTimeMillis());
         String docId = event.getAccountId() + "/" + event.getDocId();
         queueForIndexing(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName(), docId, document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -511,13 +513,16 @@ public class OpenSearchIndexingService {
      * @param docId document identifier used in the composed document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deleteDocumentUpload(String accountId, String docId) {
+    public void deleteDocumentUpload(String accountId, String docId) {
         String id = accountId + "/" + docId;
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName()).id(id))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName()).id(id)),
+                    "document-upload " + id);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for document-upload " + id, e);
+        }
     }
 
     /**
@@ -526,12 +531,11 @@ public class OpenSearchIndexingService {
      * @param notification process request update payload
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexProcessRequest(ProcessRequestUpdateNotification notification) {
+    public void indexProcessRequest(ProcessRequestUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(ProcessFields.REQUEST_ID.getFieldName(), notification.getRequestId());
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
         queueForIndexing(Index.REPOSITORY_PROCESS_REQUESTS.getIndexName(), notification.getRequestId(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -540,12 +544,15 @@ public class OpenSearchIndexingService {
      * @param requestId request identifier used as the OpenSearch document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deleteProcessRequest(String requestId) {
+    public void deleteProcessRequest(String requestId) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_REQUESTS.getIndexName()).id(requestId))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_REQUESTS.getIndexName()).id(requestId)),
+                    "process-request " + requestId);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for process-request " + requestId, e);
+        }
     }
 
     /**
@@ -554,12 +561,11 @@ public class OpenSearchIndexingService {
      * @param notification process response update payload
      * @return a completion signal after the document is queued
      */
-    public Uni<Void> indexProcessResponse(ProcessResponseUpdateNotification notification) {
+    public void indexProcessResponse(ProcessResponseUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
         document.put(ProcessFields.RESPONSE_ID.getFieldName(), notification.getResponseId());
         document.put(CommonFields.INDEXED_AT.getFieldName(), System.currentTimeMillis());
         queueForIndexing(Index.REPOSITORY_PROCESS_RESPONSES.getIndexName(), notification.getResponseId(), document);
-        return Uni.createFrom().voidItem();
     }
 
     /**
@@ -568,12 +574,15 @@ public class OpenSearchIndexingService {
      * @param responseId response identifier used as the OpenSearch document id
      * @return a completion signal for the delete request
      */
-    public Uni<Void> deleteProcessResponse(String responseId) {
+    public void deleteProcessResponse(String responseId) {
         try {
-            return Uni.createFrom().completionStage(
-                openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_RESPONSES.getIndexName()).id(responseId))
-            ).replaceWithVoid();
-        } catch (Exception e) { return Uni.createFrom().failure(e); }
+            awaitDeleteQuietly(
+                    openSearchAsyncClient.delete(r -> r.index(Index.REPOSITORY_PROCESS_RESPONSES.getIndexName()).id(responseId)),
+                    "process-response " + responseId);
+        } catch (IOException e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch delete submission failed for process-response " + responseId, e);
+        }
     }
 
     // ===== Index administration methods =====
@@ -584,16 +593,16 @@ public class OpenSearchIndexingService {
      * @param request create-index request payload
      * @return the asynchronous index creation result
      */
-    public Uni<CreateIndexResponse> createIndex(CreateIndexRequest request) {
+    public CreateIndexResponse createIndex(CreateIndexRequest request) {
         String vectorFieldName = request.hasVectorFieldName() && !request.getVectorFieldName().isBlank()
                 ? request.getVectorFieldName()
                 : "embeddings";
-        return openSearchSchemaClient.createIndexWithNestedMapping(
-                        request.getIndexName(), vectorFieldName, request.getVectorFieldDefinition())
-                .map(success -> CreateIndexResponse.newBuilder()
-                        .setSuccess(success)
-                        .setMessage(success ? "Index created successfully" : "Failed to create index")
-                        .build());
+        boolean success = openSearchSchemaClient.createIndexWithNestedMapping(
+                request.getIndexName(), vectorFieldName, request.getVectorFieldDefinition());
+        return CreateIndexResponse.newBuilder()
+                .setSuccess(success)
+                .setMessage(success ? "Index created successfully" : "Failed to create index")
+                .build();
     }
 
     /**
@@ -602,39 +611,55 @@ public class OpenSearchIndexingService {
      * @param request mapping lookup request
      * @return the asynchronous mapping response
      */
-    public Uni<GetIndexMappingResponse> getIndexMapping(GetIndexMappingRequest request) {
+    public GetIndexMappingResponse getIndexMapping(GetIndexMappingRequest request) {
         String indexName = request.getIndexName();
-        return Uni.createFrom()
-                .completionStage(() -> {
-                    try {
-                        return openSearchAsyncClient.indices()
-                                .getMapping(b -> b.index(indexName));
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                })
-                .map(response -> {
-                    Map<String, Object> fields = new LinkedHashMap<>();
-                    response.result().forEach((idx, indexMapping) -> {
-                        Map<String, Object> props = new LinkedHashMap<>();
-                        indexMapping.mappings().properties().forEach((name, prop) -> {
-                            Map<String, Object> fieldInfo = new LinkedHashMap<>();
-                            fieldInfo.put("type", prop._kind().jsonValue());
-                            props.put(name, fieldInfo);
-                        });
-                        fields.put(idx, props);
-                    });
-                    Struct.Builder structBuilder = Struct.newBuilder();
-                    try {
-                        JsonFormat.parser().merge(objectMapper.writeValueAsString(fields), structBuilder);
-                    } catch (Exception e) {
-                        throw new RuntimeException("Failed to build mapping struct: " + e.getMessage(), e);
-                    }
-                    return GetIndexMappingResponse.newBuilder()
-                            .setIndexName(indexName)
-                            .setMappings(structBuilder.build())
-                            .build();
-                });
+        var response = awaitFuture(() -> {
+            try {
+                return openSearchAsyncClient.indices().getMapping(b -> b.index(indexName));
+            } catch (IOException e) {
+                // TODO(named-exception, task #70): OpenSearchSubmitException
+                throw new RuntimeException("OpenSearch getMapping submission failed for " + indexName, e);
+            }
+        });
+        Map<String, Object> fields = new LinkedHashMap<>();
+        response.result().forEach((idx, indexMapping) -> {
+            Map<String, Object> props = new LinkedHashMap<>();
+            indexMapping.mappings().properties().forEach((name, prop) -> {
+                Map<String, Object> fieldInfo = new LinkedHashMap<>();
+                fieldInfo.put("type", prop._kind().jsonValue());
+                props.put(name, fieldInfo);
+            });
+            fields.put(idx, props);
+        });
+        Struct.Builder structBuilder = Struct.newBuilder();
+        try {
+            JsonFormat.parser().merge(objectMapper.writeValueAsString(fields), structBuilder);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build mapping struct: " + e.getMessage(), e);
+        }
+        return GetIndexMappingResponse.newBuilder()
+                .setIndexName(indexName)
+                .setMappings(structBuilder.build())
+                .build();
+    }
+
+    /**
+     * Blocks until the supplied {@link java.util.concurrent.CompletionStage} completes,
+     * unwrapping checked-exception causes for caller convenience.
+     */
+    private static <T> T awaitFuture(java.util.function.Supplier<java.util.concurrent.CompletionStage<T>> supplier) {
+        try {
+            return supplier.get().toCompletableFuture().get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("Interrupted awaiting OpenSearch response", ie);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            if (cause instanceof RuntimeException re) throw re;
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("OpenSearch async operation failed", cause);
+        }
     }
 
     /**
@@ -643,18 +668,16 @@ public class OpenSearchIndexingService {
      * @param request existence-check request
      * @return the asynchronous existence result
      */
-    public Uni<IndexExistsResponse> indexExists(IndexExistsRequest request) {
+    public IndexExistsResponse indexExists(IndexExistsRequest request) {
         String indexName = request.getIndexName();
-        return Uni.createFrom().item(() -> {
-            try {
-                boolean exists = openSearchAsyncClient.indices()
-                        .exists(b -> b.index(indexName)).get().value();
-                return IndexExistsResponse.newBuilder().setExists(exists).build();
-            } catch (Exception e) {
-                LOG.warnf("Failed to check existence of index '%s': %s", indexName, e.getMessage());
-                return IndexExistsResponse.newBuilder().setExists(false).build();
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        try {
+            boolean exists = openSearchAsyncClient.indices()
+                    .exists(b -> b.index(indexName)).get().value();
+            return IndexExistsResponse.newBuilder().setExists(exists).build();
+        } catch (Exception e) {
+            LOG.warnf("Failed to check existence of index '%s': %s", indexName, e.getMessage());
+            return IndexExistsResponse.newBuilder().setExists(false).build();
+        }
     }
 
     /**
@@ -663,7 +686,7 @@ public class OpenSearchIndexingService {
      * @param request filesystem search request
      * @return the asynchronous search response
      */
-    public Uni<SearchFilesystemMetaResponse> searchFilesystemMeta(SearchFilesystemMetaRequest request) {
+    public SearchFilesystemMetaResponse searchFilesystemMeta(SearchFilesystemMetaRequest request) {
         LOG.infof("Searching filesystem metadata: drive=%s, query=%s", request.getDrive(), request.getQuery());
 
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 50;
@@ -692,43 +715,41 @@ public class OpenSearchIndexingService {
                 NodeFields.MIME_TYPE_TEXT.getFieldName(),
                 NodeFields.S3_KEY.getFieldName());
 
-        int finalFrom = from;
-        return adminSearchService.search(
+        var response = adminSearchService.search(
                 Index.FILESYSTEM_NODES.getIndexName(),
                 request.getQuery(),
                 searchFields,
-                finalFrom, pageSize,
+                from, pageSize,
                 null, null,
-                filters
-        ).map(response -> {
-            SearchFilesystemMetaResponse.Builder respBuilder = SearchFilesystemMetaResponse.newBuilder();
-            long total = response.hits().total() != null ? response.hits().total().value() : 0;
-            respBuilder.setTotalCount(total);
-            respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
+                filters);
 
-            for (var hit : response.hits().hits()) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> src = (Map<String, Object>) hit.source();
-                if (src == null) continue;
+        SearchFilesystemMetaResponse.Builder respBuilder = SearchFilesystemMetaResponse.newBuilder();
+        long total = response.hits().total() != null ? response.hits().total().value() : 0;
+        respBuilder.setTotalCount(total);
+        respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
 
-                FilesystemSearchResult.Builder r = FilesystemSearchResult.newBuilder();
-                r.setNodeId(strVal(src, "node_id"));
-                r.setName(strVal(src, "name"));
-                r.setNodeType(strVal(src, "node_type"));
-                r.setDrive(strVal(src, "drive"));
-                if (src.containsKey("parent_id") && src.get("parent_id") != null) {
-                    r.setParentId(String.valueOf(src.get("parent_id")));
-                }
-                r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
-                respBuilder.addResults(r.build());
+        for (var hit : response.hits().hits()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> src = (Map<String, Object>) hit.source();
+            if (src == null) continue;
+
+            FilesystemSearchResult.Builder r = FilesystemSearchResult.newBuilder();
+            r.setNodeId(strVal(src, "node_id"));
+            r.setName(strVal(src, "name"));
+            r.setNodeType(strVal(src, "node_type"));
+            r.setDrive(strVal(src, "drive"));
+            if (src.containsKey("parent_id") && src.get("parent_id") != null) {
+                r.setParentId(String.valueOf(src.get("parent_id")));
             }
+            r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
+            respBuilder.addResults(r.build());
+        }
 
-            int nextFrom = finalFrom + pageSize;
-            if (nextFrom < total) {
-                respBuilder.setNextPageToken(String.valueOf(nextFrom));
-            }
-            return respBuilder.build();
-        });
+        int nextFrom = from + pageSize;
+        if (nextFrom < total) {
+            respBuilder.setNextPageToken(String.valueOf(nextFrom));
+        }
+        return respBuilder.build();
     }
 
     /**
@@ -737,7 +758,7 @@ public class OpenSearchIndexingService {
      * @param request document-upload search request
      * @return the asynchronous search response
      */
-    public Uni<SearchDocumentUploadsResponse> searchDocumentUploads(SearchDocumentUploadsRequest request) {
+    public SearchDocumentUploadsResponse searchDocumentUploads(SearchDocumentUploadsRequest request) {
         LOG.infof("Searching document uploads: query=%s", request.getQuery());
 
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
@@ -761,52 +782,50 @@ public class OpenSearchIndexingService {
         String sortField = request.getSortBy().isEmpty() ? null : request.getSortBy();
         String sortOrder = request.getSortOrder().isEmpty() ? "desc" : request.getSortOrder();
 
-        int finalFrom = from;
-        return adminSearchService.search(
+        var response = adminSearchService.search(
                 Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName(),
                 request.getQuery(),
                 searchFields,
-                finalFrom, pageSize,
+                from, pageSize,
                 sortField, sortOrder,
-                filters
-        ).map(response -> {
-            SearchDocumentUploadsResponse.Builder respBuilder = SearchDocumentUploadsResponse.newBuilder();
-            long total = response.hits().total() != null ? response.hits().total().value() : 0;
-            respBuilder.setTotalCount(total);
-            respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
+                filters);
 
-            for (var hit : response.hits().hits()) {
-                @SuppressWarnings("unchecked")
-                Map<String, Object> src = (Map<String, Object>) hit.source();
-                if (src == null) continue;
+        SearchDocumentUploadsResponse.Builder respBuilder = SearchDocumentUploadsResponse.newBuilder();
+        long total = response.hits().total() != null ? response.hits().total().value() : 0;
+        respBuilder.setTotalCount(total);
+        respBuilder.setMaxScore(response.hits().maxScore() != null ? response.hits().maxScore().floatValue() : 0f);
 
-                DocumentUploadResult.Builder r = DocumentUploadResult.newBuilder();
-                r.setDocId(strVal(src, "doc_id"));
-                r.setFilename(strVal(src, "filename"));
-                r.setPath(strVal(src, "path"));
-                r.setMimeType(strVal(src, "mime_type"));
-                r.setAccountId(strVal(src, "account_id"));
-                r.setConnectorId(strVal(src, "connector_id"));
-                // Backward compat: prefer storage_key, fall back to s3_key
-                // TODO: remove s3_key fallback after full re-crawl
-                String storageKey = strVal(src, "storage_key");
-                if (storageKey.isEmpty()) {
-                    storageKey = strVal(src, "s3_key");
-                }
-                r.setStorageKey(storageKey);
-                if (src.containsKey("uploaded_at") && src.get("uploaded_at") instanceof Number) {
-                    r.setUploadedAt(((Number) src.get("uploaded_at")).longValue());
-                }
-                r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
-                respBuilder.addResults(r.build());
+        for (var hit : response.hits().hits()) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> src = (Map<String, Object>) hit.source();
+            if (src == null) continue;
+
+            DocumentUploadResult.Builder r = DocumentUploadResult.newBuilder();
+            r.setDocId(strVal(src, "doc_id"));
+            r.setFilename(strVal(src, "filename"));
+            r.setPath(strVal(src, "path"));
+            r.setMimeType(strVal(src, "mime_type"));
+            r.setAccountId(strVal(src, "account_id"));
+            r.setConnectorId(strVal(src, "connector_id"));
+            // Backward compat: prefer storage_key, fall back to s3_key
+            // TODO: remove s3_key fallback after full re-crawl
+            String storageKey = strVal(src, "storage_key");
+            if (storageKey.isEmpty()) {
+                storageKey = strVal(src, "s3_key");
             }
-
-            int nextFrom = finalFrom + pageSize;
-            if (nextFrom < total) {
-                respBuilder.setNextPageToken(String.valueOf(nextFrom));
+            r.setStorageKey(storageKey);
+            if (src.containsKey("uploaded_at") && src.get("uploaded_at") instanceof Number) {
+                r.setUploadedAt(((Number) src.get("uploaded_at")).longValue());
             }
-            return respBuilder.build();
-        });
+            r.setScore(hit.score() != null ? hit.score().floatValue() : 0f);
+            respBuilder.addResults(r.build());
+        }
+
+        int nextFrom = from + pageSize;
+        if (nextFrom < total) {
+            respBuilder.setNextPageToken(String.valueOf(nextFrom));
+        }
+        return respBuilder.build();
     }
 
     private static String strVal(Map<String, Object> src, String key) {
@@ -820,29 +839,26 @@ public class OpenSearchIndexingService {
      * @param request delete-index request
      * @return the asynchronous delete result
      */
-    public Uni<DeleteIndexResponse> deleteIndex(DeleteIndexRequest request) {
+    public DeleteIndexResponse deleteIndex(DeleteIndexRequest request) {
         String indexName = request.getIndexName();
         LOG.infof("Deleting index '%s'", indexName);
-
-        return Uni.createFrom().item(() -> {
-            try {
-                var response = openSearchAsyncClient.indices()
-                        .delete(b -> b.index(indexName)).get();
-                return DeleteIndexResponse.newBuilder()
-                        .setSuccess(response.acknowledged())
-                        .setMessage(response.acknowledged()
-                                ? "Index '" + indexName + "' deleted successfully"
-                                : "Delete not acknowledged for index '" + indexName + "'")
-                        .build();
-            } catch (Exception e) {
-                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                LOG.warnf("Failed to delete index '%s': %s", indexName, msg);
-                return DeleteIndexResponse.newBuilder()
-                        .setSuccess(false)
-                        .setMessage("Failed to delete index '" + indexName + "': " + msg)
-                        .build();
-            }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        try {
+            var response = openSearchAsyncClient.indices()
+                    .delete(b -> b.index(indexName)).get();
+            return DeleteIndexResponse.newBuilder()
+                    .setSuccess(response.acknowledged())
+                    .setMessage(response.acknowledged()
+                            ? "Index '" + indexName + "' deleted successfully"
+                            : "Delete not acknowledged for index '" + indexName + "'")
+                    .build();
+        } catch (Exception e) {
+            String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            LOG.warnf("Failed to delete index '%s': %s", indexName, msg);
+            return DeleteIndexResponse.newBuilder()
+                    .setSuccess(false)
+                    .setMessage("Failed to delete index '" + indexName + "': " + msg)
+                    .build();
+        }
     }
 
     /**
@@ -851,98 +867,80 @@ public class OpenSearchIndexingService {
      * @param request list-indices request
      * @return the asynchronous list response
      */
-    public Uni<ListIndicesResponse> listIndices(ListIndicesRequest request) {
-        // OpenSearch async completion runs on an HTTP I/O thread without a Vert.x duplicated context.
-        // Hibernate Reactive requires the request context — capture it here while still on the gRPC/event-loop thread.
-        Context vertxContext = Vertx.currentContext();
-        if (vertxContext == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "listIndices must run on a Vert.x context (e.g. gRPC or HTTP worker with context)"));
-        }
-
+    public ListIndicesResponse listIndices(ListIndicesRequest request) {
         String prefix = request.hasPrefixFilter() ? request.getPrefixFilter() : null;
         LOG.debugf("Listing indices with prefix filter: %s", prefix);
-
         String indexPattern = (prefix != null && !prefix.isBlank()) ? prefix + "*" : "*";
-        return Uni.createFrom().completionStage(() -> {
-                    try {
-                        return openSearchAsyncClient.cat()
-                                .indices(b -> b.index(indexPattern));
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
-                    }
-                })
-                .flatMap(catResponse -> {
-                    List<OpenSearchIndexInfo.Builder> builders = new ArrayList<>();
-                    for (var record : catResponse.valueBody()) {
-                        String name = record.index();
-                        if (name != null && name.startsWith(".")) {
-                            continue;
-                        }
 
-                        long docCount = 0;
-                        long sizeBytes = 0;
-                        String status = record.health() != null ? record.health() : "unknown";
+        var catResponse = awaitFuture(() -> {
+            try {
+                return openSearchAsyncClient.cat().indices(b -> b.index(indexPattern));
+            } catch (IOException e) {
+                // TODO(named-exception, task #70): OpenSearchSubmitException
+                throw new RuntimeException("OpenSearch cat.indices submission failed for pattern " + indexPattern, e);
+            }
+        });
 
-                        if (record.docsCount() != null) {
-                            try {
-                                docCount = Long.parseLong(record.docsCount());
-                            } catch (NumberFormatException ignored) {
-                            }
-                        }
-                        if (record.storeSize() != null) {
-                            sizeBytes = parseSizeToBytes(record.storeSize());
-                        }
+        List<OpenSearchIndexInfo.Builder> builders = new ArrayList<>();
+        for (var record : catResponse.valueBody()) {
+            String name = record.index();
+            if (name != null && name.startsWith(".")) {
+                continue;
+            }
 
-                        builders.add(OpenSearchIndexInfo.newBuilder()
-                                .setName(name != null ? name : "")
-                                .setDocumentCount(docCount)
-                                .setSizeInBytes(sizeBytes)
-                                .setStatus(status));
-                    }
+            long docCount = 0;
+            long sizeBytes = 0;
+            String status = record.health() != null ? record.health() : "unknown";
 
-                    if (builders.isEmpty()) {
-                        return Uni.createFrom().item(ListIndicesResponse.getDefaultInstance());
-                    }
+            if (record.docsCount() != null) {
+                try {
+                    docCount = Long.parseLong(record.docsCount());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (record.storeSize() != null) {
+                sizeBytes = parseSizeToBytes(record.storeSize());
+            }
 
-                    List<String> names = new ArrayList<>(builders.size());
-                    for (OpenSearchIndexInfo.Builder b : builders) {
-                        names.add(b.getName());
-                    }
+            builders.add(OpenSearchIndexInfo.newBuilder()
+                    .setName(name != null ? name : "")
+                    .setDocumentCount(docCount)
+                    .setSizeInBytes(sizeBytes)
+                    .setStatus(status));
+        }
 
-                    return Uni.createFrom().<ListIndicesResponse>emitter(emitter ->
-                            vertxContext.runOnContext(v ->
-                                    Panache.withSession(() -> VectorSetIndexBindingEntity.findAllByIndexNames(names))
-                                            .map(bindings -> {
-                                                Map<String, List<VectorFieldSummary>> byIndex = new HashMap<>();
-                                                for (VectorSetIndexBindingEntity binding : bindings) {
-                                                    VectorSetEntity vs = binding.vectorSet;
-                                                    if (vs == null) {
-                                                        continue;
-                                                    }
-                                                    VectorFieldSummary vf = VectorFieldSummary.newBuilder()
-                                                            .setVectorSetId(vs.id)
-                                                            .setVectorSetName(vs.name)
-                                                            .setFieldName(vs.fieldName)
-                                                            .setResultSetName(vs.resultSetName)
-                                                            .setDimensions(vs.vectorDimensions)
-                                                            .build();
-                                                    byIndex.computeIfAbsent(binding.indexName, k -> new ArrayList<>()).add(vf);
-                                                }
-                                                List<OpenSearchIndexInfo> indices = new ArrayList<>(builders.size());
-                                                for (OpenSearchIndexInfo.Builder bb : builders) {
-                                                    String n = bb.getName();
-                                                    bb.addAllVectorFields(byIndex.getOrDefault(n, List.of()));
-                                                    indices.add(bb.build());
-                                                }
-                                                return ListIndicesResponse.newBuilder().addAllIndices(indices).build();
-                                            })
-                                            .subscribe().with(emitter::complete, emitter::fail)));
-                })
-                .onFailure().recoverWithItem(e -> {
-                    LOG.warnf("Failed to list indices: %s", e.getMessage());
-                    return ListIndicesResponse.newBuilder().build();
-                });
+        if (builders.isEmpty()) {
+            return ListIndicesResponse.getDefaultInstance();
+        }
+
+        List<String> names = new ArrayList<>(builders.size());
+        for (OpenSearchIndexInfo.Builder b : builders) {
+            names.add(b.getName());
+        }
+        List<VectorSetIndexBindingEntity> bindings = vsIndexBindingRepo.findAllByIndexNames(names);
+
+        Map<String, List<VectorFieldSummary>> byIndex = new HashMap<>();
+        for (VectorSetIndexBindingEntity binding : bindings) {
+            VectorSetEntity vs = binding.vectorSet;
+            if (vs == null) {
+                continue;
+            }
+            VectorFieldSummary vf = VectorFieldSummary.newBuilder()
+                    .setVectorSetId(vs.id)
+                    .setVectorSetName(vs.name)
+                    .setFieldName(vs.fieldName)
+                    .setResultSetName(vs.resultSetName)
+                    .setDimensions(vs.vectorDimensions)
+                    .build();
+            byIndex.computeIfAbsent(binding.indexName, k -> new ArrayList<>()).add(vf);
+        }
+        List<OpenSearchIndexInfo> indices = new ArrayList<>(builders.size());
+        for (OpenSearchIndexInfo.Builder bb : builders) {
+            String n = bb.getName();
+            bb.addAllVectorFields(byIndex.getOrDefault(n, List.of()));
+            indices.add(bb.build());
+        }
+        return ListIndicesResponse.newBuilder().addAllIndices(indices).build();
     }
 
     /**
@@ -951,49 +949,46 @@ public class OpenSearchIndexingService {
      * @param request index-stats request
      * @return the asynchronous stats response
      */
-    public Uni<GetIndexStatsResponse> getIndexStats(GetIndexStatsRequest request) {
+    public GetIndexStatsResponse getIndexStats(GetIndexStatsRequest request) {
         String indexName = request.getIndexName();
         LOG.debugf("Getting stats for index '%s'", indexName);
-
-        return Uni.createFrom().item(() -> {
-            try {
-                if (managerRuntimeConfig.indexStats().refreshBeforeRead()) {
-                    try {
-                        openSearchAsyncClient.indices().refresh(r -> r.index(indexName)).get();
-                    } catch (Exception e) {
-                        LOG.warnf("Refresh before stats failed for index '%s': %s", indexName, e.getMessage());
-                    }
+        try {
+            if (managerRuntimeConfig.indexStats().refreshBeforeRead()) {
+                try {
+                    openSearchAsyncClient.indices().refresh(r -> r.index(indexName)).get();
+                } catch (Exception e) {
+                    LOG.warnf("Refresh before stats failed for index '%s': %s", indexName, e.getMessage());
                 }
-                var statsResponse = openSearchAsyncClient.indices()
-                        .stats(b -> b.index(indexName)).get();
+            }
+            var statsResponse = openSearchAsyncClient.indices()
+                    .stats(b -> b.index(indexName)).get();
 
-                var indexStats = statsResponse.indices().get(indexName);
-                if (indexStats == null) {
-                    return GetIndexStatsResponse.newBuilder()
-                            .setSuccess(false)
-                            .setMessage("Index '" + indexName + "' not found")
-                            .build();
-                }
-
-                long docCount = indexStats.primaries().docs() != null
-                        ? indexStats.primaries().docs().count() : 0;
-                long sizeBytes = indexStats.primaries().store() != null
-                        ? indexStats.primaries().store().sizeInBytes() : 0;
-
-                return GetIndexStatsResponse.newBuilder()
-                        .setSuccess(true)
-                        .setDocumentCount(docCount)
-                        .setSizeInBytes(sizeBytes)
-                        .setMessage("Stats retrieved for index '" + indexName + "'")
-                        .build();
-            } catch (Exception e) {
-                LOG.warnf("Failed to get stats for index '%s': %s", indexName, e.getMessage());
+            var indexStats = statsResponse.indices().get(indexName);
+            if (indexStats == null) {
                 return GetIndexStatsResponse.newBuilder()
                         .setSuccess(false)
-                        .setMessage("Failed to get stats: " + e.getMessage())
+                        .setMessage("Index '" + indexName + "' not found")
                         .build();
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+
+            long docCount = indexStats.primaries().docs() != null
+                    ? indexStats.primaries().docs().count() : 0;
+            long sizeBytes = indexStats.primaries().store() != null
+                    ? indexStats.primaries().store().sizeInBytes() : 0;
+
+            return GetIndexStatsResponse.newBuilder()
+                    .setSuccess(true)
+                    .setDocumentCount(docCount)
+                    .setSizeInBytes(sizeBytes)
+                    .setMessage("Stats retrieved for index '" + indexName + "'")
+                    .build();
+        } catch (Exception e) {
+            LOG.warnf("Failed to get stats for index '%s': %s", indexName, e.getMessage());
+            return GetIndexStatsResponse.newBuilder()
+                    .setSuccess(false)
+                    .setMessage("Failed to get stats: " + e.getMessage())
+                    .build();
+        }
     }
 
     /**
@@ -1016,86 +1011,84 @@ public class OpenSearchIndexingService {
      * @param request crawl-scoped stats request
      * @return per-index counts filtered by crawl_id
      */
-    public Uni<ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse> getCrawlIndexStats(
+    public ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse getCrawlIndexStats(
             ai.pipestream.opensearch.v1.GetCrawlIndexStatsRequest request) {
         String crawlId = request.getCrawlId();
         String baseIndex = request.getBaseIndexName();
         if (crawlId == null || crawlId.isEmpty() || baseIndex == null || baseIndex.isEmpty()) {
-            return Uni.createFrom().item(ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder()
+            return ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder()
                     .setSuccess(false)
                     .setMessage("crawl_id and base_index_name are required")
-                    .build());
+                    .build();
         }
 
-        return Uni.createFrom().item(() -> {
-            ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.Builder respBuilder =
-                    ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder();
-            try {
-                // Enumerate the family: base + base--chunk--* + base--vs--*.
-                // We use cat/indices via the low-level client because
-                // .indices().get(index="X*") with a wildcard would fail when
-                // the base hasn't been written yet.
-                String[] patterns = new String[]{
-                        baseIndex,
-                        baseIndex + "--chunk--*",
-                        baseIndex + "--vs--*"
-                };
-                java.util.Set<String> familyMembers = new java.util.LinkedHashSet<>();
-                for (String pattern : patterns) {
-                    try {
-                        var resolveResp = openSearchAsyncClient.indices()
-                                .get(g -> g.index(pattern).ignoreUnavailable(true).allowNoIndices(true))
-                                .get();
-                        familyMembers.addAll(resolveResp.result().keySet());
-                    } catch (Exception e) {
-                        // index_not_found / no concrete indices: that's fine
-                        // for an early-run query; continue without this pattern.
-                        LOG.debugf("Family resolve for pattern %s yielded none: %s", pattern, e.getMessage());
-                    }
+        ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.Builder respBuilder =
+                ai.pipestream.opensearch.v1.GetCrawlIndexStatsResponse.newBuilder();
+        try {
+            // Enumerate the family: base + base--chunk--* + base--vs--*.
+            // We use cat/indices via the low-level client because
+            // .indices().get(index="X*") with a wildcard would fail when
+            // the base hasn't been written yet.
+            String[] patterns = new String[]{
+                    baseIndex,
+                    baseIndex + "--chunk--*",
+                    baseIndex + "--vs--*"
+            };
+            java.util.Set<String> familyMembers = new java.util.LinkedHashSet<>();
+            for (String pattern : patterns) {
+                try {
+                    var resolveResp = openSearchAsyncClient.indices()
+                            .get(g -> g.index(pattern).ignoreUnavailable(true).allowNoIndices(true))
+                            .get();
+                    familyMembers.addAll(resolveResp.result().keySet());
+                } catch (Exception e) {
+                    // index_not_found / no concrete indices: that's fine
+                    // for an early-run query; continue without this pattern.
+                    LOG.debugf("Family resolve for pattern %s yielded none: %s", pattern, e.getMessage());
                 }
-
-                if (familyMembers.isEmpty()) {
-                    // Nothing exists yet — base + side indices haven't been
-                    // created. Return success=true with no counts; the caller
-                    // treats this as "still at zero, keep polling".
-                    respBuilder.setSuccess(true)
-                            .setMessage("No indices found yet for base " + baseIndex);
-                    return respBuilder.build();
-                }
-
-                // Run a count query per family member with the crawl_id term.
-                // Use the {@code crawl_id.keyword} subfield because the dynamic
-                // template maps {@code crawl_id} as {@code text} (analyzed),
-                // which tokenises UUIDs on the dashes and makes a {@code term}
-                // query against the parent field always return zero. The
-                // {@code .keyword} sibling carries the exact value for term
-                // matching. Same trick OSM aggs already use elsewhere.
-                for (String idx : familyMembers) {
-                    var entry = ai.pipestream.opensearch.v1.CrawlIndexCount.newBuilder()
-                            .setIndexName(idx);
-                    try {
-                        final String ci = crawlId;
-                        var countResp = openSearchAsyncClient.count(c -> c
-                                .index(idx)
-                                .query(q -> q.term(t -> t.field("crawl_id.keyword").value(v -> v.stringValue(ci))))
-                        ).get();
-                        entry.setSuccess(true).setDocumentCount(countResp.count());
-                    } catch (Exception e) {
-                        entry.setSuccess(false)
-                                .setMessage("count failed for " + idx + ": " + e.getMessage());
-                    }
-                    respBuilder.addIndexCounts(entry.build());
-                }
-                respBuilder.setSuccess(true);
-                return respBuilder.build();
-            } catch (Exception e) {
-                LOG.warnf("Failed to compute crawl-scoped stats for crawl_id=%s base=%s: %s",
-                        crawlId, baseIndex, e.getMessage());
-                return respBuilder.setSuccess(false)
-                        .setMessage("Failed to compute crawl-scoped stats: " + e.getMessage())
-                        .build();
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+
+            if (familyMembers.isEmpty()) {
+                // Nothing exists yet — base + side indices haven't been
+                // created. Return success=true with no counts; the caller
+                // treats this as "still at zero, keep polling".
+                respBuilder.setSuccess(true)
+                        .setMessage("No indices found yet for base " + baseIndex);
+                return respBuilder.build();
+            }
+
+            // Run a count query per family member with the crawl_id term.
+            // Use the {@code crawl_id.keyword} subfield because the dynamic
+            // template maps {@code crawl_id} as {@code text} (analyzed),
+            // which tokenises UUIDs on the dashes and makes a {@code term}
+            // query against the parent field always return zero. The
+            // {@code .keyword} sibling carries the exact value for term
+            // matching. Same trick OSM aggs already use elsewhere.
+            for (String idx : familyMembers) {
+                var entry = ai.pipestream.opensearch.v1.CrawlIndexCount.newBuilder()
+                        .setIndexName(idx);
+                try {
+                    final String ci = crawlId;
+                    var countResp = openSearchAsyncClient.count(c -> c
+                            .index(idx)
+                            .query(q -> q.term(t -> t.field("crawl_id.keyword").value(v -> v.stringValue(ci))))
+                    ).get();
+                    entry.setSuccess(true).setDocumentCount(countResp.count());
+                } catch (Exception e) {
+                    entry.setSuccess(false)
+                            .setMessage("count failed for " + idx + ": " + e.getMessage());
+                }
+                respBuilder.addIndexCounts(entry.build());
+            }
+            respBuilder.setSuccess(true);
+            return respBuilder.build();
+        } catch (Exception e) {
+            LOG.warnf("Failed to compute crawl-scoped stats for crawl_id=%s base=%s: %s",
+                    crawlId, baseIndex, e.getMessage());
+            return respBuilder.setSuccess(false)
+                    .setMessage("Failed to compute crawl-scoped stats: " + e.getMessage())
+                    .build();
+        }
     }
 
     /**
@@ -1104,34 +1097,31 @@ public class OpenSearchIndexingService {
      * @param request delete-document request
      * @return the asynchronous delete result
      */
-    public Uni<DeleteDocumentResponse> deleteDocument(DeleteDocumentRequest request) {
+    public DeleteDocumentResponse deleteDocument(DeleteDocumentRequest request) {
         String indexName = request.getIndexName();
         String documentId = request.getDocumentId();
         LOG.debugf("Deleting document '%s' from index '%s'", documentId, indexName);
-
-        return Uni.createFrom().item(() -> {
-            try {
-                var builder = new org.opensearch.client.opensearch.core.DeleteRequest.Builder()
-                        .index(indexName)
-                        .id(documentId);
-                if (request.hasRouting()) {
-                    builder.routing(request.getRouting());
-                }
-                var response = openSearchAsyncClient.delete(builder.build()).get();
-                boolean found = "deleted".equals(response.result().jsonValue());
-                return DeleteDocumentResponse.newBuilder()
-                        .setSuccess(found)
-                        .setMessage(found
-                                ? "Document '" + documentId + "' deleted from '" + indexName + "'"
-                                : "Document '" + documentId + "' not found in '" + indexName + "'")
-                        .build();
-            } catch (Exception e) {
-                return DeleteDocumentResponse.newBuilder()
-                        .setSuccess(false)
-                        .setMessage("Failed to delete document: " + e.getMessage())
-                        .build();
+        try {
+            var builder = new org.opensearch.client.opensearch.core.DeleteRequest.Builder()
+                    .index(indexName)
+                    .id(documentId);
+            if (request.hasRouting()) {
+                builder.routing(request.getRouting());
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+            var response = openSearchAsyncClient.delete(builder.build()).get();
+            boolean found = "deleted".equals(response.result().jsonValue());
+            return DeleteDocumentResponse.newBuilder()
+                    .setSuccess(found)
+                    .setMessage(found
+                            ? "Document '" + documentId + "' deleted from '" + indexName + "'"
+                            : "Document '" + documentId + "' not found in '" + indexName + "'")
+                    .build();
+        } catch (Exception e) {
+            return DeleteDocumentResponse.newBuilder()
+                    .setSuccess(false)
+                    .setMessage("Failed to delete document: " + e.getMessage())
+                    .build();
+        }
     }
 
     /**
@@ -1140,49 +1130,46 @@ public class OpenSearchIndexingService {
      * @param request get-document request
      * @return the asynchronous document lookup result
      */
-    public Uni<GetOpenSearchDocumentResponse> getOpenSearchDocument(GetOpenSearchDocumentRequest request) {
+    public GetOpenSearchDocumentResponse getOpenSearchDocument(GetOpenSearchDocumentRequest request) {
         String indexName = request.getIndexName();
         String documentId = request.getDocumentId();
         LOG.debugf("Getting document '%s' from index '%s'", documentId, indexName);
-
-        return Uni.createFrom().item(() -> {
-            try {
-                var builder = new org.opensearch.client.opensearch.core.GetRequest.Builder()
-                        .index(indexName)
-                        .id(documentId);
-                if (request.hasRouting()) {
-                    builder.routing(request.getRouting());
-                }
-                var response = openSearchAsyncClient.get(builder.build(), Map.class).get();
-                if (!response.found()) {
-                    return GetOpenSearchDocumentResponse.newBuilder()
-                            .setFound(false)
-                            .setMessage("Document not found")
-                            .build();
-                }
-
-                // Parse the source back into OpenSearchDocument
-                @SuppressWarnings("unchecked")
-                Map<String, Object> sourceMap = (Map<String, Object>) response.source();
-                String sourceJson = objectMapper.writeValueAsString(sourceMap);
-                OpenSearchDocument.Builder docBuilder = OpenSearchDocument.newBuilder();
-                JsonFormat.parser().ignoringUnknownFields().merge(sourceJson, docBuilder);
-
-                // Reverse the write-path transform: reconstruct semantic_sets from vs_* nested fields
-                nestedStrategy.reconstructSemanticSets(sourceMap, docBuilder);
-
-                return GetOpenSearchDocumentResponse.newBuilder()
-                        .setFound(true)
-                        .setDocument(docBuilder.build())
-                        .setMessage("Document retrieved successfully")
-                        .build();
-            } catch (Exception e) {
+        try {
+            var builder = new org.opensearch.client.opensearch.core.GetRequest.Builder()
+                    .index(indexName)
+                    .id(documentId);
+            if (request.hasRouting()) {
+                builder.routing(request.getRouting());
+            }
+            var response = openSearchAsyncClient.get(builder.build(), Map.class).get();
+            if (!response.found()) {
                 return GetOpenSearchDocumentResponse.newBuilder()
                         .setFound(false)
-                        .setMessage("Failed to get document: " + e.getMessage())
+                        .setMessage("Document not found")
                         .build();
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+
+            // Parse the source back into OpenSearchDocument
+            @SuppressWarnings("unchecked")
+            Map<String, Object> sourceMap = (Map<String, Object>) response.source();
+            String sourceJson = objectMapper.writeValueAsString(sourceMap);
+            OpenSearchDocument.Builder docBuilder = OpenSearchDocument.newBuilder();
+            JsonFormat.parser().ignoringUnknownFields().merge(sourceJson, docBuilder);
+
+            // Reverse the write-path transform: reconstruct semantic_sets from vs_* nested fields
+            nestedStrategy.reconstructSemanticSets(sourceMap, docBuilder);
+
+            return GetOpenSearchDocumentResponse.newBuilder()
+                    .setFound(true)
+                    .setDocument(docBuilder.build())
+                    .setMessage("Document retrieved successfully")
+                    .build();
+        } catch (Exception e) {
+            return GetOpenSearchDocumentResponse.newBuilder()
+                    .setFound(false)
+                    .setMessage("Failed to get document: " + e.getMessage())
+                    .build();
+        }
     }
 
     private static long parseSizeToBytes(String sizeStr) {

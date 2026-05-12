@@ -3,7 +3,6 @@ package ai.pipestream.schemamanager.vectorset;
 import ai.pipestream.data.v1.VectorSetDirectives;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import io.quarkus.arc.DefaultBean;
-import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 
 /**
@@ -35,8 +34,8 @@ public class NoOpVectorSetProvisioner implements VectorSetProvisioner {
      * <p>This no-op implementation completes immediately without touching OpenSearch.
      */
     @Override
-    public Uni<Void> ensureFieldsForDirectives(VectorSetDirectives directives, String indexName) {
-        return Uni.createFrom().voidItem();
+    public void ensureFieldsForDirectives(VectorSetDirectives directives, String indexName) {
+        // no-op
     }
 
     /**
@@ -45,13 +44,13 @@ public class NoOpVectorSetProvisioner implements VectorSetProvisioner {
      * <p>This no-op implementation completes immediately without touching OpenSearch.
      */
     @Override
-    public Uni<Void> ensureFieldsForVectorSet(
+    public void ensureFieldsForVectorSet(
             String vectorSetId,
             String chunkerConfigId,
             String embeddingModelId,
             int vectorDimensions,
             String indexName,
             IndexingStrategy strategy) {
-        return Uni.createFrom().voidItem();
+        // no-op
     }
 }

@@ -7,10 +7,10 @@ import ai.pipestream.opensearch.v1.CreateIndexPlanResponse;
 import ai.pipestream.opensearch.v1.CreateVectorSetRequest;
 import ai.pipestream.opensearch.v1.IndexPlanStatus;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyIndexPlanServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyVectorSetServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.IndexPlanServiceGrpc;
+import ai.pipestream.opensearch.v1.VectorSetServiceGrpc;
 import ai.pipestream.opensearch.v1.UpdateIndexPlanRequest;
 import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
@@ -42,16 +42,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class IndexPlanMatrixIT {
 
     @GrpcClient
-    MutinyIndexPlanServiceGrpc.MutinyIndexPlanServiceStub indexPlanClient;
+    IndexPlanServiceGrpc.IndexPlanServiceBlockingStub indexPlanClient;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerService;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingService;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingService;
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetService;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetService;
 
     @Inject
     OpenSearchClient openSearchClient;
@@ -90,7 +90,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         // no vector_set_ids — chunker-only pipeline writing plain docs
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("plan with zero VSes must still be READY after base-index pre-create")
@@ -119,7 +119,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addAllVectorSetIds(List.of(vsX, vsY))
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("CHUNK_COMBINED plan with 2 VSes (same chunker) must be READY after provisioning")
@@ -159,7 +159,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES)
                         .addAllVectorSetIds(List.of(vsAX, vsBY))
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("SEPARATE_INDICES plan with 2 VSes must be READY")
@@ -199,7 +199,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .addAllVectorSetIds(List.of(vsA, vsB))
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("NESTED plan with 2 VSes must be READY")
@@ -254,7 +254,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsX)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getPlan().getStatus())
                 .as("provisioning failure on OS dimension mismatch must set status=FAILED")
@@ -301,7 +301,7 @@ class IndexPlanMatrixIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .addVectorSetIds(vsX)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(failed.getPlan().getStatus())
                 .as("initial create with conflicting mapping must be FAILED")
@@ -321,7 +321,7 @@ class IndexPlanMatrixIT {
                 UpdateIndexPlanRequest.newBuilder()
                         .setId(failed.getPlan().getId())
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(recovered.getPlan().getStatus())
                 .as("update after resolving conflict must flip to READY")
@@ -352,7 +352,7 @@ class IndexPlanMatrixIT {
                         .setFieldName("vs_field_" + UUID.randomUUID().toString().substring(0, 6))
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely().getVectorSet().getId();
+        ).getVectorSet().getId();
     }
 
     private void createChunker(String configId) {
@@ -362,7 +362,7 @@ class IndexPlanMatrixIT {
                             .setId(configId).setName(configId).setConfigId(configId)
                             .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException ignored) { }
     }
 
@@ -374,7 +374,7 @@ class IndexPlanMatrixIT {
                             .setModelIdentifier(modelIdentifier)
                             .setDimensions(DIM)
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException ignored) { }
     }
 

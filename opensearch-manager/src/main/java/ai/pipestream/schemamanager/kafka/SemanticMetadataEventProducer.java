@@ -1,52 +1,55 @@
 package ai.pipestream.schemamanager.kafka;
 
+import ai.pipestream.apicurio.registry.protobuf.ProtobufChannel;
+import ai.pipestream.apicurio.registry.protobuf.ProtobufEmitter;
 import ai.pipestream.opensearch.v1.*;
 import com.google.protobuf.Timestamp;
-import ai.pipestream.schemamanager.config.OpenSearchManagerRuntimeConfig;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.reactive.messaging.MutinyEmitter;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.reactive.messaging.Channel;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
 
 /**
- * Publishes semantic metadata change events to Kafka topic {@code semantic-metadata-events}.
- * Consumers (module-chunker, module-embedder) use these to invalidate caches and refresh lookups.
+ * Publishes semantic metadata change events to Kafka topic
+ * {@code semantic-metadata-events} (derived from the {@code -out} channel
+ * suffix by the Apicurio protobuf plugin). Consumers (module-chunker,
+ * module-embedder) use these to invalidate caches and refresh lookups.
+ *
+ * <p>Channel wiring is fully plugin-managed via {@link ProtobufChannel} +
+ * {@link ProtobufEmitter}; serializer, deserializer, failure-strategy, and
+ * the deterministic-UUID partition key are all auto-configured. Per-event
+ * partition keys come from {@link SemanticMetadataEventKeyExtractor}, which
+ * derives them from {@code event.entity_id}. Do NOT add manual
+ * {@code mp.messaging.outgoing.semantic-metadata-events-out.*} overrides —
+ * they will displace the plugin's auto-config.
+ *
+ * <p>Fire-and-forget: each {@code publishXxx} call returns immediately. The
+ * DB row is the source of truth — this Kafka event is a broadcast hint for
+ * downstream caches. Producer-side failures are surfaced through the
+ * smallrye-reactive-messaging channel's failure handler (the plugin's
+ * default), not by holding up the gRPC caller.
  */
 @ApplicationScoped
 public class SemanticMetadataEventProducer {
 
     private static final Logger LOG = Logger.getLogger(SemanticMetadataEventProducer.class);
 
-    private final MutinyEmitter<SemanticMetadataEvent> emitter;
-
-    private final boolean failOpenPublish;
-
-    /**
-     * Creates the semantic metadata event producer.
-     *
-     * @param emitter Kafka emitter for semantic metadata events
-     * @param runtimeConfig runtime configuration controlling publish behavior
-     */
     @Inject
-    public SemanticMetadataEventProducer(
-            @Channel("semantic-metadata-events") MutinyEmitter<SemanticMetadataEvent> emitter,
-            OpenSearchManagerRuntimeConfig runtimeConfig) {
-        this.emitter = emitter;
-        this.failOpenPublish = runtimeConfig.semanticMetadata().failOpenPublish();
+    @ProtobufChannel("semantic-metadata-events-out")
+    ProtobufEmitter<SemanticMetadataEvent> emitter;
+
+    /** CDI. */
+    public SemanticMetadataEventProducer() {
     }
 
     /**
      * Publishes a chunker-config created event.
      *
      * @param config created chunker config
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishChunkerConfigCreated(ChunkerConfig config) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_CREATED,
+    public void publishChunkerConfigCreated(ChunkerConfig config) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_CREATED,
                 config.getId(),
                 SemanticMetadataEvent.newBuilder().setChunkerConfig(config).build());
     }
@@ -56,10 +59,9 @@ public class SemanticMetadataEventProducer {
      *
      * @param previous previous chunker config state
      * @param current current chunker config state
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishChunkerConfigUpdated(ChunkerConfig previous, ChunkerConfig current) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_UPDATED,
+    public void publishChunkerConfigUpdated(ChunkerConfig previous, ChunkerConfig current) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_UPDATED,
                 current.getId(),
                 SemanticMetadataEvent.newBuilder()
                         .setChunkerConfig(current)
@@ -71,20 +73,18 @@ public class SemanticMetadataEventProducer {
      * Publishes a chunker-config deleted event.
      *
      * @param entityId deleted chunker config identifier
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishChunkerConfigDeleted(String entityId) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_DELETED, entityId, null);
+    public void publishChunkerConfigDeleted(String entityId) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_CHUNKER_CONFIG_DELETED, entityId, null);
     }
 
     /**
      * Publishes an embedding-model-config created event.
      *
      * @param config created embedding model config
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishEmbeddingModelConfigCreated(EmbeddingModelConfig config) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_CREATED,
+    public void publishEmbeddingModelConfigCreated(EmbeddingModelConfig config) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_CREATED,
                 config.getId(),
                 SemanticMetadataEvent.newBuilder().setEmbeddingModelConfig(config).build());
     }
@@ -94,10 +94,9 @@ public class SemanticMetadataEventProducer {
      *
      * @param previous previous embedding model config state
      * @param current current embedding model config state
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishEmbeddingModelConfigUpdated(EmbeddingModelConfig previous, EmbeddingModelConfig current) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_UPDATED,
+    public void publishEmbeddingModelConfigUpdated(EmbeddingModelConfig previous, EmbeddingModelConfig current) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_UPDATED,
                 current.getId(),
                 SemanticMetadataEvent.newBuilder()
                         .setEmbeddingModelConfig(current)
@@ -109,20 +108,18 @@ public class SemanticMetadataEventProducer {
      * Publishes an embedding-model-config deleted event.
      *
      * @param entityId deleted embedding model config identifier
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishEmbeddingModelConfigDeleted(String entityId) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_DELETED, entityId, null);
+    public void publishEmbeddingModelConfigDeleted(String entityId) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_EMBEDDING_MODEL_CONFIG_DELETED, entityId, null);
     }
 
     /**
      * Publishes an index-embedding binding created event.
      *
      * @param binding created binding
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishIndexEmbeddingBindingCreated(IndexEmbeddingBinding binding) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_CREATED,
+    public void publishIndexEmbeddingBindingCreated(IndexEmbeddingBinding binding) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_CREATED,
                 binding.getId(),
                 SemanticMetadataEvent.newBuilder().setIndexEmbeddingBinding(binding).build());
     }
@@ -132,10 +129,9 @@ public class SemanticMetadataEventProducer {
      *
      * @param previous previous binding state
      * @param current current binding state
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishIndexEmbeddingBindingUpdated(IndexEmbeddingBinding previous, IndexEmbeddingBinding current) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_UPDATED,
+    public void publishIndexEmbeddingBindingUpdated(IndexEmbeddingBinding previous, IndexEmbeddingBinding current) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_UPDATED,
                 current.getId(),
                 SemanticMetadataEvent.newBuilder()
                         .setIndexEmbeddingBinding(current)
@@ -147,10 +143,9 @@ public class SemanticMetadataEventProducer {
      * Publishes an index-embedding binding deleted event.
      *
      * @param entityId deleted binding identifier
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishIndexEmbeddingBindingDeleted(String entityId) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_DELETED, entityId, null);
+    public void publishIndexEmbeddingBindingDeleted(String entityId) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_INDEX_EMBEDDING_BINDING_DELETED, entityId, null);
     }
 
     // --- VectorSet events ---
@@ -159,10 +154,9 @@ public class SemanticMetadataEventProducer {
      * Publishes a vector-set created event.
      *
      * @param vectorSet created vector set
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishVectorSetCreated(VectorSet vectorSet) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_CREATED,
+    public void publishVectorSetCreated(VectorSet vectorSet) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_CREATED,
                 vectorSet.getId(),
                 SemanticMetadataEvent.newBuilder().setVectorSet(vectorSet).build());
     }
@@ -172,10 +166,9 @@ public class SemanticMetadataEventProducer {
      *
      * @param previous previous vector-set state
      * @param current current vector-set state
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishVectorSetUpdated(VectorSet previous, VectorSet current) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_UPDATED,
+    public void publishVectorSetUpdated(VectorSet previous, VectorSet current) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_UPDATED,
                 current.getId(),
                 SemanticMetadataEvent.newBuilder()
                         .setVectorSet(current)
@@ -187,25 +180,25 @@ public class SemanticMetadataEventProducer {
      * Publishes a vector-set deleted event.
      *
      * @param entityId deleted vector-set identifier
-     * @return completion signal for the publish attempt
      */
-    public Uni<Void> publishVectorSetDeleted(String entityId) {
-        return publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_DELETED, entityId, null);
+    public void publishVectorSetDeleted(String entityId) {
+        publish(SemanticMetadataEventType.SEMANTIC_METADATA_EVENT_TYPE_VECTOR_SET_DELETED, entityId, null);
     }
 
-    private Uni<Void> publish(SemanticMetadataEventType eventType, String entityId, SemanticMetadataEvent event) {
+    /**
+     * Fire-and-forget publish. Hands the event to the producer and returns —
+     * the gRPC caller doesn't wait for the Kafka ack. The plugin partitions
+     * by deterministic UUID via {@link SemanticMetadataEventKeyExtractor};
+     * producer-side failures surface through the smallrye channel's
+     * failure-strategy, not back to the calling thread.
+     */
+    private void publish(SemanticMetadataEventType eventType, String entityId, SemanticMetadataEvent event) {
         Timestamp now = Timestamp.newBuilder()
                 .setSeconds(Instant.now().getEpochSecond())
                 .setNanos(Instant.now().getNano())
                 .build();
         SemanticMetadataEvent.Builder b = event != null ? event.toBuilder() : SemanticMetadataEvent.newBuilder();
         SemanticMetadataEvent full = b.setEventType(eventType).setEntityId(entityId).setOccurredAt(now).build();
-        Uni<Void> send = emitter.send(full).replaceWithVoid()
-                .onFailure().invoke(e ->
-                        LOG.warnf(e, "Failed to publish semantic metadata event %s for %s", eventType, entityId));
-        if (failOpenPublish) {
-            return send.onFailure().recoverWithUni(() -> Uni.createFrom().voidItem());
-        }
-        return send;
+        emitter.send(full);
     }
 }

@@ -1,7 +1,6 @@
 package ai.pipestream.schemamanager.entity;
 
-import io.quarkus.hibernate.reactive.panache.PanacheEntityBase;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.hibernate.orm.panache.PanacheEntityBase;
 import jakarta.persistence.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.JdbcTypeCode;
@@ -9,7 +8,6 @@ import org.hibernate.annotations.UpdateTimestamp;
 import org.hibernate.type.SqlTypes;
 
 import java.time.LocalDateTime;
-import java.util.List;
 
 /**
  * Entity for semantic configuration.
@@ -113,37 +111,4 @@ public class SemanticConfigEntity extends PanacheEntityBase {
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     public LocalDateTime updatedAt;
-
-    /**
-     * Finds a semantic config by its unique name.
-     *
-     * @param name semantic config name
-     * @return the matching entity, if present
-     */
-    public static Uni<SemanticConfigEntity> findByName(String name) {
-        return find("name", name).firstResult();
-    }
-
-    /**
-     * Finds a semantic config by its stable config identifier.
-     *
-     * @param configId stable semantic config identifier
-     * @return the matching entity, if present
-     */
-    public static Uni<SemanticConfigEntity> findByConfigId(String configId) {
-        return find("configId", configId).firstResult();
-    }
-
-    /**
-     * Lists semantic configs ordered by newest first.
-     *
-     * @param page zero-based page number
-     * @param pageSize maximum rows per page
-     * @return paged semantic configs ordered by creation time descending
-     */
-    public static Uni<List<SemanticConfigEntity>> listOrderedByCreatedDesc(int page, int pageSize) {
-        return find("order by createdAt desc")
-                .page(io.quarkus.panache.common.Page.of(page, pageSize))
-                .list();
-    }
 }

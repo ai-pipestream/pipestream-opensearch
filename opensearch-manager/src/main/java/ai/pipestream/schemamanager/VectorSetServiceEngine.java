@@ -9,30 +9,33 @@ import ai.pipestream.schemamanager.entity.SemanticConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
+import ai.pipestream.schemamanager.repository.ChunkerConfigRepository;
+import ai.pipestream.schemamanager.repository.EmbeddingModelConfigRepository;
+import ai.pipestream.schemamanager.repository.SemanticConfigRepository;
+import ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
-import com.google.protobuf.Timestamp;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
 import io.grpc.Status;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.hibernate.reactive.panache.common.WithSession;
-import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
-import io.smallrye.mutiny.Uni;
-import io.vertx.core.Context;
-import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
+import org.hibernate.exception.ConstraintViolationException;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * Core business logic for VectorSet management.
+ * Core business logic for VectorSet management. Blocking on virtual threads
+ * with Hibernate ORM (classic). All collaborators (provisioner, cache, etc.)
+ * are blocking too — no Mutiny on the wire.
  */
 @ApplicationScoped
 public class VectorSetServiceEngine {
@@ -55,9 +58,28 @@ public class VectorSetServiceEngine {
     @Inject
     VectorSetProvisioner vectorSetProvisioner;
 
+    @Inject
+    VectorSetRepository vectorSetRepo;
+
+    @Inject
+    VectorSetIndexBindingRepository bindingRepo;
+
+    @Inject
+    ChunkerConfigRepository chunkerRepo;
+
+    @Inject
+    EmbeddingModelConfigRepository embeddingRepo;
+
+    @Inject
+    SemanticConfigRepository semanticRepo;
+
     /** CDI constructor. */
     public VectorSetServiceEngine() {
     }
+
+    // ============================================================================
+    // CRUD
+    // ============================================================================
 
     /**
      * Creates and persists a vector set from the supplied request.
@@ -65,81 +87,76 @@ public class VectorSetServiceEngine {
      * @param request create request
      * @return response containing the created vector set
      */
-    @WithTransaction
-    public Uni<CreateVectorSetResponse> createVectorSet(CreateVectorSetRequest request) {
-        return Panache.withTransaction(() -> {
-            // Semantic path: skip chunker config lookup; standard path: require it
-            Uni<ChunkerConfigEntity> chunkerLookup;
-            if (request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank()) {
-                chunkerLookup = Uni.createFrom().nullItem();
-            } else {
-                chunkerLookup = ChunkerConfigEntity.<ChunkerConfigEntity>findById(request.getChunkerConfigId())
-                        .onItem().transformToUni(cc -> {
-                            if (cc == null) {
-                                return Uni.createFrom().<ChunkerConfigEntity>failure(Status.NOT_FOUND
-                                        .withDescription("Chunker config not found: " + request.getChunkerConfigId())
-                                        .asRuntimeException());
-                            }
-                            return Uni.createFrom().item(cc);
-                        });
-            }
-            return chunkerLookup.onItem().transformToUni(cc ->
-                        EmbeddingModelConfig.<EmbeddingModelConfig>findById(request.getEmbeddingModelConfigId())
-                                .onItem().transformToUni(emc -> {
-                                    if (emc == null) {
-                                        return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
-                                                .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
-                                                .asRuntimeException());
-                                    }
-                                    try {
-                                        validateSourceCelConflictAndLength(request);
-                                    } catch (RuntimeException ex) {
-                                        return Uni.createFrom().failure(ex);
-                                    }
-                                    String id = request.hasId() && !request.getId().isBlank()
-                                            ? request.getId()
-                                            : UUID.randomUUID().toString();
-                                    VectorSetEntity entity = new VectorSetEntity();
-                                    entity.id = id;
-                                    entity.name = request.getName();
-                                    if (cc != null) entity.chunkerConfig = cc;
-                                    entity.embeddingModelConfig = emc;
-                                    entity.fieldName = request.getFieldName();
-                                    entity.resultSetName = normalizeResultSetName(
-                                            request.hasResultSetName() ? request.getResultSetName() : null);
-                                    entity.sourceCel = effectiveSourceCel(request);
-                                    entity.vectorDimensions = emc.dimensions;
-                                    entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
-                                    entity.provenance = request.hasProvenance()
-                                            ? provenanceToStorage(request.getProvenance())
-                                            : "REGISTERED";
-                                    entity.ownerType = request.hasOwnerType() ? request.getOwnerType() : null;
-                                    entity.ownerId = request.hasOwnerId() ? request.getOwnerId() : null;
-                                    entity.contentSignature = request.hasContentSignature() ? request.getContentSignature() : null;
+    public CreateVectorSetResponse createVectorSet(CreateVectorSetRequest request) {
+        VectorSetEntity saved = persistVectorSet(request);
+        VectorSet proto = toVectorSetProto(saved, request.getIndexName());
+        eventProducer.publishVectorSetCreated(proto);
+        return CreateVectorSetResponse.newBuilder().setVectorSet(proto).build();
+    }
 
-                                    if (request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank()) {
-                                        return SemanticConfigEntity.<SemanticConfigEntity>findById(request.getSemanticConfigId())
-                                                .onItem().transformToUni(sc -> {
-                                                    if (sc == null) {
-                                                        return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
-                                                                .withDescription("Semantic config not found: " + request.getSemanticConfigId())
-                                                                .asRuntimeException());
-                                                    }
-                                                    entity.semanticConfig = sc;
-                                                    if (request.hasGranularity()
-                                                            && request.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
-                                                        entity.granularity = request.getGranularity().name()
-                                                                .replace("GRANULARITY_LEVEL_", "");
-                                                    }
-                                                    return persistAndBind(entity, request.getIndexName());
-                                                });
-                                    }
-                                    return persistAndBind(entity, request.getIndexName());
-                                }));
-        })
-                .onItem().transform(saved -> toVectorSetProto(saved, request.getIndexName()))
-                .call(vs -> eventProducer.publishVectorSetCreated(vs))
-                .map(vs -> CreateVectorSetResponse.newBuilder().setVectorSet(vs).build());
+    @Transactional
+    protected VectorSetEntity persistVectorSet(CreateVectorSetRequest request) {
+        // Semantic path skips chunker config; standard path requires it.
+        ChunkerConfigEntity cc = null;
+        if (!(request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank())) {
+            cc = chunkerRepo.findById(request.getChunkerConfigId());
+            if (cc == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("Chunker config not found: " + request.getChunkerConfigId())
+                        .asRuntimeException();
+            }
+        }
+        EmbeddingModelConfig emc = embeddingRepo.findById(request.getEmbeddingModelConfigId());
+        if (emc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
+                    .asRuntimeException();
+        }
+        validateSourceCelConflictAndLength(request);
+
+        String id = request.hasId() && !request.getId().isBlank()
+                ? request.getId()
+                : UUID.randomUUID().toString();
+        VectorSetEntity entity = new VectorSetEntity();
+        entity.id = id;
+        entity.name = request.getName();
+        if (cc != null) entity.chunkerConfig = cc;
+        entity.embeddingModelConfig = emc;
+        entity.fieldName = request.getFieldName();
+        entity.resultSetName = normalizeResultSetName(
+                request.hasResultSetName() ? request.getResultSetName() : null);
+        entity.sourceCel = effectiveSourceCel(request);
+        entity.vectorDimensions = emc.dimensions;
+        entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
+        entity.provenance = request.hasProvenance()
+                ? provenanceToStorage(request.getProvenance())
+                : "REGISTERED";
+        entity.ownerType = request.hasOwnerType() ? request.getOwnerType() : null;
+        entity.ownerId = request.hasOwnerId() ? request.getOwnerId() : null;
+        entity.contentSignature = request.hasContentSignature() ? request.getContentSignature() : null;
+
+        if (request.hasSemanticConfigId() && !request.getSemanticConfigId().isBlank()) {
+            SemanticConfigEntity sc = semanticRepo.findById(request.getSemanticConfigId());
+            if (sc == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("Semantic config not found: " + request.getSemanticConfigId())
+                        .asRuntimeException();
+            }
+            entity.semanticConfig = sc;
+            if (request.hasGranularity()
+                    && request.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
+                entity.granularity = request.getGranularity().name()
+                        .replace("GRANULARITY_LEVEL_", "");
+            }
+        }
+
+        vectorSetRepo.persist(entity);
+
+        String indexName = request.getIndexName();
+        if (indexName != null && !indexName.isBlank()) {
+            ensureIndexBindingForCreate(entity, indexName);
+        }
+        return entity;
     }
 
     /**
@@ -148,17 +165,18 @@ public class VectorSetServiceEngine {
      * @param request lookup request
      * @return response containing the resolved vector set
      */
-    @WithSession
-    public Uni<GetVectorSetResponse> getVectorSet(GetVectorSetRequest request) {
-        Uni<VectorSetEntity> lookup = request.hasByName() && request.getByName()
-                ? VectorSetEntity.findByName(request.getId())
-                : VectorSetEntity.findById(request.getId());
-        return lookup.onItem().transformToUni(e -> e != null
-                        ? Uni.createFrom().item(GetVectorSetResponse.newBuilder()
-                                .setVectorSet(toVectorSetProto((VectorSetEntity) e)).build())
-                        : Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("VectorSet not found: " + request.getId())
-                                .asRuntimeException()));
+    public GetVectorSetResponse getVectorSet(GetVectorSetRequest request) {
+        VectorSetEntity e = request.hasByName() && request.getByName()
+                ? vectorSetRepo.findByName(request.getId())
+                : vectorSetRepo.findById(request.getId());
+        if (e == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("VectorSet not found: " + request.getId())
+                    .asRuntimeException();
+        }
+        return GetVectorSetResponse.newBuilder()
+                .setVectorSet(toVectorSetProto(e))
+                .build();
     }
 
     /**
@@ -167,73 +185,57 @@ public class VectorSetServiceEngine {
      * @param request update request
      * @return response containing the updated vector set
      */
-    @WithTransaction
-    public Uni<UpdateVectorSetResponse> updateVectorSet(UpdateVectorSetRequest request) {
-        return Panache.withTransaction(() -> VectorSetEntity.<VectorSetEntity>findById(request.getId())
-                .onItem().transformToUni(e -> {
-                    if (e == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("VectorSet not found: " + request.getId())
-                                .asRuntimeException());
-                    }
-                    try {
-                        validateUpdateSourceCel(request, e);
-                    } catch (RuntimeException ex) {
-                        return Uni.createFrom().failure(ex);
-                    }
-                    VectorSet previous = toVectorSetProto(e);
+    public UpdateVectorSetResponse updateVectorSet(UpdateVectorSetRequest request) {
+        VectorSetUpdate result = applyVectorSetUpdate(request);
+        VectorSet current = toVectorSetProto(result.entity);
+        eventProducer.publishVectorSetUpdated(result.previous, current);
+        return UpdateVectorSetResponse.newBuilder().setVectorSet(current).build();
+    }
 
-                    if (request.hasName()) e.name = request.getName();
-                    if (request.hasSourceField()) e.sourceCel = request.getSourceField();
-                    if (request.hasSourceCel()) e.sourceCel = request.getSourceCel();
-                    if (request.hasResultSetName()) e.resultSetName = normalizeResultSetName(request.getResultSetName());
-                    if (request.hasMetadata()) e.metadata = structToJson(request.getMetadata());
-                    if (request.hasProvenance()) e.provenance = provenanceToStorage(request.getProvenance());
-                    if (request.hasOwnerType()) e.ownerType = request.getOwnerType();
-                    if (request.hasOwnerId()) e.ownerId = request.getOwnerId();
+    @Transactional
+    protected VectorSetUpdate applyVectorSetUpdate(UpdateVectorSetRequest request) {
+        VectorSetEntity e = vectorSetRepo.findById(request.getId());
+        if (e == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("VectorSet not found: " + request.getId())
+                    .asRuntimeException();
+        }
+        validateUpdateSourceCel(request, e);
+        VectorSet previous = toVectorSetProto(e);
 
-                    Uni<VectorSetEntity> afterChunker;
-                    if (request.hasChunkerConfigId()) {
-                        afterChunker = ChunkerConfigEntity.<ChunkerConfigEntity>findById(request.getChunkerConfigId())
-                                .onItem().transformToUni(cc -> {
-                                    if (cc == null) {
-                                        return Uni.createFrom().<VectorSetEntity>failure(Status.NOT_FOUND
-                                                .withDescription("Chunker config not found: " + request.getChunkerConfigId())
-                                                .asRuntimeException());
-                                    }
-                                    e.chunkerConfig = cc;
-                                    return Uni.createFrom().item(e);
-                                });
-                    } else {
-                        afterChunker = Uni.createFrom().item(e);
-                    }
+        if (request.hasName()) e.name = request.getName();
+        if (request.hasSourceField()) e.sourceCel = request.getSourceField();
+        if (request.hasSourceCel()) e.sourceCel = request.getSourceCel();
+        if (request.hasResultSetName()) e.resultSetName = normalizeResultSetName(request.getResultSetName());
+        if (request.hasMetadata()) e.metadata = structToJson(request.getMetadata());
+        if (request.hasProvenance()) e.provenance = provenanceToStorage(request.getProvenance());
+        if (request.hasOwnerType()) e.ownerType = request.getOwnerType();
+        if (request.hasOwnerId()) e.ownerId = request.getOwnerId();
 
-                    return afterChunker.onItem().transformToUni(entity -> {
-                        if (request.hasEmbeddingModelConfigId()) {
-                            return EmbeddingModelConfig.<EmbeddingModelConfig>findById(request.getEmbeddingModelConfigId())
-                                    .onItem().transformToUni(emc -> {
-                                        if (emc == null) {
-                                            return Uni.createFrom().failure(Status.NOT_FOUND
-                                                    .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
-                                                    .asRuntimeException());
-                                        }
-                                        entity.embeddingModelConfig = emc;
-                                        entity.vectorDimensions = emc.dimensions;
-                                        return entity.persist()
-                                                .replaceWith(Uni.createFrom().item(new Object[]{previous, entity}));
-                                    });
-                        }
-                        return entity.persist()
-                                .replaceWith(Uni.createFrom().item(new Object[]{previous, entity}));
-                    });
-                }))
-                .onItem().transformToUni(pair -> {
-                    var prev = (VectorSet) ((Object[]) pair)[0];
-                    var entity = (VectorSetEntity) ((Object[]) pair)[1];
-                    var current = toVectorSetProto(entity);
-                    return eventProducer.publishVectorSetUpdated(prev, current)
-                            .replaceWith(UpdateVectorSetResponse.newBuilder().setVectorSet(current).build());
-                });
+        if (request.hasChunkerConfigId()) {
+            ChunkerConfigEntity cc = chunkerRepo.findById(request.getChunkerConfigId());
+            if (cc == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("Chunker config not found: " + request.getChunkerConfigId())
+                        .asRuntimeException();
+            }
+            e.chunkerConfig = cc;
+        }
+        if (request.hasEmbeddingModelConfigId()) {
+            EmbeddingModelConfig emc = embeddingRepo.findById(request.getEmbeddingModelConfigId());
+            if (emc == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
+                        .asRuntimeException();
+            }
+            e.embeddingModelConfig = emc;
+            e.vectorDimensions = emc.dimensions;
+        }
+        vectorSetRepo.persist(e);
+        return new VectorSetUpdate(previous, e);
+    }
+
+    private record VectorSetUpdate(VectorSet previous, VectorSetEntity entity) {
     }
 
     /**
@@ -242,22 +244,28 @@ public class VectorSetServiceEngine {
      * @param request delete request
      * @return deletion outcome
      */
-    @WithTransaction
-    public Uni<DeleteVectorSetResponse> deleteVectorSet(DeleteVectorSetRequest request) {
-        return Panache.withTransaction(() ->
-                VectorSetEntity.<VectorSetEntity>findById(request.getId())
-                        .onItem().transformToUni(e -> {
-                            if (e == null) {
-                                return Uni.createFrom().item(DeleteVectorSetResponse.newBuilder()
-                                        .setSuccess(false)
-                                        .setMessage("Not found: " + request.getId()).build());
-                            }
-                            return e.delete()
-                                    .replaceWith(DeleteVectorSetResponse.newBuilder()
-                                            .setSuccess(true)
-                                            .setMessage("Deleted").build())
-                                    .call(() -> eventProducer.publishVectorSetDeleted(request.getId()));
-                        }));
+    public DeleteVectorSetResponse deleteVectorSet(DeleteVectorSetRequest request) {
+        DeleteOutcome outcome = applyVectorSetDelete(request);
+        if (outcome.deleted) {
+            eventProducer.publishVectorSetDeleted(request.getId());
+        }
+        return DeleteVectorSetResponse.newBuilder()
+                .setSuccess(outcome.deleted)
+                .setMessage(outcome.message)
+                .build();
+    }
+
+    @Transactional
+    protected DeleteOutcome applyVectorSetDelete(DeleteVectorSetRequest request) {
+        VectorSetEntity e = vectorSetRepo.findById(request.getId());
+        if (e == null) {
+            return new DeleteOutcome(false, "Not found: " + request.getId());
+        }
+        vectorSetRepo.delete(e);
+        return new DeleteOutcome(true, "Deleted");
+    }
+
+    private record DeleteOutcome(boolean deleted, String message) {
     }
 
     /**
@@ -266,31 +274,31 @@ public class VectorSetServiceEngine {
      * @param request list request
      * @return matching vector sets
      */
-    @WithSession
-    public Uni<ListVectorSetsResponse> listVectorSets(ListVectorSetsRequest request) {
+    public ListVectorSetsResponse listVectorSets(ListVectorSetsRequest request) {
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
         int page = parsePageToken(request.getPageToken());
 
         if (request.hasIndexName()) {
-            return VectorSetIndexBindingEntity.<VectorSetIndexBindingEntity>list("indexName", request.getIndexName())
-                    .onItem().transform(bindings -> ListVectorSetsResponse.newBuilder()
-                        .addAllVectorSets(bindings.stream().map(b -> toVectorSetProto(b.vectorSet, b.indexName)).toList())
-                        .build());
+            List<VectorSetIndexBindingEntity> bindings =
+                    bindingRepo.list("indexName", request.getIndexName());
+            return ListVectorSetsResponse.newBuilder()
+                    .addAllVectorSets(bindings.stream()
+                            .map(b -> toVectorSetProto(b.vectorSet, b.indexName)).toList())
+                    .build();
         }
 
-        Uni<List<VectorSetEntity>> query;
+        List<VectorSetEntity> entities;
         if (request.hasChunkerConfigId()) {
-            query = VectorSetEntity.findByChunkerConfigId(request.getChunkerConfigId());
+            entities = vectorSetRepo.findByChunkerConfigId(request.getChunkerConfigId());
         } else if (request.hasEmbeddingModelConfigId()) {
-            query = VectorSetEntity.findByEmbeddingModelConfigId(request.getEmbeddingModelConfigId());
+            entities = vectorSetRepo.findByEmbeddingModelConfigId(request.getEmbeddingModelConfigId());
         } else {
-            query = VectorSetEntity.listOrderedByCreatedDesc(page, pageSize);
+            entities = vectorSetRepo.listOrderedByCreatedDesc(page, pageSize);
         }
-
-        return query.onItem().transform(entities -> ListVectorSetsResponse.newBuilder()
-                        .addAllVectorSets(entities.stream().map(e -> toVectorSetProto(e, null)).toList())
-                        .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
-                        .build());
+        return ListVectorSetsResponse.newBuilder()
+                .addAllVectorSets(entities.stream().map(e -> toVectorSetProto(e, null)).toList())
+                .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
+                .build();
     }
 
     /**
@@ -299,122 +307,102 @@ public class VectorSetServiceEngine {
      * @param request resolution request
      * @return resolution response
      */
-    @WithSession
-    public Uni<ResolveVectorSetResponse> resolveVectorSet(ResolveVectorSetRequest request) {
+    public ResolveVectorSetResponse resolveVectorSet(ResolveVectorSetRequest request) {
         String resultSetName = normalizeResultSetName(
                 request.hasResultSetName() ? request.getResultSetName() : null);
-        return VectorSetIndexBindingEntity.findBindingByDetails(request.getIndexName(), request.getFieldName(), resultSetName)
-                        .onItem().transformToUni(binding -> {
-                            if (binding != null) {
-                                return Uni.createFrom().item(binding.vectorSet);
-                            }
-                            if (!DEFAULT_RESULT_SET_NAME.equals(resultSetName)) {
-                                return VectorSetIndexBindingEntity.findBindingByDetails(
-                                        request.getIndexName(), request.getFieldName(), DEFAULT_RESULT_SET_NAME)
-                                        .onItem().transform(b -> b != null ? b.vectorSet : null);
-                            }
-                            return Uni.createFrom().item((VectorSetEntity) null);
-                        })
-                .onItem().transform(vs -> {
-                    if (vs != null) {
-                        return ResolveVectorSetResponse.newBuilder()
-                                .setVectorSet(toVectorSetProto(vs, request.getIndexName()))
-                                .setFound(true)
-                                .build();
-                    }
-                    return ResolveVectorSetResponse.newBuilder()
-                            .setFound(false)
-                            .build();
-                });
+        VectorSetIndexBindingEntity binding = bindingRepo.findBindingByDetails(
+                request.getIndexName(), request.getFieldName(), resultSetName);
+        VectorSetEntity vs = binding != null ? binding.vectorSet : null;
+        if (vs == null && !DEFAULT_RESULT_SET_NAME.equals(resultSetName)) {
+            VectorSetIndexBindingEntity fallback = bindingRepo.findBindingByDetails(
+                    request.getIndexName(), request.getFieldName(), DEFAULT_RESULT_SET_NAME);
+            vs = fallback != null ? fallback.vectorSet : null;
+        }
+        if (vs != null) {
+            return ResolveVectorSetResponse.newBuilder()
+                    .setVectorSet(toVectorSetProto(vs, request.getIndexName()))
+                    .setFound(true)
+                    .build();
+        }
+        return ResolveVectorSetResponse.newBuilder().setFound(false).build();
     }
 
     /**
-     * Resolve a registered VectorSet id or an inline (ephemeral) tuple for sinks and semantic indexing.
+     * Resolve a registered VectorSet id or an inline (ephemeral) tuple for
+     * sinks and semantic indexing.
      *
      * @param request directive resolution request
      * @return resolution response
      */
-    @WithSession
-    public Uni<ResolveVectorSetFromDirectiveResponse> resolveVectorSetFromDirective(ResolveVectorSetFromDirectiveRequest request) {
+    public ResolveVectorSetFromDirectiveResponse resolveVectorSetFromDirective(
+            ResolveVectorSetFromDirectiveRequest request) {
         return switch (request.getSpecCase()) {
             case VECTOR_SET_ID -> resolveFromVectorSetId(request.getVectorSetId());
             case INLINE -> resolveFromInlineSpec(request.getInline());
-            default -> Uni.createFrom().failure(Status.INVALID_ARGUMENT
+            default -> throw Status.INVALID_ARGUMENT
                     .withDescription("Oneof spec is required (vector_set_id or inline)")
-                    .asRuntimeException());
+                    .asRuntimeException();
         };
     }
 
-    private Uni<ResolveVectorSetFromDirectiveResponse> resolveFromVectorSetId(String id) {
+    private ResolveVectorSetFromDirectiveResponse resolveFromVectorSetId(String id) {
         resolutionMetrics.recordDirectiveResolveById();
-        return VectorSetEntity.<VectorSetEntity>findById(id)
-                .onItem().transformToUni(e -> {
-                    if (e == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("VectorSet not found: " + id)
-                                .asRuntimeException());
-                    }
-                    return VectorSetIndexBindingEntity.findFirstByVectorSetId(id)
-                            .onItem().transform(binding -> {
-                                String idx = binding != null ? binding.indexName : "";
-                                return ResolveVectorSetFromDirectiveResponse.newBuilder()
-                                        .setVectorSet(toVectorSetProto(e, idx))
-                                        .setResolved(true)
-                                        .setResolutionNotes("vector_set_id")
-                                        .build();
-                            });
-                });
+        VectorSetEntity e = vectorSetRepo.findById(id);
+        if (e == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("VectorSet not found: " + id)
+                    .asRuntimeException();
+        }
+        VectorSetIndexBindingEntity binding = bindingRepo.findFirstByVectorSetId(id);
+        String idx = binding != null ? binding.indexName : "";
+        return ResolveVectorSetFromDirectiveResponse.newBuilder()
+                .setVectorSet(toVectorSetProto(e, idx))
+                .setResolved(true)
+                .setResolutionNotes("vector_set_id")
+                .build();
     }
 
-    private Uni<ResolveVectorSetFromDirectiveResponse> resolveFromInlineSpec(InlineVectorSetSpec spec) {
+    private ResolveVectorSetFromDirectiveResponse resolveFromInlineSpec(InlineVectorSetSpec spec) {
         if (!semanticVectorSetConfig.inlineResolutionEnabled()) {
-            return Uni.createFrom().failure(Status.PERMISSION_DENIED
+            throw Status.PERMISSION_DENIED
                     .withDescription("Inline VectorSet resolution is disabled")
-                    .asRuntimeException());
+                    .asRuntimeException();
         }
         resolutionMetrics.recordDirectiveResolveInline();
-        try {
-            validateSourceCelLength(spec.getSourceCel());
-        } catch (RuntimeException ex) {
-            return Uni.createFrom().failure(ex);
+        validateSourceCelLength(spec.getSourceCel());
+        ChunkerConfigEntity cc = chunkerRepo.findById(spec.getChunkerConfigId());
+        if (cc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Chunker config not found: " + spec.getChunkerConfigId())
+                    .asRuntimeException();
         }
-        return ChunkerConfigEntity.<ChunkerConfigEntity>findById(spec.getChunkerConfigId())
-                .onItem().transformToUni(cc -> {
-                    if (cc == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Chunker config not found: " + spec.getChunkerConfigId())
-                                .asRuntimeException());
-                    }
-                    return EmbeddingModelConfig.<EmbeddingModelConfig>findById(spec.getEmbeddingModelConfigId())
-                            .onItem().transformToUni(emc -> {
-                                if (emc == null) {
-                                    return Uni.createFrom().failure(Status.NOT_FOUND
-                                            .withDescription("Embedding model config not found: " + spec.getEmbeddingModelConfigId())
-                                            .asRuntimeException());
-                                }
-                                String rs = normalizeResultSetName(
-                                        spec.getResultSetName() == null || spec.getResultSetName().isBlank()
-                                                ? null : spec.getResultSetName());
-                                VectorSet vs = VectorSet.newBuilder()
-                                        .setId("")
-                                        .setName("inline-ephemeral")
-                                        .setChunkerConfigId(cc.id)
-                                        .setEmbeddingModelConfigId(emc.id)
-                                        .setIndexName(spec.hasIndexName() ? spec.getIndexName() : "")
-                                        .setFieldName(spec.getFieldName())
-                                        .setResultSetName(rs)
-                                        .setSourceField(spec.getSourceCel())
-                                        .setSourceCel(spec.getSourceCel())
-                                        .setProvenance(VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE)
-                                        .setVectorDimensions(emc.dimensions)
-                                        .build();
-                                return Uni.createFrom().item(ResolveVectorSetFromDirectiveResponse.newBuilder()
-                                        .setVectorSet(vs)
-                                        .setResolved(true)
-                                        .setResolutionNotes("inline_ephemeral")
-                                        .build());
-                            });
-                });
+        EmbeddingModelConfig emc = embeddingRepo.findById(spec.getEmbeddingModelConfigId());
+        if (emc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Embedding model config not found: " + spec.getEmbeddingModelConfigId())
+                    .asRuntimeException();
+        }
+        String rs = normalizeResultSetName(
+                spec.getResultSetName() == null || spec.getResultSetName().isBlank()
+                        ? null : spec.getResultSetName());
+        VectorSet vs = VectorSet.newBuilder()
+                .setId("")
+                .setName("inline-ephemeral")
+                .setChunkerConfigId(cc.id)
+                .setEmbeddingModelConfigId(emc.id)
+                .setIndexName(spec.hasIndexName() ? spec.getIndexName() : "")
+                .setFieldName(spec.getFieldName())
+                .setResultSetName(rs)
+                .setSourceField(spec.getSourceCel())
+                .setSourceCel(spec.getSourceCel())
+                .setProvenance(VectorSetProvenance.VECTOR_SET_PROVENANCE_INLINE)
+                .setVectorDimensions(emc.dimensions)
+                .build();
+        return ResolveVectorSetFromDirectiveResponse.newBuilder()
+                .setVectorSet(vs)
+                .setResolved(true)
+                .setResolutionNotes("inline_ephemeral")
+                .build();
     }
 
     /**
@@ -424,25 +412,20 @@ public class VectorSetServiceEngine {
      * @param embeddingModelConfigId embedding model config id
      * @return resolved embedding dimensions
      */
-    @WithSession
-    public Uni<Integer> resolveEmbeddingDimensionsFromConfigIds(String chunkerConfigId, String embeddingModelConfigId) {
-        return ChunkerConfigEntity.<ChunkerConfigEntity>findById(chunkerConfigId)
-                .onItem().transformToUni(cc -> {
-                    if (cc == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Chunker config not found: " + chunkerConfigId)
-                                .asRuntimeException());
-                    }
-                    return EmbeddingModelConfig.<EmbeddingModelConfig>findById(embeddingModelConfigId)
-                            .onItem().transformToUni(emc -> {
-                                if (emc == null) {
-                                    return Uni.createFrom().failure(Status.NOT_FOUND
-                                            .withDescription("Embedding model config not found: " + embeddingModelConfigId)
-                                            .asRuntimeException());
-                                }
-                                return Uni.createFrom().item(emc.dimensions);
-                            });
-                });
+    public int resolveEmbeddingDimensionsFromConfigIds(String chunkerConfigId, String embeddingModelConfigId) {
+        ChunkerConfigEntity cc = chunkerRepo.findById(chunkerConfigId);
+        if (cc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Chunker config not found: " + chunkerConfigId)
+                    .asRuntimeException();
+        }
+        EmbeddingModelConfig emc = embeddingRepo.findById(embeddingModelConfigId);
+        if (emc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Embedding model config not found: " + embeddingModelConfigId)
+                    .asRuntimeException();
+        }
+        return emc.dimensions;
     }
 
     /**
@@ -457,80 +440,33 @@ public class VectorSetServiceEngine {
     }
 
     /**
-     * Creates an index binding for a newly-created VectorSet, gracefully handling the case
-     * where the binding already exists (e.g., duplicate create request with same explicit id).
-     * The binding insert runs inside the caller's transaction since both the VectorSet and
-     * binding are being created together. If a constraint violation occurs, the binding already
-     * exists and we simply log and continue.
+     * Creates an index binding for a newly-created VectorSet, gracefully
+     * handling the case where the binding already exists (e.g., duplicate
+     * create request with same explicit id, or a concurrent insert from
+     * another instance). The binding insert runs inside the caller's
+     * transaction since both the VectorSet and binding are being created
+     * together. On constraint violation the binding already exists and we
+     * simply log and continue.
      */
-    private Uni<VectorSetEntity> ensureIndexBindingForCreate(VectorSetEntity saved, String indexName) {
-        return VectorSetIndexBindingEntity.findBinding(saved.id, indexName)
-                .onItem().transformToUni(existing -> {
-                    if (existing != null) {
-                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — binding exists, skipping create",
-                                saved.id, indexName);
-                        return Uni.createFrom().item(saved);
-                    }
-                    // Isolated transaction: a constraint violation from a concurrent insert
-                    // must not corrupt the caller's Hibernate session.
-                    return Panache.<VectorSetEntity>withTransaction(() -> {
-                        VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
-                        binding.id = UUID.randomUUID().toString();
-                        binding.vectorSet = saved;
-                        binding.indexName = indexName;
-                        binding.status = "ACTIVE";
-                        return binding.<VectorSetIndexBindingEntity>persist().replaceWith(saved);
-                    });
-                })
-                .onFailure().recoverWithUni(err -> {
-                    if (isUniqueVsIndexBindingViolation(err)) {
-                        LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — concurrent create race resolved, continuing normally",
-                                saved.id, indexName);
-                        return Uni.createFrom().item(saved);
-                    }
-                    return Uni.createFrom().failure(err);
-                })
-                // The hot path's IndexBindingCache must reload after any write
-                // touching this index. Fire-and-forget invalidation keeps this
-                // method's contract identical to before.
-                .invoke(vs -> bindingCache.invalidate(indexName));
-    }
-
-    /**
-     * Checks for the unique_vs_index_binding constraint violation specifically.
-     * Falls back to general unique-violation check (23505) since the persist only
-     * targets the vector_set_index_binding table.
-     */
-    private static boolean isUniqueVsIndexBindingViolation(Throwable t) {
-        Throwable original = t;
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && msg.contains("unique_vs_index_binding")) {
-                return true;
-            }
-            t = t.getCause();
+    private void ensureIndexBindingForCreate(VectorSetEntity saved, String indexName) {
+        VectorSetIndexBindingEntity existing = bindingRepo.findBinding(saved.id, indexName);
+        if (existing != null) {
+            LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — binding exists, skipping create",
+                    saved.id, indexName);
+            return;
         }
-        return isConstraintViolation(original);
-    }
-
-    private static boolean isConstraintViolation(Throwable t) {
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
-                return true;
-            }
-            t = t.getCause();
+        try {
+            VectorSetIndexBindingEntity binding = new VectorSetIndexBindingEntity();
+            binding.id = UUID.randomUUID().toString();
+            binding.vectorSet = saved;
+            binding.indexName = indexName;
+            binding.status = "ACTIVE";
+            bindingRepo.persist(binding);
+        } catch (ConstraintViolationException dup) {
+            LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — concurrent create race resolved",
+                    saved.id, indexName);
         }
-        return false;
-    }
-
-    private Uni<VectorSetEntity> persistAndBind(VectorSetEntity entity, String indexName) {
-        return entity.<VectorSetEntity>persist().onItem().transformToUni(saved -> {
-            if (indexName != null && !indexName.isBlank()) {
-                return ensureIndexBindingForCreate(saved, indexName);
-            }
-            return Uni.createFrom().item(saved);
-        });
+        bindingCache.invalidate(indexName);
     }
 
     // ============================================================================
@@ -540,126 +476,112 @@ public class VectorSetServiceEngine {
     /**
      * Binds an existing VectorSet recipe to an OpenSearch index. The recipe
      * must already exist; the index does not need to exist (the eager
-     * provisioner — task #79 — will create it as part of putMapping if
-     * needed).
+     * provisioner will create it as part of putMapping if needed).
      *
      * <p>Idempotent: re-binding the same (vector_set_id, index_name) pair
      * returns the existing binding with {@code created=false}.
+     *
+     * <p>ALWAYS runs the eager provisioner, even when the binding row
+     * already exists. Short-circuiting on "already bound" was a fallback
+     * that hid configId-drift bugs: if the chunkerConfig's stored configId
+     * changed since the original bind (e.g. via a self-repair
+     * UpdateChunkerConfig), the existing OpenSearch side index has a now-stale
+     * name and the chunker module writes to a name nothing provisioned.
+     * Always re-provisioning forces the side-index naming to track the
+     * current chunker configId. The provisioner is idempotent (cache hit on
+     * unchanged state = O(1) noop), so this is cheap.
      */
-    public Uni<BindVectorSetToIndexResponse> bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
+    public BindVectorSetToIndexResponse bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
         if (request.getVectorSetId().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("vector_set_id is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("vector_set_id is required").asRuntimeException();
         }
         if (request.getIndexName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("index_name is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("index_name is required").asRuntimeException();
         }
         final String vsId = request.getVectorSetId();
         final String indexName = request.getIndexName();
         final String accountId = request.hasAccountId() ? request.getAccountId() : null;
         final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
-        // Strategy chosen for this binding's physical layout. UNSPECIFIED
-        // (default for unset) is treated as the server-side default in
-        // BindTimeVectorSetProvisioner.handlerFor (currently CHUNK_COMBINED).
-        final ai.pipestream.opensearch.v1.IndexingStrategy strategy = request.getIndexingStrategy();
+        final IndexingStrategy strategy = request.getIndexingStrategy();
 
-        // Capture the calling Vert.x context now (gRPC dispatch puts us on
-        // the event loop). Phase 2's OpenSearch I/O hops to a worker pool;
-        // we use this captured context to emit Phase 3 back onto the event
-        // loop where Hibernate Reactive's session machinery requires it.
-        final Context vertxContext = Vertx.currentContext();
-        if (vertxContext == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "bindVectorSetToIndex must run on a Vert.x context"));
+        // Phase 1: lookup recipe + existing binding (read-only, no transaction).
+        BindLookupResult lookup = lookupBind(vsId, indexName);
+
+        // Phase 2: ALWAYS run the eager provisioner, even on existing bindings,
+        // so configId drift can't cause silent side-index naming mismatches.
+        // The provisioner is idempotent (cache hit = O(1) noop) when unchanged.
+        vectorSetProvisioner.ensureFieldsForVectorSet(
+                        vsId,
+                        lookup.chunkerConfigId,
+                        lookup.embeddingModelId,
+                        lookup.dimensions,
+                        indexName,
+                        strategy)
+                ;
+
+        BindVectorSetToIndexResponse response;
+        if (lookup.alreadyBoundProto != null) {
+            response = BindVectorSetToIndexResponse.newBuilder()
+                    .setBinding(lookup.alreadyBoundProto)
+                    .setCreated(false)
+                    .build();
+        } else {
+            // Phase 3: insert binding row in a fresh transaction. Concurrent
+            // insert races resolve to an existing-row read.
+            try {
+                VectorSetIndexBindingEntity persisted = persistBinding(vsId, indexName, accountId, datasourceId);
+                response = BindVectorSetToIndexResponse.newBuilder()
+                        .setBinding(toBindingProto(persisted))
+                        .setCreated(true)
+                        .build();
+            } catch (ConstraintViolationException dup) {
+                VectorSetIndexBindingEntity existing = bindingRepo.findBinding(vsId, indexName);
+                if (existing == null) {
+                    throw dup;
+                }
+                response = BindVectorSetToIndexResponse.newBuilder()
+                        .setBinding(toBindingProto(existing))
+                        .setCreated(false)
+                        .build();
+            }
         }
+        bindingCache.invalidate(indexName);
+        return response;
+    }
 
-        // Phase 1: read recipe + check existing binding inside a session.
-        // Capture EAGER-loaded scalars so the provisioner phase (which runs
-        // OUTSIDE any session) doesn't need the entity.
-        Uni<BindLookupResult> phase1 = Panache.withSession(() ->
-                VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
-                    if (vs == null) {
-                        return Uni.createFrom().<BindLookupResult>failure(Status.NOT_FOUND
-                                .withDescription("VectorSet not found: " + vsId)
-                                .asRuntimeException());
-                    }
-                    // Use the SYMBOLIC ids (configId / name), not the DB UUIDs.
-                    // The sink derives side-index names from the same symbolic
-                    // ids the chunker/embedder stamp on emitted chunks at runtime.
-                    // Using `.id` (UUID) here would make the eager provisioner
-                    // create indices like `--vs--<UUID>--<UUID>` that the sink
-                    // never writes to (mismatch → cold cache + empty indices).
-                    String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
-                    String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
-                    int dimensions = vs.vectorDimensions;
-                    return VectorSetIndexBindingEntity.findBinding(vsId, indexName)
-                            .map(existing -> new BindLookupResult(
-                                    existing != null ? toBindingProto(existing) : null,
-                                    chunkerConfigId, embeddingModelId, dimensions));
-                }));
+    @Transactional
+    protected BindLookupResult lookupBind(String vsId, String indexName) {
+        VectorSetEntity vs = vectorSetRepo.findById(vsId);
+        if (vs == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("VectorSet not found: " + vsId)
+                    .asRuntimeException();
+        }
+        // Use the SYMBOLIC ids (configId / name), not the DB UUIDs. The sink
+        // derives side-index names from these same symbolic ids that the
+        // chunker/embedder stamp on emitted chunks at runtime.
+        String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
+        String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
+        int dimensions = vs.vectorDimensions;
+        VectorSetIndexBindingEntity existing = bindingRepo.findBinding(vsId, indexName);
+        return new BindLookupResult(
+                existing != null ? toBindingProto(existing) : null,
+                chunkerConfigId, embeddingModelId, dimensions);
+    }
 
-        return phase1.chain(lookup -> {
-                    // ALWAYS run the eager provisioner, even when the binding row
-                    // already exists. Short-circuiting on "already bound" was a
-                    // fallback that hid configId-drift bugs: if the chunkerConfig's
-                    // stored configId changed since the original bind (e.g. via a
-                    // self-repair UpdateChunkerConfig), the existing OpenSearch
-                    // side index has a now-stale name and the chunker module
-                    // writes to a name nothing provisioned. Always re-provisioning
-                    // forces the side-index naming to track the current chunker
-                    // configId. The provisioner is idempotent (cache hit on
-                    // unchanged state = O(1) noop), so this is cheap.
-                    Uni<Void> provision = vectorSetProvisioner.ensureFieldsForVectorSet(
-                                    vsId,
-                                    lookup.chunkerConfigId,
-                                    lookup.embeddingModelId,
-                                    lookup.dimensions,
-                                    indexName,
-                                    strategy)
-                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()));
-
-                    if (lookup.alreadyBoundProto != null) {
-                        // Binding row exists; re-provisioned above; return as not-created.
-                        return provision.replaceWith(BindVectorSetToIndexResponse.newBuilder()
-                                .setBinding(lookup.alreadyBoundProto)
-                                .setCreated(false)
-                                .build());
-                    }
-                    // Phase 3: insert binding row in a fresh transaction.
-                    return provision
-                            .chain(() -> Panache.withTransaction(() ->
-                                    VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
-                                        VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
-                                        row.id = UUID.randomUUID().toString();
-                                        row.vectorSet = vs;
-                                        row.indexName = indexName;
-                                        row.accountId = accountId;
-                                        row.datasourceId = datasourceId;
-                                        row.status = "ACTIVE";
-                                        return row.<VectorSetIndexBindingEntity>persist();
-                                    })))
-                            .map(persisted -> BindVectorSetToIndexResponse.newBuilder()
-                                    .setBinding(toBindingProto(persisted))
-                                    .setCreated(true)
-                                    .build());
-                })
-                .onFailure().recoverWithUni(err -> {
-                    if (isUniqueVsIndexBindingViolation(err)) {
-                        // Concurrent insert won the race — re-read and return as not-created.
-                        // Same event-loop hop applies before re-entering Panache.
-                        return Uni.createFrom().<Void>voidItem()
-                                .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
-                                .chain(() -> Panache.withSession(() ->
-                                        VectorSetIndexBindingEntity.findBinding(vsId, indexName)
-                                                .map(existing -> BindVectorSetToIndexResponse.newBuilder()
-                                                        .setBinding(toBindingProto(existing))
-                                                        .setCreated(false)
-                                                        .build())));
-                    }
-                    return Uni.createFrom().failure(err);
-                })
-                .invoke(resp -> bindingCache.invalidate(indexName));
+    @Transactional
+    protected VectorSetIndexBindingEntity persistBinding(
+            String vsId, String indexName, String accountId, String datasourceId) {
+        VectorSetEntity vs = vectorSetRepo.findById(vsId);
+        VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+        row.id = UUID.randomUUID().toString();
+        row.vectorSet = vs;
+        row.indexName = indexName;
+        row.accountId = accountId;
+        row.datasourceId = datasourceId;
+        row.status = "ACTIVE";
+        bindingRepo.persist(row);
+        return row;
     }
 
     /**
@@ -684,202 +606,160 @@ public class VectorSetServiceEngine {
      * dropping a SEPARATE_INDICES side-index can be added later as an
      * opt-in flag on this RPC.)
      */
-    @WithTransaction
-    public Uni<UnbindVectorSetFromIndexResponse> unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
+    @Transactional
+    public UnbindVectorSetFromIndexResponse unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
         if (request.getVectorSetId().isBlank() || request.getIndexName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("vector_set_id and index_name are required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("vector_set_id and index_name are required")
+                    .asRuntimeException();
         }
         final String indexName = request.getIndexName();
-        return VectorSetIndexBindingEntity.deleteBinding(request.getVectorSetId(), indexName)
-                .map(count -> UnbindVectorSetFromIndexResponse.newBuilder()
-                        .setUnbound(count != null && count > 0)
-                        .build())
-                .invoke(resp -> bindingCache.invalidate(indexName));
+        long count = bindingRepo.deleteBinding(request.getVectorSetId(), indexName);
+        UnbindVectorSetFromIndexResponse response = UnbindVectorSetFromIndexResponse.newBuilder()
+                .setUnbound(count > 0)
+                .build();
+        bindingCache.invalidate(indexName);
+        return response;
     }
 
     /** Lists indices a single VectorSet is bound to, paginated. */
-    @WithSession
-    public Uni<ListIndicesForVectorSetResponse> listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
+    public ListIndicesForVectorSetResponse listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
         if (request.getVectorSetId().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("vector_set_id is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("vector_set_id is required").asRuntimeException();
         }
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
         int offset = parseOffset(request.getPageToken());
-        return VectorSetIndexBindingEntity.listByVectorSetId(request.getVectorSetId(), offset, pageSize)
-                .map(rows -> {
-                    var b = ListIndicesForVectorSetResponse.newBuilder();
-                    for (var row : rows) {
-                        b.addBindings(toBindingProto(row));
-                    }
-                    if (rows.size() == pageSize) {
-                        b.setNextPageToken(String.valueOf(offset + pageSize));
-                    }
-                    return b.build();
-                });
+        List<VectorSetIndexBindingEntity> rows = bindingRepo.listByVectorSetId(
+                request.getVectorSetId(), offset, pageSize);
+        var b = ListIndicesForVectorSetResponse.newBuilder();
+        for (var row : rows) {
+            b.addBindings(toBindingProto(row));
+        }
+        if (rows.size() == pageSize) {
+            b.setNextPageToken(String.valueOf(offset + pageSize));
+        }
+        return b.build();
     }
 
     /** Lists VectorSets bound to a single index, paginated, with hydrated recipes. */
-    @WithSession
-    public Uni<ListVectorSetsForIndexResponse> listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
+    public ListVectorSetsForIndexResponse listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
         if (request.getIndexName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("index_name is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("index_name is required").asRuntimeException();
         }
         int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
         int offset = parseOffset(request.getPageToken());
-        return VectorSetIndexBindingEntity.listByIndexName(request.getIndexName(), offset, pageSize)
-                .map(rows -> {
-                    var b = ListVectorSetsForIndexResponse.newBuilder();
-                    for (var row : rows) {
-                        b.addEntries(ListVectorSetsForIndexResponse.Entry.newBuilder()
-                                .setBinding(toBindingProto(row))
-                                .setVectorSet(toVectorSetProto(row.vectorSet, row.indexName))
-                                .build());
-                    }
-                    if (rows.size() == pageSize) {
-                        b.setNextPageToken(String.valueOf(offset + pageSize));
-                    }
-                    return b.build();
-                });
+        List<VectorSetIndexBindingEntity> rows = bindingRepo.listByIndexName(
+                request.getIndexName(), offset, pageSize);
+        var b = ListVectorSetsForIndexResponse.newBuilder();
+        for (var row : rows) {
+            b.addEntries(ListVectorSetsForIndexResponse.Entry.newBuilder()
+                    .setBinding(toBindingProto(row))
+                    .setVectorSet(toVectorSetProto(row.vectorSet, row.indexName))
+                    .build());
+        }
+        if (rows.size() == pageSize) {
+            b.setNextPageToken(String.valueOf(offset + pageSize));
+        }
+        return b.build();
     }
 
+    /**
+     * All-or-nothing: bind every requested VectorSet to the given index. If
+     * any bind fails (NOT_FOUND, dimension mismatch, etc.) the transaction
+     * rolls back so the index ends up with all the requested bindings or none.
+     */
     /**
      * All-or-nothing: bind every requested VectorSet to the given index.
      * If any bind fails (NOT_FOUND, dimension mismatch, etc.) the
      * transaction rolls back so the index ends up with all the requested
      * bindings or none of them.
      */
-    public Uni<CreateIndexWithVectorSetsResponse> createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
+    public CreateIndexWithVectorSetsResponse createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
         if (request.getIndexName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("index_name is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("index_name is required").asRuntimeException();
         }
         if (request.getVectorSetIdsList().isEmpty()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("at least one vector_set_id is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("at least one vector_set_id is required")
+                    .asRuntimeException();
         }
         final String indexName = request.getIndexName();
         final String accountId = request.hasAccountId() ? request.getAccountId() : null;
         final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
         final List<String> vsIds = List.copyOf(request.getVectorSetIdsList());
 
-        final Context vertxContext = Vertx.currentContext();
-        if (vertxContext == null) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "createIndexWithVectorSets must run on a Vert.x context"));
+        // Phase 1: validate every vsId + capture existing bindings.
+        BatchBindLookupResult batch = resolveBatchLookup(vsIds, indexName);
+
+        // Phase 2: provision OS for EVERY entry, sequentially. Re-provisioning
+        // already-bound entries is the architectural rule: the eager provisioner
+        // is idempotent on unchanged state and is the only path that catches
+        // configId-drift in pre-existing rows.
+        for (BatchBindEntry e : batch.allEntries()) {
+            vectorSetProvisioner.ensureFieldsForVectorSet(
+                            e.vsId, e.chunkerConfigId, e.embeddingModelId,
+                            e.dimensions, indexName,
+                            IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED)
+                    ;
         }
 
-        // Phase 1: validate ALL vsIds + check existing bindings, in one read-only session.
-        // Failing here (e.g. NOT_FOUND on any id) short-circuits before any OS work
-        // or DB writes happen — preserves the all-or-nothing atomicity contract.
-        Uni<BatchBindLookupResult> phase1 = Panache.withSession(() ->
-                resolveBatchLookup(vsIds, indexName));
-
-        return phase1.chain(batch -> {
-                    // Phase 2: provision OS for EVERY entry, sequentially — both the
-                    // ones that need a new binding row AND the ones that are already
-                    // bound. Re-provisioning already-bound entries is the architectural
-                    // rule (no fallbacks): the eager provisioner is idempotent (cache
-                    // hit = O(1) noop) when nothing has changed, and is the only path
-                    // that catches configId-drift in pre-existing rows. Skipping it
-                    // for already-bound entries was a fallback that hid drift bugs.
-                    Uni<Void> provisionChain = Uni.createFrom().voidItem();
-                    for (BatchBindEntry entry : batch.allEntries()) {
-                        final BatchBindEntry e = entry;
-                        // CreateIndexWithVectorSetsRequest doesn't yet carry
-                        // indexing_strategy. Defaults to UNSPECIFIED → manager
-                        // server default (CHUNK_COMBINED). If a caller needs
-                        // per-batch strategy choice, add the field to the
-                        // request and thread it through here.
-                        provisionChain = provisionChain.chain(() ->
-                                vectorSetProvisioner.ensureFieldsForVectorSet(
-                                        e.vsId, e.chunkerConfigId, e.embeddingModelId,
-                                        e.dimensions, indexName,
-                                        ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED));
-                    }
-
-                    return provisionChain
-                            // Provisioning hopped to a worker thread — return to the
-                            // event loop before any further Panache calls.
-                            .emitOn(cmd -> vertxContext.runOnContext(v -> cmd.run()))
-                            .chain(() -> {
-                                if (batch.toCreate.isEmpty()) {
-                                    // Everything was already bound — no DB writes needed.
-                                    return Uni.createFrom().item(buildBatchResponse(indexName, batch.alreadyBoundProtos, List.of()));
-                                }
-                                // Phase 3: insert all new binding rows atomically in one transaction.
-                                return Panache.withTransaction(() -> persistBatch(batch.toCreate, indexName, accountId, datasourceId))
-                                        .map(newRows -> {
-                                            List<VectorSetIndexBinding> newProtos = new java.util.ArrayList<>(newRows.size());
-                                            for (VectorSetIndexBindingEntity r : newRows) newProtos.add(toBindingProto(r));
-                                            return buildBatchResponse(indexName, batch.alreadyBoundProtos, newProtos);
-                                        });
-                            });
-                })
-                .invoke(resp -> bindingCache.invalidate(indexName));
-    }
-
-    /**
-     * Read-only phase-1 lookup for the batch RPC. Walks every requested vsId,
-     * (a) loads the entity to validate existence and capture EAGER scalars,
-     * (b) checks for an existing binding and either records the existing proto
-     *     or queues a create entry. NOT_FOUND on any id fails the whole batch.
-     */
-    private Uni<BatchBindLookupResult> resolveBatchLookup(List<String> vsIds, String indexName) {
-        Uni<BatchBindLookupResult> chain = Uni.createFrom().item(new BatchBindLookupResult());
-        for (String id : vsIds) {
-            final String vsId = id;
-            chain = chain.chain(acc ->
-                    VectorSetEntity.<VectorSetEntity>findById(vsId).chain(vs -> {
-                        if (vs == null) {
-                            return Uni.createFrom().<BatchBindLookupResult>failure(Status.NOT_FOUND
-                                    .withDescription("VectorSet not found: " + vsId)
-                                    .asRuntimeException());
-                        }
-                        // Symbolic ids (see bindVectorSetToIndex for the why).
-                        String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
-                        String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
-                        int dimensions = vs.vectorDimensions;
-                        return VectorSetIndexBindingEntity.findBinding(vsId, indexName).map(existing -> {
-                            BatchBindEntry entry = new BatchBindEntry(
-                                    vsId, chunkerConfigId, embeddingModelId, dimensions);
-                            if (existing != null) {
-                                acc.alreadyBoundProtos.add(toBindingProto(existing));
-                                acc.alreadyBoundEntries.add(entry);
-                            } else {
-                                acc.toCreate.add(entry);
-                            }
-                            return acc;
-                        });
-                    }));
+        List<VectorSetIndexBinding> newProtos;
+        if (batch.toCreate.isEmpty()) {
+            newProtos = List.of();
+        } else {
+            List<VectorSetIndexBindingEntity> newRows =
+                    persistBatch(batch.toCreate, indexName, accountId, datasourceId);
+            newProtos = new ArrayList<>(newRows.size());
+            for (VectorSetIndexBindingEntity r : newRows) newProtos.add(toBindingProto(r));
         }
-        return chain;
+        CreateIndexWithVectorSetsResponse response =
+                buildBatchResponse(indexName, batch.alreadyBoundProtos, newProtos);
+        bindingCache.invalidate(indexName);
+        return response;
     }
 
-    /** Phase-3 persistence: insert one binding row per "needs create" entry, all in one tx. */
-    private Uni<List<VectorSetIndexBindingEntity>> persistBatch(
+    @Transactional
+    protected BatchBindLookupResult resolveBatchLookup(List<String> vsIds, String indexName) {
+        BatchBindLookupResult acc = new BatchBindLookupResult();
+        for (String vsId : vsIds) {
+            VectorSetEntity vs = vectorSetRepo.findById(vsId);
+            if (vs == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("VectorSet not found: " + vsId)
+                        .asRuntimeException();
+            }
+            String chunkerConfigId = vs.chunkerConfig != null ? vs.chunkerConfig.configId : null;
+            String embeddingModelId = vs.embeddingModelConfig != null ? vs.embeddingModelConfig.name : null;
+            int dimensions = vs.vectorDimensions;
+            BatchBindEntry entry = new BatchBindEntry(vsId, chunkerConfigId, embeddingModelId, dimensions);
+            VectorSetIndexBindingEntity existing = bindingRepo.findBinding(vsId, indexName);
+            if (existing != null) {
+                acc.alreadyBoundProtos.add(toBindingProto(existing));
+                acc.alreadyBoundEntries.add(entry);
+            } else {
+                acc.toCreate.add(entry);
+            }
+        }
+        return acc;
+    }
+
+    @Transactional
+    protected List<VectorSetIndexBindingEntity> persistBatch(
             List<BatchBindEntry> toCreate, String indexName, String accountId, String datasourceId) {
-        Uni<List<VectorSetIndexBindingEntity>> chain = Uni.createFrom().item(new java.util.ArrayList<>());
+        List<VectorSetIndexBindingEntity> rows = new ArrayList<>(toCreate.size());
         for (BatchBindEntry entry : toCreate) {
-            final BatchBindEntry e = entry;
-            chain = chain.chain(acc ->
-                    VectorSetEntity.<VectorSetEntity>findById(e.vsId).chain(vs -> {
-                        VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
-                        row.id = UUID.randomUUID().toString();
-                        row.vectorSet = vs;
-                        row.indexName = indexName;
-                        row.accountId = accountId;
-                        row.datasourceId = datasourceId;
-                        row.status = "ACTIVE";
-                        return row.<VectorSetIndexBindingEntity>persist().map(persisted -> {
-                            acc.add(persisted);
-                            return acc;
-                        });
-                    }));
+            VectorSetEntity vs = vectorSetRepo.findById(entry.vsId);
+            VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
+            row.id = UUID.randomUUID().toString();
+            row.vectorSet = vs;
+            row.indexName = indexName;
+            row.accountId = accountId;
+            row.datasourceId = datasourceId;
+            row.status = "ACTIVE";
+            bindingRepo.persist(row);
+            rows.add(row);
         }
-        return chain;
+        return rows;
     }
 
     private CreateIndexWithVectorSetsResponse buildBatchResponse(
@@ -892,7 +772,6 @@ public class VectorSetServiceEngine {
         return b.build();
     }
 
-    /** Captured scalars for one (vector_set, index) entry that needs to be created. */
     private record BatchBindEntry(
             String vsId,
             String chunkerConfigId,
@@ -900,15 +779,13 @@ public class VectorSetServiceEngine {
             int dimensions) {
     }
 
-    /** Aggregate phase-1 result for the batch RPC. */
     private static final class BatchBindLookupResult {
-        final List<VectorSetIndexBinding> alreadyBoundProtos = new java.util.ArrayList<>();
-        final List<BatchBindEntry> alreadyBoundEntries = new java.util.ArrayList<>();
-        final List<BatchBindEntry> toCreate = new java.util.ArrayList<>();
+        final List<VectorSetIndexBinding> alreadyBoundProtos = new ArrayList<>();
+        final List<BatchBindEntry> alreadyBoundEntries = new ArrayList<>();
+        final List<BatchBindEntry> toCreate = new ArrayList<>();
 
-        /** All entries (already-bound + needs-create); the eager provisioner runs over every one. */
         List<BatchBindEntry> allEntries() {
-            List<BatchBindEntry> all = new java.util.ArrayList<>(alreadyBoundEntries.size() + toCreate.size());
+            List<BatchBindEntry> all = new ArrayList<>(alreadyBoundEntries.size() + toCreate.size());
             all.addAll(alreadyBoundEntries);
             all.addAll(toCreate);
             return all;
@@ -933,12 +810,8 @@ public class VectorSetServiceEngine {
                 .setStatus(parseBindingStatus(row.status));
         if (row.accountId != null) b.setAccountId(row.accountId);
         if (row.datasourceId != null) b.setDatasourceId(row.datasourceId);
-        if (row.createdAt != null) {
-            b.setCreatedAt(toTimestamp(row.createdAt));
-        }
-        if (row.updatedAt != null) {
-            b.setUpdatedAt(toTimestamp(row.updatedAt));
-        }
+        if (row.createdAt != null) b.setCreatedAt(toTimestamp(row.createdAt));
+        if (row.updatedAt != null) b.setUpdatedAt(toTimestamp(row.updatedAt));
         return b.build();
     }
 
@@ -951,7 +824,6 @@ public class VectorSetServiceEngine {
             default        -> VectorSetBindingStatus.VECTOR_SET_BINDING_STATUS_UNSPECIFIED;
         };
     }
-
 
     // --- Proto conversion ---
 
@@ -1064,7 +936,9 @@ public class VectorSetServiceEngine {
 
     private void validateSourceCelLength(String sourceCel) {
         if (sourceCel == null || sourceCel.isBlank()) {
-            throw Status.INVALID_ARGUMENT.withDescription("source_cel (or legacy source_field) is required").asRuntimeException();
+            throw Status.INVALID_ARGUMENT
+                    .withDescription("source_cel (or legacy source_field) is required")
+                    .asRuntimeException();
         }
         int max = semanticVectorSetConfig.sourceCelMaxChars();
         if (sourceCel.length() > max) {

@@ -4,8 +4,6 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -13,11 +11,12 @@ import org.jboss.logging.Logger;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 
 /**
- * SEPARATE_INDICES indexing strategy: stores the base document (metadata only, no vectors)
- * in the primary index, and chunk documents in separate flat indices per (chunk config, embedding model).
+ * SEPARATE_INDICES indexing strategy: stores the base document (metadata only,
+ * no vectors) in the primary index, and chunk documents in separate flat
+ * indices per (chunk config, embedding model). Blocking-on-VT.
  */
 @ApplicationScoped
 public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler {
@@ -40,8 +39,8 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
     @Override
-    public ai.pipestream.opensearch.v1.IndexingStrategy strategy() {
-        return ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;
+    public IndexingStrategy strategy() {
+        return IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;
     }
 
     @Override
@@ -57,21 +56,25 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
     }
 
     @Override
-    public Uni<Void> provisionKnnField(String baseIndex, String chunkConfigId,
-                                       String embeddingModelId, int dimensions) {
+    public void provisionKnnField(String baseIndex, String chunkConfigId,
+                                  String embeddingModelId, int dimensions) {
         String indexName = resolveIndexName(baseIndex, chunkConfigId, embeddingModelId);
-        return indexKnnProvisioner.ensureKnnField(indexName, resolveFieldName(embeddingModelId), dimensions);
+        indexKnnProvisioner.ensureKnnField(indexName, resolveFieldName(embeddingModelId), dimensions);
     }
 
     @Override
-    public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
+    public IndexDocumentResponse indexDocument(IndexDocumentRequest request) {
         if (!request.hasDocumentMap()) {
-            return Uni.createFrom().item(IndexDocumentResponse.newBuilder()
+            return IndexDocumentResponse.newBuilder()
                     .setSuccess(false)
                     .setMessage("SEPARATE_INDICES requires document_map")
-                    .build());
+                    .build();
         }
-        
+        // STRICT: hot path verifies the base index was eagerly provisioned;
+        // does not create. If missing, fail loud rather than silently creating
+        // an index nothing else expects.
+        indexKnnProvisioner.requireIndex(request.getIndexName());
+
         String requestId = "unary-" + UUID.randomUUID();
         StreamIndexDocumentsRequest streamReq = StreamIndexDocumentsRequest.newBuilder()
                 .setRequestId(requestId)
@@ -79,29 +82,18 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
                 .setDocumentMap(request.getDocumentMap())
                 .addAllChunkDocuments(request.getChunkDocumentsList())
                 .build();
-
-        // STRICT: hot path verifies the base index was eagerly provisioned;
-        // does not create. If missing, fail loud rather than silently
-        // creating an index nothing else expects.
-        return Uni.createFrom().item(() -> {
-                    indexKnnProvisioner.requireIndex(request.getIndexName());
-                    return (Void) null;
-                })
-                .flatMap(v -> enqueueDocumentsAsync(List.of(streamReq)))
-                .map(resps -> {
-                    var r = resps.get(0);
-                    return IndexDocumentResponse.newBuilder()
-                            .setSuccess(r.getSuccess())
-                            .setDocumentId(r.getDocumentId())
-                            .setMessage(r.getMessage())
-                            .build();
-                });
+        StreamIndexDocumentsResponse r = enqueueDocuments(List.of(streamReq)).get(0);
+        return IndexDocumentResponse.newBuilder()
+                .setSuccess(r.getSuccess())
+                .setDocumentId(r.getDocumentId())
+                .setMessage(r.getMessage())
+                .build();
     }
 
     @Override
-    public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
+    public List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
-            return Uni.createFrom().item(Collections.emptyList());
+            return Collections.emptyList();
         }
 
         Map<String, List<StreamIndexDocumentsRequest>> byBaseIndex = new HashMap<>();
@@ -111,127 +103,142 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
 
         // STRICT: verify each base index was eagerly provisioned. No
         // create-on-missing.
-        return Uni.createFrom().item(() -> {
-                    for (String indexName : byBaseIndex.keySet()) {
-                        indexKnnProvisioner.requireIndex(indexName);
-                    }
-                    return (Void) null;
-                })
-                .flatMap(v -> enqueueDocumentsAsync(batch));
+        for (String indexName : byBaseIndex.keySet()) {
+            indexKnnProvisioner.requireIndex(indexName);
+        }
+
+        return enqueueDocuments(batch);
     }
 
-    private Uni<List<StreamIndexDocumentsResponse>> enqueueDocumentsAsync(List<StreamIndexDocumentsRequest> batch) {
-        List<Uni<StreamIndexDocumentsResponse>> responseUnis = new ArrayList<>();
+    private List<StreamIndexDocumentsResponse> enqueueDocuments(List<StreamIndexDocumentsRequest> batch) {
+        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(batch.size());
 
         for (var req : batch) {
             final String requestId = req.getRequestId();
             final String baseIndex = req.getIndexName();
 
             if (!req.hasDocumentMap()) {
-                 responseUnis.add(Uni.createFrom().item(StreamIndexDocumentsResponse.newBuilder()
+                responses.add(StreamIndexDocumentsResponse.newBuilder()
                         .setRequestId(requestId)
                         .setSuccess(false)
                         .setMessage("Protocol error: Missing document_map for SEPARATE_INDICES strategy")
-                        .build()));
-                 continue;
+                        .build());
+                continue;
             }
 
             final OpenSearchDocumentMap docMap = req.getDocumentMap();
             final String docId = docMap.getOriginalDocId();
 
-            Uni<StreamIndexDocumentsResponse> baseUni = enqueueBaseDoc(baseIndex, docId, docMap, requestId);
-            
-            List<Uni<Boolean>> chunkUnis = new ArrayList<>();
+            StreamIndexDocumentsResponse baseResp = enqueueBaseDoc(baseIndex, docId, docMap, requestId);
+
+            boolean allChunksOk = true;
             if (req.getChunkDocumentsCount() > 0) {
                 Map<String, List<VsChunkEntry>> groupedChunks = groupChunksByVsIndex(baseIndex, req.getChunkDocumentsList());
                 for (var entry : groupedChunks.entrySet()) {
-                    chunkUnis.add(enqueueChunkGroup(entry.getKey(), entry.getValue()));
+                    if (!enqueueChunkGroup(entry.getKey(), entry.getValue())) {
+                        allChunksOk = false;
+                    }
                 }
             }
 
-            if (chunkUnis.isEmpty()) {
-                responseUnis.add(baseUni);
-            } else {
-                // Return success only if both base and all chunk groups flush successfully.
-                responseUnis.add(Uni.combine().all().unis(chunkUnis).with(results -> {
-                    return results.stream().allMatch(r -> (Boolean) r);
-                }).flatMap(allChunksOk -> baseUni.map(resp -> {
-                    if (!allChunksOk) {
-                        return StreamIndexDocumentsResponse.newBuilder(resp)
-                                .setSuccess(false)
-                                .setMessage(resp.getMessage() + " (some chunks failed indexing)")
-                                .build();
-                    }
-                    return resp;
-                })));
+            if (!allChunksOk) {
+                baseResp = StreamIndexDocumentsResponse.newBuilder(baseResp)
+                        .setSuccess(false)
+                        .setMessage(baseResp.getMessage() + " (some chunks failed indexing)")
+                        .build();
             }
+            responses.add(baseResp);
         }
-
-        return Uni.join().all(responseUnis).andCollectFailures();
+        return responses;
     }
 
-    private Uni<StreamIndexDocumentsResponse> enqueueBaseDoc(String indexName, String docId, OpenSearchDocumentMap docMap, String requestId) {
+    private StreamIndexDocumentsResponse enqueueBaseDoc(
+            String indexName, String docId, OpenSearchDocumentMap docMap, String requestId) {
         try {
             String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(docMap);
             @SuppressWarnings("unchecked")
             Map<String, Object> map = objectMapper.readValue(jsonDoc, Map.class);
             sanitizePunctuationCounts(map);
-            
-            return Uni.createFrom().completionStage(bulkQueueSet.submitWithFuture(indexName, docId, map, null))
-                    .map(result -> StreamIndexDocumentsResponse.newBuilder()
-                            .setRequestId(requestId)
-                            .setDocumentId(docId)
-                            .setSuccess(result.success())
-                            .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail())
-                            .build())
-                    .onFailure().recoverWithItem(t -> StreamIndexDocumentsResponse.newBuilder()
-                            .setRequestId(requestId)
-                            .setDocumentId(docId)
-                            .setSuccess(false)
-                            .setMessage("Base doc queue failure: " + t.getMessage())
-                            .build());
+            try {
+                var result = awaitBulk(bulkQueueSet.submitWithFuture(indexName, docId, map, null));
+                return StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(requestId)
+                        .setDocumentId(docId)
+                        .setSuccess(result.success())
+                        .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail())
+                        .build();
+            } catch (RuntimeException t) {
+                return StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(requestId)
+                        .setDocumentId(docId)
+                        .setSuccess(false)
+                        .setMessage("Base doc queue failure: " + t.getMessage())
+                        .build();
+            }
         } catch (IOException e) {
-            return Uni.createFrom().item(StreamIndexDocumentsResponse.newBuilder()
+            return StreamIndexDocumentsResponse.newBuilder()
                     .setRequestId(requestId)
                     .setDocumentId(docId)
                     .setSuccess(false)
                     .setMessage("Conversion error: " + e.getMessage())
-                    .build());
+                    .build();
         }
     }
 
-    private Uni<Boolean> enqueueChunkGroup(String vsIndexName, List<VsChunkEntry> entries) {
+    private boolean enqueueChunkGroup(String vsIndexName, List<VsChunkEntry> entries) {
         VsChunkEntry first = entries.get(0);
         int dimension = first.chunk().getEmbeddingsMap().get(first.embeddingModelId()).getValuesCount();
 
         // STRICT: verify the per-recipe side index + knn field were eagerly
         // provisioned by the bind-time path. No create-on-missing here.
-        return Uni.createFrom().item(() -> {
-                    indexKnnProvisioner.requireKnnField(vsIndexName, "vector", dimension);
-                    return (Void) null;
-                })
-                .flatMap(v -> {
-                    List<Uni<Boolean>> chunkResults = new ArrayList<>(entries.size());
-                    for (VsChunkEntry entry : entries) {
-                        try {
-                            Map<String, Object> docMap = serializeChunkForModel(entry.chunk(), entry.embeddingModelId());
-                            String docId = generateChunkDocId(entry.chunk(), entry.embeddingModelId());
-                            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future =
-                                    bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null);
-                            chunkResults.add(Uni.createFrom().completionStage(future)
-                                    .map(ai.pipestream.schemamanager.bulk.BulkItemResult::success)
-                                    .onFailure().recoverWithItem(false));
-                        } catch (Exception e) {
-                            LOG.errorf(e, "Failed to enqueue chunk %s", entry.chunk().getDocId());
-                            chunkResults.add(Uni.createFrom().item(false));
-                        }
-                    }
-                    if (chunkResults.isEmpty()) {
-                        return Uni.createFrom().item(true);
-                    }
-                    return Uni.combine().all().unis(chunkResults)
-                            .with(results -> results.stream().allMatch(r -> (Boolean) r));
-                });
+        indexKnnProvisioner.requireKnnField(vsIndexName, "vector", dimension);
+
+        List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> futures = new ArrayList<>(entries.size());
+        for (VsChunkEntry entry : entries) {
+            try {
+                Map<String, Object> docMap = serializeChunkForModel(entry.chunk(), entry.embeddingModelId());
+                String docId = generateChunkDocId(entry.chunk(), entry.embeddingModelId());
+                futures.add(bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null));
+            } catch (Exception e) {
+                LOG.errorf(e, "Failed to enqueue chunk %s", entry.chunk().getDocId());
+                CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> failed = new CompletableFuture<>();
+                failed.completeExceptionally(e);
+                futures.add(failed);
+            }
+        }
+        if (futures.isEmpty()) {
+            return true;
+        }
+        boolean allOk = true;
+        for (CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> f : futures) {
+            try {
+                if (!f.get().success()) {
+                    allOk = false;
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                allOk = false;
+            } catch (ExecutionException ee) {
+                LOG.warnf(ee.getCause(), "Bulk submit failed for %s", vsIndexName);
+                allOk = false;
+            }
+        }
+        return allOk;
+    }
+
+    private static ai.pipestream.schemamanager.bulk.BulkItemResult awaitBulk(
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted awaiting bulk submission", ie);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            throw cause instanceof RuntimeException re
+                    ? re
+                    : new RuntimeException("Bulk submit failed", cause);
+        }
     }
 
     Map<String, List<VsChunkEntry>> groupChunksByVsIndex(String baseIndex, List<OpenSearchChunkDocument> chunkDocs) {

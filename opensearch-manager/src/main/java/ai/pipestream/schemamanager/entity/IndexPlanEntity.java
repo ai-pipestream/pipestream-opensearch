@@ -1,13 +1,11 @@
 package ai.pipestream.schemamanager.entity;
 
-import io.quarkus.hibernate.reactive.panache.PanacheEntityBase;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.hibernate.orm.panache.PanacheEntityBase;
 import jakarta.persistence.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.LocalDateTime;
-import java.util.List;
 
 /**
  * Governance row for one physical OpenSearch index. Bundles the indexing
@@ -113,48 +111,4 @@ public class IndexPlanEntity extends PanacheEntityBase {
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     public LocalDateTime updatedAt;
-
-    // --- Static finders ---
-
-    /**
-     * Finds a plan by id.
-     *
-     * @param id plan id
-     * @return entity or {@code null}
-     */
-    public static Uni<IndexPlanEntity> findById(String id) {
-        return find("id", id).firstResult();
-    }
-
-    /**
-     * Finds a plan by unique name.
-     *
-     * @param name plan name
-     * @return entity or {@code null}
-     */
-    public static Uni<IndexPlanEntity> findByName(String name) {
-        return find("name", name).firstResult();
-    }
-
-    /**
-     * Lists plans newest-first, paginated.
-     *
-     * @param page     zero-based page index
-     * @param pageSize page size
-     * @return page of plans
-     */
-    public static Uni<List<IndexPlanEntity>> listOrderedByCreatedDesc(int page, int pageSize) {
-        return find("order by createdAt desc")
-                .page(io.quarkus.panache.common.Page.of(page, pageSize))
-                .list();
-    }
-
-    /**
-     * Counts all plans (for paginated list responses).
-     *
-     * @return total count
-     */
-    public static Uni<Long> countAll() {
-        return count();
-    }
 }

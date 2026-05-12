@@ -19,18 +19,16 @@ import ai.pipestream.schemamanager.entity.IndexPlanEntity;
 import ai.pipestream.schemamanager.entity.IndexPlanVectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.indexing.IndexKnnProvisioner;
+import ai.pipestream.schemamanager.repository.IndexPlanRepository;
+import ai.pipestream.schemamanager.repository.IndexPlanVectorSetRepository;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import ai.pipestream.schemamanager.validation.PlanProducibilityValidator;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
 import com.google.protobuf.Timestamp;
 import io.grpc.Status;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.hibernate.reactive.panache.common.WithSession;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
-import io.vertx.core.Context;
-import io.vertx.core.Vertx;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
 import org.jboss.logging.Logger;
 import org.opensearch.client.opensearch.OpenSearchClient;
 
@@ -55,14 +53,14 @@ import java.util.UUID;
  * FAILED (with {@code last_error}) on any failure. FAILED plans are recovered
  * by calling UpdateIndexPlan — provisioning handlers are idempotent.
  *
- * <p>Threading model follows {@link VectorSetServiceEngine#bindVectorSetToIndex}:
+ * <p>Threading model:
  * <ol>
- *   <li>Phase 1 — {@code Panache.withTransaction}: validate + persist DB rows;
+ *   <li>Phase 1 — {@code @Transactional}: validate + persist DB rows;
  *       capture entity scalars so Phase 2 doesn't need a Hibernate session.</li>
- *   <li>Phase 2 — outside any session: run {@link VectorSetProvisioner} per VS.
- *       May hop to a worker thread inside the provisioner.</li>
- *   <li>Phase 3 — {@code emitOn(vertxCtx)} + {@code Panache.withTransaction}:
- *       flip status to READY or FAILED, persist.</li>
+ *   <li>Phase 2 — outside the transaction: run {@link VectorSetProvisioner}
+ *       per VS.</li>
+ *   <li>Phase 3 — {@code @Transactional}: flip status to READY or FAILED,
+ *       persist.</li>
  * </ol>
  */
 @ApplicationScoped
@@ -85,6 +83,15 @@ public class IndexPlanServiceEngine {
     @Inject
     PlanProducibilityValidator planProducibilityValidator;
 
+    @Inject
+    IndexPlanRepository planRepo;
+
+    @Inject
+    IndexPlanVectorSetRepository membershipRepo;
+
+    @Inject
+    VectorSetRepository vectorSetRepo;
+
     /** CDI constructor. */
     public IndexPlanServiceEngine() {
     }
@@ -102,42 +109,34 @@ public class IndexPlanServiceEngine {
      * @param req create request
      * @return the created plan, status=READY or FAILED
      */
-    public Uni<CreateIndexPlanResponse> createPlan(CreateIndexPlanRequest req) {
+    public CreateIndexPlanResponse createPlan(CreateIndexPlanRequest req) {
         if (req.getName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("name is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("name is required").asRuntimeException();
         }
         if (req.getIndexName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("index_name is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("index_name is required").asRuntimeException();
         }
+        PlanWithScalars pws = persistNewPlan(req);
+        String planId = provisionAndFlip(pws);
+        IndexPlanEntity plan = planRepo.findById(planId);
+        List<String> vsIds = loadMembership(planId);
+        return CreateIndexPlanResponse.newBuilder()
+                .setPlan(toProto(plan, vsIds))
+                .build();
+    }
 
-        final Context vertxCtx = Vertx.currentContext();
-
-        // Phase 1: name uniqueness + VS validation + persist PENDING plan + membership
-        Uni<PlanWithScalars> phase1 = Panache.withTransaction(() ->
-                IndexPlanEntity.findByName(req.getName()).chain(existing -> {
-                    if (existing != null) {
-                        return Uni.createFrom().<PlanWithScalars>failure(Status.ALREADY_EXISTS
-                                .withDescription("IndexPlan with name '" + req.getName()
-                                        + "' already exists")
-                                .asRuntimeException());
-                    }
-                    return resolveVsScalars(req.getVectorSetIdsList()).chain(scalars -> {
-                        IndexPlanEntity plan = buildEntity(req);
-                        return plan.<IndexPlanEntity>persist()
-                                .chain(saved -> persistMembership(saved.id, req.getVectorSetIdsList())
-                                        .map(v -> new PlanWithScalars(saved, scalars)));
-                    });
-                }));
-
-        return phase1.chain(pws -> provisionAndFlip(pws, vertxCtx)
-                .chain(planId -> Panache.withSession(() ->
-                        IndexPlanEntity.findById(planId)
-                                .chain(plan -> loadMembership(planId)
-                                        .map(vsIds -> CreateIndexPlanResponse.newBuilder()
-                                                .setPlan(toProto(plan, vsIds))
-                                                .build())))));
+    @Transactional
+    protected PlanWithScalars persistNewPlan(CreateIndexPlanRequest req) {
+        if (planRepo.findByName(req.getName()) != null) {
+            throw Status.ALREADY_EXISTS
+                    .withDescription("IndexPlan with name '" + req.getName() + "' already exists")
+                    .asRuntimeException();
+        }
+        List<VsScalars> scalars = resolveVsScalars(req.getVectorSetIdsList());
+        IndexPlanEntity plan = buildEntity(req);
+        planRepo.persist(plan);
+        persistMembership(plan.id, req.getVectorSetIdsList());
+        return new PlanWithScalars(plan, scalars);
     }
 
     // =========================================================================
@@ -151,17 +150,15 @@ public class IndexPlanServiceEngine {
      * @param id plan id
      * @return response, or null if not found
      */
-    @WithSession
-    public Uni<GetIndexPlanResponse> getPlan(String id) {
-        return IndexPlanEntity.findById(id).chain(plan -> {
-            if (plan == null) {
-                return Uni.createFrom().item((GetIndexPlanResponse) null);
-            }
-            return loadMembership(id)
-                    .map(vsIds -> GetIndexPlanResponse.newBuilder()
-                            .setPlan(toProto(plan, vsIds))
-                            .build());
-        });
+    public GetIndexPlanResponse getPlan(String id) {
+        IndexPlanEntity plan = planRepo.findById(id);
+        if (plan == null) {
+            return null;
+        }
+        List<String> vsIds = loadMembership(id);
+        return GetIndexPlanResponse.newBuilder()
+                .setPlan(toProto(plan, vsIds))
+                .build();
     }
 
     // =========================================================================
@@ -176,51 +173,45 @@ public class IndexPlanServiceEngine {
      * @param req update request
      * @return updated plan, status=READY or FAILED
      */
-    public Uni<UpdateIndexPlanResponse> updatePlan(UpdateIndexPlanRequest req) {
+    public UpdateIndexPlanResponse updatePlan(UpdateIndexPlanRequest req) {
         if (req.getId().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("id is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("id is required").asRuntimeException();
+        }
+        PlanWithScalars pws = applyUpdate(req);
+        String planId = provisionAndFlip(pws);
+        IndexPlanEntity plan = planRepo.findById(planId);
+        List<String> vsIds = loadMembership(planId);
+        return UpdateIndexPlanResponse.newBuilder()
+                .setPlan(toProto(plan, vsIds))
+                .build();
+    }
+
+    @Transactional
+    protected PlanWithScalars applyUpdate(UpdateIndexPlanRequest req) {
+        IndexPlanEntity plan = planRepo.findById(req.getId());
+        if (plan == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("IndexPlan not found: " + req.getId())
+                    .asRuntimeException();
+        }
+        applyPartialUpdates(plan, req);
+        plan.status = IndexPlanEntity.STATUS_PENDING;
+        plan.lastError = null;
+
+        List<String> effectiveVsIds;
+        if (req.getReplaceVectorSetIds()) {
+            List<String> newIds = req.getVectorSetIdsList();
+            membershipRepo.deleteByPlanId(plan.id);
+            resolveVsScalars(newIds); // validate that ids exist
+            persistMembership(plan.id, newIds);
+            effectiveVsIds = newIds;
+        } else {
+            effectiveVsIds = loadMembership(plan.id);
         }
 
-        final Context vertxCtx = Vertx.currentContext();
-
-        // Phase 1: apply partial updates, replace membership if requested, set PENDING
-        Uni<PlanWithScalars> phase1 = Panache.withTransaction(() ->
-                IndexPlanEntity.findById(req.getId()).chain(plan -> {
-                    if (plan == null) {
-                        return Uni.createFrom().<PlanWithScalars>failure(Status.NOT_FOUND
-                                .withDescription("IndexPlan not found: " + req.getId())
-                                .asRuntimeException());
-                    }
-                    applyPartialUpdates(plan, req);
-                    plan.status = IndexPlanEntity.STATUS_PENDING;
-                    plan.lastError = null;
-
-                    // Resolve which VS IDs govern provisioning after this update
-                    Uni<List<String>> effectiveVsIds;
-                    if (req.getReplaceVectorSetIds()) {
-                        List<String> newIds = req.getVectorSetIdsList();
-                        effectiveVsIds = IndexPlanVectorSetEntity.deleteByPlanId(plan.id)
-                                .chain(deleted -> resolveVsScalars(newIds) // validate new ids exist
-                                        .chain(ignored -> persistMembership(plan.id, newIds)
-                                                .map(v -> newIds)));
-                    } else {
-                        effectiveVsIds = loadMembership(plan.id);
-                    }
-
-                    return plan.<IndexPlanEntity>persist()
-                            .chain(saved -> effectiveVsIds
-                                    .chain(vsIds -> resolveVsScalars(vsIds)
-                                            .map(scalars -> new PlanWithScalars(saved, scalars))));
-                }));
-
-        return phase1.chain(pws -> provisionAndFlip(pws, vertxCtx)
-                .chain(planId -> Panache.withSession(() ->
-                        IndexPlanEntity.findById(planId)
-                                .chain(plan -> loadMembership(planId)
-                                        .map(vsIds -> UpdateIndexPlanResponse.newBuilder()
-                                                .setPlan(toProto(plan, vsIds))
-                                                .build())))));
+        planRepo.persist(plan);
+        List<VsScalars> scalars = resolveVsScalars(effectiveVsIds);
+        return new PlanWithScalars(plan, scalars);
     }
 
     // =========================================================================
@@ -231,55 +222,40 @@ public class IndexPlanServiceEngine {
      * Deletes a plan. When {@code deleteIndices=true}, also drops the OpenSearch
      * index(es) the plan governs. The DB delete cascades to membership rows via FK.
      *
-     * <p>Sink-config reference check is deferred to task #2; this implementation
-     * deletes without that guard.
+     * <p>Sink-config reference check is deferred to a follow-up task; this
+     * implementation deletes without that guard.
      *
      * @param id            plan id
      * @param deleteIndices whether to also drop OS index(es)
      * @return deletion outcome
      */
-    public Uni<DeleteIndexPlanResponse> deletePlan(String id, boolean deleteIndices) {
+    public DeleteIndexPlanResponse deletePlan(String id, boolean deleteIndices) {
         if (id.isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("id is required").asRuntimeException());
+            throw Status.INVALID_ARGUMENT.withDescription("id is required").asRuntimeException();
         }
+        IndexPlanEntity plan = planRepo.findById(id);
+        if (plan == null) {
+            return DeleteIndexPlanResponse.newBuilder().setDeleted(false).build();
+        }
+        if (!deleteIndices) {
+            deletePlanRow(id);
+            return DeleteIndexPlanResponse.newBuilder().setDeleted(true).build();
+        }
+        String indexName = plan.indexName;
+        String strategyName = plan.indexingStrategy;
+        List<String> vsIds = loadMembership(id);
+        List<VsScalars> scalars = resolveVsScalars(vsIds);
+        dropOsIndices(indexName, strategyName, scalars);
+        deletePlanRow(id);
+        return DeleteIndexPlanResponse.newBuilder().setDeleted(true).build();
+    }
 
-        final Context vertxCtx = Vertx.currentContext();
-
-        return Panache.withSession(() ->
-                IndexPlanEntity.findById(id).chain(plan -> {
-                    if (plan == null) {
-                        return Uni.createFrom().item(
-                                DeleteIndexPlanResponse.newBuilder().setDeleted(false).build());
-                    }
-                    if (!deleteIndices) {
-                        // Just delete the row; cascade handles membership
-                        return Panache.withTransaction(() ->
-                                IndexPlanEntity.findById(id)
-                                        .chain(p -> p.delete()))
-                                .map(v -> DeleteIndexPlanResponse.newBuilder().setDeleted(true).build());
-                    }
-                    // Capture what we need for OS drop before closing session
-                    final String indexName = plan.indexName;
-                    final String strategyName = plan.indexingStrategy;
-                    return loadMembership(id).chain(vsIds ->
-                            resolveVsScalars(vsIds).chain(scalars -> {
-                                // Phase 2: OS drop on worker thread
-                                Uni<Void> dropUni = Uni.createFrom().voidItem()
-                                        .chain(v -> dropOsIndices(indexName, strategyName, scalars));
-                                // Hop back to event loop before Phase 3 Panache call
-                                Uni<Void> afterDrop = (vertxCtx != null)
-                                        ? dropUni.emitOn(cmd -> vertxCtx.runOnContext(v -> cmd.run()))
-                                        : dropUni;
-                                // Phase 3: DB delete
-                                return afterDrop.chain(v ->
-                                        Panache.withTransaction(() ->
-                                                IndexPlanEntity.findById(id)
-                                                        .chain(p -> p.delete())))
-                                        .map(v -> DeleteIndexPlanResponse.newBuilder()
-                                                .setDeleted(true).build());
-                            }));
-                }));
+    @Transactional
+    protected void deletePlanRow(String id) {
+        IndexPlanEntity p = planRepo.findById(id);
+        if (p != null) {
+            planRepo.delete(p);
+        }
     }
 
     // =========================================================================
@@ -293,33 +269,21 @@ public class IndexPlanServiceEngine {
      * @param pageSize entries per page (capped at 100, defaulted to 20)
      * @return paginated plan list with total count
      */
-    @WithSession
-    public Uni<ListIndexPlansResponse> listPlans(int page, int pageSize) {
+    public ListIndexPlansResponse listPlans(int page, int pageSize) {
         int effectiveSize = pageSize > 0 ? Math.min(pageSize, 100) : 20;
         int effectivePage = Math.max(0, page);
-        return IndexPlanEntity.countAll().chain(total ->
-                IndexPlanEntity.listOrderedByCreatedDesc(effectivePage, effectiveSize)
-                        .chain(plans -> {
-                            Uni<List<IndexPlan>> hydrated = Uni.createFrom().item(new ArrayList<>());
-                            for (IndexPlanEntity pe : plans) {
-                                final IndexPlanEntity planEntity = pe;
-                                hydrated = hydrated.chain(acc ->
-                                        loadMembership(planEntity.id).map(vsIds -> {
-                                            acc.add(toProto(planEntity, vsIds));
-                                            return acc;
-                                        }));
-                            }
-                            final long totalCount = total;
-                            return hydrated.map(protos ->
-                                    ListIndexPlansResponse.newBuilder()
-                                            .addAllPlans(protos)
-                                            .setTotal((int) totalCount)
-                                            .build());
-                        }));
+        long total = planRepo.countAll();
+        List<IndexPlanEntity> plans = planRepo.listOrderedByCreatedDesc(effectivePage, effectiveSize);
+        ListIndexPlansResponse.Builder b = ListIndexPlansResponse.newBuilder()
+                .setTotal((int) total);
+        for (IndexPlanEntity pe : plans) {
+            b.addPlans(toProto(pe, loadMembership(pe.id)));
+        }
+        return b.build();
     }
 
     // =========================================================================
-    // validateProducibility — graph-walk implementation
+    // validateProducibility
     // =========================================================================
 
     /**
@@ -329,14 +293,10 @@ public class IndexPlanServiceEngine {
      * each sink, expands {@code plan_ids → vector_set_ids}, and reports any
      * VS not produced upstream as a clearly-pathed error.
      *
-     * <p>The validator opens its own Panache session — callers do not need
-     * to wrap this method in {@code @WithSession}.
-     *
      * @param req validation request (graph_proto + optional cluster_id)
      * @return response with is_valid + errors + warnings
      */
-    public Uni<ValidatePlanProducibilityResponse> validateProducibility(
-            ValidatePlanProducibilityRequest req) {
+    public ValidatePlanProducibilityResponse validateProducibility(ValidatePlanProducibilityRequest req) {
         return planProducibilityValidator.validate(req);
     }
 
@@ -364,7 +324,6 @@ public class IndexPlanServiceEngine {
             b.setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED);
         }
 
-        // Only set vector_set_ids when non-empty (no empty arrays in proto)
         if (vsIds != null && !vsIds.isEmpty()) {
             b.addAllVectorSetIds(vsIds);
         }
@@ -409,147 +368,118 @@ public class IndexPlanServiceEngine {
     // =========================================================================
 
     /**
-     * Runs provisioner for each VS in pws sequentially, then flips the plan
-     * status to READY (all success) or FAILED (first failure). Returns the plan id
-     * so callers can reload the entity in a new session.
+     * Runs provisioner for each VS sequentially, then flips plan status to
+     * READY (all success) or FAILED (first failure). Returns plan id so the
+     * caller can reload the entity.
      */
-    private Uni<String> provisionAndFlip(PlanWithScalars pws, Context vertxCtx) {
-        Uni<String> provisionChain = Uni.createFrom().item((String) null); // null = no error yet
-        for (VsScalars vs : pws.scalars) {
-            final VsScalars vsScalars = vs;
-            final String indexName = pws.plan.indexName;
-            final IndexingStrategy strategy = safeParseStrategy(pws.plan.indexingStrategy);
-            provisionChain = provisionChain.chain(prevError -> {
-                if (prevError != null) {
-                    // Short-circuit: already failed, don't provision remaining VSes
-                    return Uni.createFrom().item(prevError);
+    private String provisionAndFlip(PlanWithScalars pws) {
+        String errorMsg = null;
+        String indexName = pws.plan.indexName;
+        IndexingStrategy strategy = safeParseStrategy(pws.plan.indexingStrategy);
+
+        if (pws.scalars.isEmpty()) {
+            // No VSes — still pre-create the base OS index. The lazy-create
+            // pattern (relying on OS auto-create-on-write) is banned.
+            try {
+                indexKnnProvisioner.ensureIndex(indexName);
+            } catch (Throwable err) {
+                LOG.warnf("IndexPlan %s base-index provisioning failed: %s",
+                        pws.plan.id, err.getMessage());
+                errorMsg = err.getMessage() != null
+                        ? err.getMessage()
+                        : err.getClass().getSimpleName();
+            }
+        } else {
+            for (VsScalars vs : pws.scalars) {
+                try {
+                    vectorSetProvisioner.ensureFieldsForVectorSet(
+                                    vs.vsId,
+                                    vs.chunkerConfigId,
+                                    vs.embeddingModelId,
+                                    vs.vectorDimensions,
+                                    indexName,
+                                    strategy)
+                            ;
+                } catch (Throwable err) {
+                    LOG.warnf("IndexPlan %s provisioning failed for vs=%s: %s",
+                            pws.plan.id, vs.vsId, err.getMessage());
+                    errorMsg = err.getMessage() != null
+                            ? err.getMessage()
+                            : err.getClass().getSimpleName();
+                    break;
                 }
-                return vectorSetProvisioner.ensureFieldsForVectorSet(
-                                vsScalars.vsId,
-                                vsScalars.chunkerConfigId,
-                                vsScalars.embeddingModelId,
-                                vsScalars.vectorDimensions,
-                                indexName,
-                                strategy)
-                        .map(v -> (String) null)
-                        .onFailure().recoverWithItem(err -> {
-                            LOG.warnf("IndexPlan %s provisioning failed for vs=%s: %s",
-                                    pws.plan.id, vsScalars.vsId, err.getMessage());
-                            return err.getMessage() != null
-                                    ? err.getMessage()
-                                    : err.getClass().getSimpleName();
-                        });
-            });
+            }
         }
+        flipStatus(pws.plan.id, errorMsg);
+        return pws.plan.id;
+    }
 
-        // When there are no VSes (chunker → sink shape with no embeddings),
-        // still pre-create the base OS index. Otherwise the plan would persist
-        // READY but the first sink write would rely on OS auto-create-on-write,
-        // which is the lazy-create pattern explicitly banned by the design.
-        Uni<String> finalProvision = pws.scalars.isEmpty()
-                ? indexKnnProvisioner.ensureIndex(pws.plan.indexName)
-                        .map(v -> (String) null)
-                        .onFailure().recoverWithItem(err -> {
-                            LOG.warnf("IndexPlan %s base-index provisioning failed: %s",
-                                    pws.plan.id, err.getMessage());
-                            return err.getMessage() != null
-                                    ? err.getMessage()
-                                    : err.getClass().getSimpleName();
-                        })
-                : provisionChain;
-
-        // Hop back to Vertx context before Phase 3 Panache call
-        Uni<String> withHop = (vertxCtx != null)
-                ? finalProvision.emitOn(cmd -> vertxCtx.runOnContext(v -> cmd.run()))
-                : finalProvision;
-
-        final String planId = pws.plan.id;
-        return withHop.chain(errorMsg ->
-                Panache.withTransaction(() ->
-                        IndexPlanEntity.findById(planId).chain(plan -> {
-                            if (plan == null) {
-                                return Uni.createFrom().<IndexPlanEntity>failure(
-                                        new IllegalStateException(
-                                                "IndexPlan row disappeared during provisioning: " + planId));
-                            }
-                            if (errorMsg == null) {
-                                plan.status = IndexPlanEntity.STATUS_READY;
-                                plan.lastError = null;
-                                LOG.infof("IndexPlan %s provisioned successfully: READY", planId);
-                            } else {
-                                plan.status = IndexPlanEntity.STATUS_FAILED;
-                                plan.lastError = errorMsg;
-                                LOG.warnf("IndexPlan %s provisioning failed: FAILED - %s", planId, errorMsg);
-                            }
-                            return plan.persist();
-                        })))
-                .map(plan -> planId);
+    @Transactional
+    protected void flipStatus(String planId, String errorMsg) {
+        IndexPlanEntity plan = planRepo.findById(planId);
+        if (plan == null) {
+            throw new IllegalStateException("IndexPlan row disappeared during provisioning: " + planId);
+        }
+        if (errorMsg == null) {
+            plan.status = IndexPlanEntity.STATUS_READY;
+            plan.lastError = null;
+            LOG.infof("IndexPlan %s provisioned successfully: READY", planId);
+        } else {
+            plan.status = IndexPlanEntity.STATUS_FAILED;
+            plan.lastError = errorMsg;
+            LOG.warnf("IndexPlan %s provisioning failed: FAILED - %s", planId, errorMsg);
+        }
+        planRepo.persist(plan);
     }
 
     /**
      * Loads VS membership ids for a plan in sort order.
-     * Must be called inside a Panache session.
      */
-    private Uni<List<String>> loadMembership(String planId) {
-        return IndexPlanVectorSetEntity.findByPlanIdOrdered(planId)
-                .map(rows -> {
-                    List<String> ids = new ArrayList<>(rows.size());
-                    for (IndexPlanVectorSetEntity row : rows) {
-                        ids.add(row.vectorSetId);
-                    }
-                    return ids;
-                });
+    private List<String> loadMembership(String planId) {
+        List<IndexPlanVectorSetEntity> rows = membershipRepo.findByPlanIdOrdered(planId);
+        List<String> ids = new ArrayList<>(rows.size());
+        for (IndexPlanVectorSetEntity row : rows) {
+            ids.add(row.vectorSetId);
+        }
+        return ids;
     }
 
     /**
-     * Validates that every ID in {@code vsIds} resolves to an existing
-     * VectorSet entity, and captures the scalars needed by the provisioner
-     * outside a Hibernate session. Fails with INVALID_ARGUMENT on the first
-     * missing ID.
-     *
-     * <p>Must be called inside a Panache session.
+     * Validates every id resolves to an existing VectorSet and captures the
+     * scalars needed by the provisioner outside of an active session. Fails
+     * with INVALID_ARGUMENT on the first missing id.
      */
-    private Uni<List<VsScalars>> resolveVsScalars(List<String> vsIds) {
-        Uni<List<VsScalars>> chain = Uni.createFrom().item(new ArrayList<>());
-        for (String vsId : vsIds) {
-            final String id = vsId;
-            chain = chain.chain(acc ->
-                    VectorSetEntity.<VectorSetEntity>findById(id).chain(vs -> {
-                        if (vs == null) {
-                            return Uni.createFrom().<List<VsScalars>>failure(Status.INVALID_ARGUMENT
-                                    .withDescription("VectorSet not found: " + id)
-                                    .asRuntimeException());
-                        }
-                        // Use symbolic ids - same convention as VectorSetServiceEngine.bindVectorSetToIndex
-                        String chunkerConfigId = vs.chunkerConfig != null
-                                ? vs.chunkerConfig.configId : null;
-                        String embeddingModelId = vs.embeddingModelConfig != null
-                                ? vs.embeddingModelConfig.name : null;
-                        acc.add(new VsScalars(id, chunkerConfigId, embeddingModelId, vs.vectorDimensions));
-                        return Uni.createFrom().item(acc);
-                    }));
+    private List<VsScalars> resolveVsScalars(List<String> vsIds) {
+        List<VsScalars> out = new ArrayList<>(vsIds.size());
+        for (String id : vsIds) {
+            VectorSetEntity vs = vectorSetRepo.findById(id);
+            if (vs == null) {
+                throw Status.INVALID_ARGUMENT
+                        .withDescription("VectorSet not found: " + id)
+                        .asRuntimeException();
+            }
+            // Symbolic ids - same convention as VectorSetServiceEngine.bindVectorSetToIndex.
+            String chunkerConfigId = vs.chunkerConfig != null
+                    ? vs.chunkerConfig.configId : null;
+            String embeddingModelId = vs.embeddingModelConfig != null
+                    ? vs.embeddingModelConfig.name : null;
+            out.add(new VsScalars(id, chunkerConfigId, embeddingModelId, vs.vectorDimensions));
         }
-        return chain;
+        return out;
     }
 
     /**
      * Persists one {@link IndexPlanVectorSetEntity} per VS id, with
      * {@code sortOrder = list index}. Must be called inside a transaction.
      */
-    private Uni<Void> persistMembership(String planId, List<String> vsIds) {
-        Uni<Void> chain = Uni.createFrom().voidItem();
+    private void persistMembership(String planId, List<String> vsIds) {
         for (int i = 0; i < vsIds.size(); i++) {
-            final String vsId = vsIds.get(i);
-            final int order = i;
-            chain = chain.chain(v -> {
-                IndexPlanVectorSetEntity row = new IndexPlanVectorSetEntity();
-                row.planId = planId;
-                row.vectorSetId = vsId;
-                row.sortOrder = order;
-                return row.<IndexPlanVectorSetEntity>persist().replaceWithVoid();
-            });
+            IndexPlanVectorSetEntity row = new IndexPlanVectorSetEntity();
+            row.planId = planId;
+            row.vectorSetId = vsIds.get(i);
+            row.sortOrder = i;
+            membershipRepo.persist(row);
         }
-        return chain;
     }
 
     /**
@@ -566,7 +496,6 @@ public class IndexPlanServiceEngine {
         plan.status = IndexPlanEntity.STATUS_PENDING;
         if (req.hasDescription()) plan.description = req.getDescription();
 
-        // HNSW knobs
         if (req.hasHnsw()) {
             HnswParameters h = req.getHnsw();
             plan.hnswEngine = h.hasEngine() ? h.getEngine() : defaults.hnsw().engine();
@@ -585,7 +514,6 @@ public class IndexPlanServiceEngine {
             plan.hnswEfSearch = defaults.hnsw().efSearch();
         }
 
-        // Index settings
         if (req.hasIndexSettings()) {
             IndexSettings s = req.getIndexSettings();
             plan.numberOfShards = s.hasNumberOfShards() ? s.getNumberOfShards()
@@ -634,41 +562,37 @@ public class IndexPlanServiceEngine {
     /**
      * Drops OpenSearch indices governed by a plan. Derives index names from
      * the strategy + VS scalars. Errors are logged but do not fail the delete.
-     * Runs on worker thread (blocking OS client calls).
      */
-    private Uni<Void> dropOsIndices(String indexName, String strategyName, List<VsScalars> scalars) {
-        return Uni.createFrom().item(() -> {
-            try {
-                IndexingStrategy strategy = safeParseStrategy(strategyName);
-                if (strategy == IndexingStrategy.INDEXING_STRATEGY_NESTED
-                        || strategy == IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
-                    deleteOsIndexQuietly(indexName);
-                } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED) {
-                    Set<String> seen = new HashSet<>();
-                    for (VsScalars vs : scalars) {
-                        if (vs.chunkerConfigId != null) {
-                            String idx = indexName + "--chunk--"
-                                    + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId);
-                            if (seen.add(idx)) deleteOsIndexQuietly(idx);
-                        }
-                    }
-                } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
-                    for (VsScalars vs : scalars) {
-                        if (vs.chunkerConfigId != null && vs.embeddingModelId != null) {
-                            String idx = indexName + "--vs--"
-                                    + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId)
-                                    + "--"
-                                    + IndexKnnProvisioner.sanitizeForIndexName(vs.embeddingModelId);
-                            deleteOsIndexQuietly(idx);
-                        }
+    private void dropOsIndices(String indexName, String strategyName, List<VsScalars> scalars) {
+        try {
+            IndexingStrategy strategy = safeParseStrategy(strategyName);
+            if (strategy == IndexingStrategy.INDEXING_STRATEGY_NESTED
+                    || strategy == IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
+                deleteOsIndexQuietly(indexName);
+            } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED) {
+                Set<String> seen = new HashSet<>();
+                for (VsScalars vs : scalars) {
+                    if (vs.chunkerConfigId != null) {
+                        String idx = indexName + "--chunk--"
+                                + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId);
+                        if (seen.add(idx)) deleteOsIndexQuietly(idx);
                     }
                 }
-            } catch (Exception e) {
-                LOG.warnf("dropOsIndices: unexpected error for plan index=%s strategy=%s: %s",
-                        indexName, strategyName, e.getMessage());
+            } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
+                for (VsScalars vs : scalars) {
+                    if (vs.chunkerConfigId != null && vs.embeddingModelId != null) {
+                        String idx = indexName + "--vs--"
+                                + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId)
+                                + "--"
+                                + IndexKnnProvisioner.sanitizeForIndexName(vs.embeddingModelId);
+                        deleteOsIndexQuietly(idx);
+                    }
+                }
             }
-            return (Void) null;
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        } catch (Exception e) {
+            LOG.warnf("dropOsIndices: unexpected error for plan index=%s strategy=%s: %s",
+                    indexName, strategyName, e.getMessage());
+        }
     }
 
     private void deleteOsIndexQuietly(String indexName) {
@@ -711,5 +635,6 @@ public class IndexPlanServiceEngine {
     }
 
     /** Persisted plan entity paired with its resolved VS scalars for provisioning. */
-    private record PlanWithScalars(IndexPlanEntity plan, List<VsScalars> scalars) {}
+    private record PlanWithScalars(IndexPlanEntity plan, List<VsScalars> scalars) {
+    }
 }

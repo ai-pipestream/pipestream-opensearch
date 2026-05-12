@@ -14,10 +14,10 @@ import ai.pipestream.opensearch.v1.CreateIndexPlanRequest;
 import ai.pipestream.opensearch.v1.CreateIndexPlanResponse;
 import ai.pipestream.opensearch.v1.CreateVectorSetRequest;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyIndexPlanServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyVectorSetServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.IndexPlanServiceGrpc;
+import ai.pipestream.opensearch.v1.VectorSetServiceGrpc;
 import ai.pipestream.opensearch.v1.UpdateIndexPlanRequest;
 import ai.pipestream.opensearch.v1.ValidatePlanProducibilityRequest;
 import ai.pipestream.opensearch.v1.ValidatePlanProducibilityResponse;
@@ -50,16 +50,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PlanProducibilityValidatorIT {
 
     @GrpcClient
-    MutinyIndexPlanServiceGrpc.MutinyIndexPlanServiceStub indexPlanClient;
+    IndexPlanServiceGrpc.IndexPlanServiceBlockingStub indexPlanClient;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerService;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingService;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingService;
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetService;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetService;
 
     private static final String CHUNKER = "ppv-it-chunker";
     private static final String CHUNKER_ALT = "ppv-it-chunker-alt";
@@ -95,7 +95,7 @@ class PlanProducibilityValidatorIT {
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .addVectorSetIds(vsGood)
                         .build()
-        ).await().indefinitely();
+        );
         String planId = created.getPlan().getId();
         assertThat(planId)
                 .as("seeded plan must be persisted before validating any graph against it")
@@ -109,7 +109,7 @@ class PlanProducibilityValidatorIT {
                 ValidatePlanProducibilityRequest.newBuilder()
                         .setGraphProto(validGraph.toByteString())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(okResp.getIsValid())
                 .as("graph that produces every VS in the plan must be valid (errors=%s)",
                         okResp.getErrorsList())
@@ -126,14 +126,14 @@ class PlanProducibilityValidatorIT {
                         .addVectorSetIds(vsGood)
                         .addVectorSetIds(vsMissing)
                         .build()
-        ).await().indefinitely();
+        );
 
         // 5. Re-validate the same graph -> is_valid=false with a clear field path.
         ValidatePlanProducibilityResponse badResp = indexPlanClient.validatePlanProducibility(
                 ValidatePlanProducibilityRequest.newBuilder()
                         .setGraphProto(validGraph.toByteString())
                         .build()
-        ).await().indefinitely();
+        );
         assertThat(badResp.getIsValid())
                 .as("graph that doesn't produce vs %s must be invalid after plan adds it",
                         vsMissing)
@@ -162,7 +162,7 @@ class PlanProducibilityValidatorIT {
                         .setFieldName("vs_field_" + UUID.randomUUID().toString().substring(0, 6))
                         .setSourceField("body")
                         .build()
-        ).await().indefinitely().getVectorSet().getId();
+        ).getVectorSet().getId();
     }
 
     private void createChunker(String configId) {
@@ -172,7 +172,7 @@ class PlanProducibilityValidatorIT {
                             .setId(configId).setName(configId).setConfigId(configId)
                             .setConfigJson(Struct.newBuilder().build())
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException already) {
             // Idempotent across runs — UNIQUE constraint surfaces here.
         }
@@ -186,7 +186,7 @@ class PlanProducibilityValidatorIT {
                             .setModelIdentifier(modelIdentifier)
                             .setDimensions(DIM)
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException already) {
             // Idempotent.
         }

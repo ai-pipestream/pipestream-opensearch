@@ -8,7 +8,6 @@ import ai.pipestream.schemamanager.indexing.IndexingStrategyHandler;
 import ai.pipestream.schemamanager.indexing.NestedIndexingStrategy;
 import ai.pipestream.schemamanager.indexing.SeparateIndicesIndexingStrategy;
 import io.quarkus.arc.lookup.LookupIfProperty;
-import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -76,8 +75,8 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
      * field, dim) triple — which is O(1) on a warm cache.
      */
     @Override
-    public Uni<Void> ensureFieldsForDirectives(VectorSetDirectives directives, String indexName) {
-        return Uni.createFrom().voidItem();
+    public void ensureFieldsForDirectives(VectorSetDirectives directives, String indexName) {
+        // Doc-time directive path is intentionally still a no-op.
     }
 
     /**
@@ -99,7 +98,7 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
      * aborts before any binding row is inserted. No partial DB state.
      */
     @Override
-    public Uni<Void> ensureFieldsForVectorSet(
+    public void ensureFieldsForVectorSet(
             String vectorSetId,
             String chunkerConfigId,
             String embeddingModelId,
@@ -107,20 +106,20 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
             String indexName,
             IndexingStrategy strategy) {
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().failure(new IllegalArgumentException(
-                    "ensureFieldsForVectorSet: indexName must be non-blank"));
+            throw new IllegalArgumentException(
+                    "ensureFieldsForVectorSet: indexName must be non-blank");
         }
         if (chunkerConfigId == null || chunkerConfigId.isBlank()) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "VectorSet " + vectorSetId + " has no chunker_config_id — cannot derive side-index name"));
+            throw new IllegalStateException(
+                    "VectorSet " + vectorSetId + " has no chunker_config_id — cannot derive side-index name");
         }
         if (embeddingModelId == null || embeddingModelId.isBlank()) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "VectorSet " + vectorSetId + " has no embedding_model_config_id — cannot derive side-index name"));
+            throw new IllegalStateException(
+                    "VectorSet " + vectorSetId + " has no embedding_model_config_id — cannot derive side-index name");
         }
         if (vectorDimensions <= 0) {
-            return Uni.createFrom().failure(new IllegalStateException(
-                    "VectorSet " + vectorSetId + " has non-positive vector_dimensions=" + vectorDimensions));
+            throw new IllegalStateException(
+                    "VectorSet " + vectorSetId + " has non-positive vector_dimensions=" + vectorDimensions);
         }
 
         // Dispatch to the strategy handler that owns this layout. Each
@@ -145,9 +144,8 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
                 vectorSetId, indexName, strategy.name(), resolvedIndex,
                 handler.resolveFieldName(fieldNameKey), vectorDimensions);
 
-        return indexKnnProvisioner.ensureIndex(indexName)
-                .chain(() -> handler.provisionKnnField(
-                        indexName, chunkerConfigId, fieldNameKey, vectorDimensions));
+        indexKnnProvisioner.ensureIndex(indexName);
+        handler.provisionKnnField(indexName, chunkerConfigId, fieldNameKey, vectorDimensions);
     }
 
     /**

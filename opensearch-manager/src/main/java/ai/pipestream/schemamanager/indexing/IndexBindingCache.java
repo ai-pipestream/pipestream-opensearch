@@ -2,9 +2,9 @@ package ai.pipestream.schemamanager.indexing;
 
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
-import io.quarkus.hibernate.reactive.panache.common.WithSession;
-import io.smallrye.mutiny.Uni;
+import ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * every doc by walking 2-4 sequential Postgres queries inside a transaction
  * AND issuing an idempotent {@code INSERT ... ON CONFLICT} against
  * {@code vector_set_index_binding}. With 32 concurrent docs hitting a 15-slot
- * reactive pool that produced p99 IndexDocument latency &gt; 700 seconds.
+ * pool that produced p99 IndexDocument latency &gt; 700 seconds.
  *
  * <p>The architecture intent — see
  * {@code SemanticConfigServiceEngine.assignToIndex} — is that all bindings and
@@ -67,10 +67,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <h2>Concurrency</h2>
  * <p>Concurrent first-touches for the same index may each perform their own DB
- * load. Do not share a memoized Hibernate Reactive {@code @WithSession} Uni
- * across subscribers: that can reuse one session concurrently and corrupt the
- * reactive result processing state. After the first load resolves, the result
- * moves to {@link #cache} and steady state is memory-only.
+ * load. After the first load resolves, the result moves to {@link #cache}
+ * and steady state is memory-only.
  */
 @ApplicationScoped
 public class IndexBindingCache {
@@ -87,6 +85,9 @@ public class IndexBindingCache {
     @ConfigProperty(name = "pipestream.opensearch-manager.binding-cache.ttl-seconds", defaultValue = "300")
     long ttlSeconds;
 
+    @Inject
+    VectorSetIndexBindingRepository bindingRepo;
+
     /** CDI; {@link #ttlSeconds} is injected from configuration. */
     public IndexBindingCache() {
     }
@@ -98,8 +99,7 @@ public class IndexBindingCache {
      * @param bySemanticAndGran  ("semantic_config_id" + "|" + "GRANULARITY") → mapping
      * @param byName             {@code VectorSetEntity.name} → mapping
      * @param verifiedOsFields   nested field names whose OS mapping has been
-     *                           confirmed at least once during this entry's
-     *                           lifetime; used to skip Phase 2 GET _mapping calls
+     *                           confirmed at least once during this entry's lifetime
      * @param loadedAtMs         epoch-millis at which this entry was loaded
      */
     public record IndexEntry(
@@ -181,16 +181,15 @@ public class IndexBindingCache {
 
     /**
      * Lookup by canonical {@code vector_set_id}. Loads and caches the index
-     * entry on miss. Returns {@code null} (inside the {@link Uni}) when the
-     * index has no binding for this vector set — caller MUST convert to
-     * {@link IllegalStateException}.
+     * entry on miss. Returns {@code null} when the index has no binding for
+     * this vector set — caller MUST convert to {@link IllegalStateException}.
      *
      * @param indexName   OpenSearch index name
      * @param vectorSetId canonical vector set id
-     * @return mapping inside a {@link Uni}, or {@code null} when unbound
+     * @return mapping, or {@code null} when unbound
      */
-    public Uni<VectorSetMapping> lookupByVectorSetId(String indexName, String vectorSetId) {
-        return getOrLoad(indexName).map(entry -> entry.byVectorSetId.get(vectorSetId));
+    public VectorSetMapping lookupByVectorSetId(String indexName, String vectorSetId) {
+        return getOrLoad(indexName).byVectorSetId.get(vectorSetId);
     }
 
     /**
@@ -200,11 +199,11 @@ public class IndexBindingCache {
      * @param indexName        OpenSearch index name
      * @param semanticConfigId semantic configuration id
      * @param granularity      granularity label (short form)
-     * @return mapping inside a {@link Uni}, or {@code null} when unbound
+     * @return mapping, or {@code null} when unbound
      */
-    public Uni<VectorSetMapping> lookupBySemanticConfig(String indexName, String semanticConfigId, String granularity) {
+    public VectorSetMapping lookupBySemanticConfig(String indexName, String semanticConfigId, String granularity) {
         String key = semanticConfigId + "|" + granularity;
-        return getOrLoad(indexName).map(entry -> entry.bySemanticAndGran.get(key));
+        return getOrLoad(indexName).bySemanticAndGran.get(key);
     }
 
     /**
@@ -214,10 +213,10 @@ public class IndexBindingCache {
      *
      * @param indexName OpenSearch index name
      * @param name      derived semantic vector set name
-     * @return mapping inside a {@link Uni}, or {@code null} when unbound
+     * @return mapping, or {@code null} when unbound
      */
-    public Uni<VectorSetMapping> lookupByName(String indexName, String name) {
-        return getOrLoad(indexName).map(entry -> entry.byName.get(name));
+    public VectorSetMapping lookupByName(String indexName, String name) {
+        return getOrLoad(indexName).byName.get(name);
     }
 
     /**
@@ -227,14 +226,19 @@ public class IndexBindingCache {
      * @param indexName OpenSearch index name
      * @return memoized load of {@link IndexEntry}
      */
-    public Uni<IndexEntry> getOrLoad(String indexName) {
+    public IndexEntry getOrLoad(String indexName) {
         IndexEntry hot = cache.get(indexName);
         if (hot != null && !hot.isExpired(ttlSeconds)) {
-            return Uni.createFrom().item(hot);
+            return hot;
         }
-        return loadFromDb(indexName)
-                .invoke(loaded -> cache.put(indexName, loaded))
-                .onFailure().invoke(err -> LOG.errorf(err, "Failed to load index bindings for '%s'", indexName));
+        try {
+            IndexEntry loaded = loadFromDb(indexName);
+            cache.put(indexName, loaded);
+            return loaded;
+        } catch (RuntimeException err) {
+            LOG.errorf(err, "Failed to load index bindings for '%s'", indexName);
+            throw err;
+        }
     }
 
     /**
@@ -277,39 +281,35 @@ public class IndexBindingCache {
      * @param indexName OpenSearch index name
      * @return immutable snapshot for the index
      */
-    @WithSession
-    protected Uni<IndexEntry> loadFromDb(String indexName) {
-        return VectorSetIndexBindingEntity.<VectorSetIndexBindingEntity>list("indexName", indexName)
-                .map(bindings -> {
-                    Map<String, VectorSetMapping> byVectorSetId = new HashMap<>();
-                    Map<String, VectorSetMapping> bySemanticAndGran = new HashMap<>();
-                    Map<String, VectorSetMapping> byName = new HashMap<>();
-                    for (VectorSetIndexBindingEntity b : bindings) {
-                        VectorSetEntity vs = b.vectorSet;
-                        if (vs == null) {
-                            LOG.warnf("Binding %s for index '%s' has null vectorSet — skipped",
-                                    b.id, indexName);
-                            continue;
-                        }
-                        VectorSetMapping mapping = VectorSetMapping.fromEntity(vs);
-                        byVectorSetId.put(vs.id, mapping);
-                        if (vs.name != null) {
-                            byName.put(vs.name, mapping);
-                        }
-                        if (mapping.semanticConfigId() != null && mapping.granularity() != null) {
-                            bySemanticAndGran.put(
-                                    mapping.semanticConfigId() + "|" + mapping.granularity(),
-                                    mapping);
-                        }
-                    }
-                    LOG.infof("Loaded %d binding(s) for index '%s'", bindings.size(), indexName);
-                    return new IndexEntry(
-                            Map.copyOf(byVectorSetId),
-                            Map.copyOf(bySemanticAndGran),
-                            Map.copyOf(byName),
-                            ConcurrentHashMap.newKeySet(),
-                            System.currentTimeMillis()
-                    );
-                });
+    protected IndexEntry loadFromDb(String indexName) {
+        List<VectorSetIndexBindingEntity> bindings = bindingRepo.list("indexName", indexName);
+        Map<String, VectorSetMapping> byVectorSetId = new HashMap<>();
+        Map<String, VectorSetMapping> bySemanticAndGran = new HashMap<>();
+        Map<String, VectorSetMapping> byName = new HashMap<>();
+        for (VectorSetIndexBindingEntity b : bindings) {
+            VectorSetEntity vs = b.vectorSet;
+            if (vs == null) {
+                LOG.warnf("Binding %s for index '%s' has null vectorSet — skipped", b.id, indexName);
+                continue;
+            }
+            VectorSetMapping mapping = VectorSetMapping.fromEntity(vs);
+            byVectorSetId.put(vs.id, mapping);
+            if (vs.name != null) {
+                byName.put(vs.name, mapping);
+            }
+            if (mapping.semanticConfigId() != null && mapping.granularity() != null) {
+                bySemanticAndGran.put(
+                        mapping.semanticConfigId() + "|" + mapping.granularity(),
+                        mapping);
+            }
+        }
+        LOG.infof("Loaded %d binding(s) for index '%s'", bindings.size(), indexName);
+        return new IndexEntry(
+                Map.copyOf(byVectorSetId),
+                Map.copyOf(bySemanticAndGran),
+                Map.copyOf(byName),
+                ConcurrentHashMap.newKeySet(),
+                System.currentTimeMillis()
+        );
     }
 }

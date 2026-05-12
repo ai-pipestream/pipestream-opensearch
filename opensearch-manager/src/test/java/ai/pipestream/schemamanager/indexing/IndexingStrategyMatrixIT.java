@@ -7,10 +7,10 @@ import ai.pipestream.opensearch.v1.CreateEmbeddingModelConfigRequest;
 import ai.pipestream.opensearch.v1.CreateSemanticConfigRequest;
 import ai.pipestream.opensearch.v1.CreateVectorSetRequest;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinySemanticConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyVectorSetServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.SemanticConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.VectorSetServiceGrpc;
 import io.grpc.StatusRuntimeException;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.junit.QuarkusTest;
@@ -53,16 +53,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class IndexingStrategyMatrixIT {
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerService;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingService;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingService;
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetService;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetService;
 
     @GrpcClient
-    MutinySemanticConfigServiceGrpc.MutinySemanticConfigServiceStub semanticConfigService;
+    SemanticConfigServiceGrpc.SemanticConfigServiceBlockingStub semanticConfigService;
 
     @Inject
     OpenSearchClient openSearchClient;
@@ -206,7 +206,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .build()
-        ).await().indefinitely();
+        );
 
         String idx = base + "--chunk--semantic";
         assertThat(indexExists(idx))
@@ -233,7 +233,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES)
                         .build()
-        ).await().indefinitely();
+        );
 
         String idx = base + "--vs--semantic--" + sanitize(EMBEDDER_X);
         assertThat(indexExists(idx))
@@ -260,7 +260,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(indexExists(base))
                 .as("NESTED keeps the SemanticConfig's vector set on the parent index")
@@ -291,7 +291,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(baseCombined)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .build()
-        ).await().indefinitely();
+        );
 
         semanticConfigService.assignSemanticConfigToIndex(
                 AssignSemanticConfigToIndexRequest.newBuilder()
@@ -299,7 +299,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(baseSeparate)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(indexExists(baseCombined + "--chunk--semantic"))
                 .as("first index uses CHUNK_COMBINED — has --chunk--").isTrue();
@@ -328,7 +328,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .build()
-        ).await().indefinitely();
+        );
 
         var second = semanticConfigService.assignSemanticConfigToIndex(
                 AssignSemanticConfigToIndexRequest.newBuilder()
@@ -336,7 +336,7 @@ class IndexingStrategyMatrixIT {
                         .setBaseIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(first.getBindingsProvisioned())
                 .as("first call provisions the bindings")
@@ -362,7 +362,7 @@ class IndexingStrategyMatrixIT {
                         .setIndexName(base)
                         .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED)
                         .build()
-        ).await().indefinitely())
+        ))
                 .as("missing VectorSet must surface as a clear gRPC error, not a silent skip")
                 .isInstanceOf(StatusRuntimeException.class);
     }
@@ -383,14 +383,14 @@ class IndexingStrategyMatrixIT {
                                 .setFieldName("vs_" + vsName)
                                 .setSourceField("body")
                                 .build()
-                ).await().indefinitely();
+                );
                 vectorSetService.bindVectorSetToIndex(
                         BindVectorSetToIndexRequest.newBuilder()
                                 .setVectorSetId(createResp.getVectorSet().getId())
                                 .setIndexName(baseIndex)
                                 .setIndexingStrategy(strategy)
                                 .build()
-                ).await().indefinitely();
+                );
             }
         }
     }
@@ -414,7 +414,7 @@ class IndexingStrategyMatrixIT {
                         .setComputeCentroids(false)
                         .setSourceCel("document.body")
                         .build()
-        ).await().indefinitely();
+        );
         return configId;
     }
 
@@ -425,7 +425,7 @@ class IndexingStrategyMatrixIT {
                             .setId(configId).setName(configId).setConfigId(configId)
                             .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException already) {
             // Idempotent across runs — UNIQUE constraint surfaces here.
         }
@@ -439,7 +439,7 @@ class IndexingStrategyMatrixIT {
                             .setModelIdentifier(modelIdentifier)
                             .setDimensions(DIMENSIONS)
                             .build()
-            ).await().indefinitely();
+            );
         } catch (StatusRuntimeException already) {
             // Idempotent.
         }

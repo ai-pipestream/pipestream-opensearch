@@ -2,7 +2,6 @@ package ai.pipestream.schemamanager;
 
 import ai.pipestream.opensearch.v1.ResolveVectorSetFromDirectiveRequest;
 import ai.pipestream.opensearch.v1.ResolveVectorSetFromDirectiveResponse;
-import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -26,7 +25,7 @@ public class VectorSetResolver {
      * @param request directive resolution request
      * @return resolution response
      */
-    public Uni<ResolveVectorSetFromDirectiveResponse> resolve(ResolveVectorSetFromDirectiveRequest request) {
+    public ResolveVectorSetFromDirectiveResponse resolve(ResolveVectorSetFromDirectiveRequest request) {
         return engine.resolveVectorSetFromDirective(request);
     }
 }

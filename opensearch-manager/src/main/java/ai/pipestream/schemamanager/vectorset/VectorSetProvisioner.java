@@ -3,7 +3,6 @@ package ai.pipestream.schemamanager.vectorset;
 import ai.pipestream.data.v1.VectorSetDirectives;
 import ai.pipestream.opensearch.v1.IndexingStrategy;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
-import io.smallrye.mutiny.Uni;
 
 /**
  * Ensures the target OpenSearch index has {@code knn_vector} fields matching
@@ -53,7 +52,7 @@ public interface VectorSetProvisioner {
      * @param indexName the OpenSearch index that will receive the doc
      * @return a Uni that completes (void) when the fields are ensured
      */
-    Uni<Void> ensureFieldsForDirectives(VectorSetDirectives directives, String indexName);
+    void ensureFieldsForDirectives(VectorSetDirectives directives, String indexName);
 
     /**
      * Bind-time bind-time provisioning for a single (recipe, index) pair.
@@ -90,7 +89,7 @@ public interface VectorSetProvisioner {
      * @param indexName        base OpenSearch index name the recipe is being bound to
      * @return Uni that completes (void) when provisioning is durable on the cluster
      */
-    Uni<Void> ensureFieldsForVectorSet(
+    void ensureFieldsForVectorSet(
             String vectorSetId,
             String chunkerConfigId,
             String embeddingModelId,

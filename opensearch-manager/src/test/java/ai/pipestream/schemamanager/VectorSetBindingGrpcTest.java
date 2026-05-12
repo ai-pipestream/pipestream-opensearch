@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * <p>Verifies the recipe ↔ index binding lifecycle introduced when
  * {@code CreateVectorSet} was split into a recipe-only operation:
  * <ul>
- *   <li>{@link MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub#bindVectorSetToIndex}</li>
+ *   <li>{@link VectorSetServiceGrpc.VectorSetServiceBlockingStub#bindVectorSetToIndex}</li>
  *   <li>{@code unbindVectorSetFromIndex}</li>
  *   <li>{@code listIndicesForVectorSet}</li>
  *   <li>{@code listVectorSetsForIndex}</li>
@@ -41,13 +41,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class VectorSetBindingGrpcTest {
 
     @GrpcClient
-    MutinyVectorSetServiceGrpc.MutinyVectorSetServiceStub vectorSetClient;
+    VectorSetServiceGrpc.VectorSetServiceBlockingStub vectorSetClient;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerClient;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerClient;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingClient;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingClient;
 
     // --- Helpers ---
 
@@ -64,7 +64,7 @@ class VectorSetBindingGrpcTest {
                         .setConfigId("token-512-50-" + suffix)
                         .setConfigJson(configJson)
                         .build()
-        ).await().indefinitely().getConfig().getId();
+        ).getConfig().getId();
     }
 
     private String createEmbeddingConfig(String suffix, int dimensions) {
@@ -74,7 +74,7 @@ class VectorSetBindingGrpcTest {
                         .setModelIdentifier("test/embed-" + suffix)
                         .setDimensions(dimensions)
                         .build()
-        ).await().indefinitely().getConfig().getId();
+        ).getConfig().getId();
     }
 
     /** Creates a recipe-only VectorSet (no index_name). Returns the new id. */
@@ -90,7 +90,7 @@ class VectorSetBindingGrpcTest {
                         .setSourceField("body")
                         // intentionally NO index_name — we want a pure recipe
                         .build()
-        ).await().indefinitely().getVectorSet().getId();
+        ).getVectorSet().getId();
     }
 
     // --- Recipe-only create (the proto split) ---
@@ -102,7 +102,7 @@ class VectorSetBindingGrpcTest {
 
         var bindings = vectorSetClient.listIndicesForVectorSet(
                 ListIndicesForVectorSetRequest.newBuilder().setVectorSetId(vsId).build()
-        ).await().indefinitely();
+        );
 
         assertThat(bindings.getBindingsList())
                 .as("a CreateVectorSet call without index_name must produce a recipe with zero bindings")
@@ -122,7 +122,7 @@ class VectorSetBindingGrpcTest {
                         .setVectorSetId(vsId)
                         .setIndexName(indexName)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(first.getCreated())
                 .as("first bind for a (vector_set, index) pair must report created=true")
@@ -143,7 +143,7 @@ class VectorSetBindingGrpcTest {
                         .setVectorSetId(vsId)
                         .setIndexName(indexName)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(second.getCreated())
                 .as("re-binding the same (vector_set, index) pair must be idempotent (created=false)")
@@ -163,7 +163,7 @@ class VectorSetBindingGrpcTest {
                                 .setVectorSetId(fakeId)
                                 .setIndexName("any-index")
                                 .build()
-                ).await().indefinitely()
+                )
         )
                 .as("binding to a non-existent vector_set_id must surface as NOT_FOUND")
                 .satisfies(t -> assertThat(rootStatusCode(t))
@@ -177,7 +177,7 @@ class VectorSetBindingGrpcTest {
         assertThatThrownBy(() ->
                 vectorSetClient.bindVectorSetToIndex(
                         BindVectorSetToIndexRequest.newBuilder().setIndexName("idx").build()
-                ).await().indefinitely()
+                )
         )
                 .as("bind with empty vector_set_id must reject as INVALID_ARGUMENT")
                 .satisfies(t -> assertThat(rootStatusCode(t))
@@ -188,7 +188,7 @@ class VectorSetBindingGrpcTest {
         assertThatThrownBy(() ->
                 vectorSetClient.bindVectorSetToIndex(
                         BindVectorSetToIndexRequest.newBuilder().setVectorSetId("vs-x").build()
-                ).await().indefinitely()
+                )
         )
                 .as("bind with empty index_name must reject as INVALID_ARGUMENT")
                 .satisfies(t -> assertThat(rootStatusCode(t))
@@ -207,12 +207,12 @@ class VectorSetBindingGrpcTest {
         vectorSetClient.bindVectorSetToIndex(
                 BindVectorSetToIndexRequest.newBuilder()
                         .setVectorSetId(vsId).setIndexName(indexName).build()
-        ).await().indefinitely();
+        );
 
         var first = vectorSetClient.unbindVectorSetFromIndex(
                 UnbindVectorSetFromIndexRequest.newBuilder()
                         .setVectorSetId(vsId).setIndexName(indexName).build()
-        ).await().indefinitely();
+        );
 
         assertThat(first.getUnbound())
                 .as("unbinding an existing binding must report unbound=true (1 row removed)")
@@ -222,7 +222,7 @@ class VectorSetBindingGrpcTest {
         var second = vectorSetClient.unbindVectorSetFromIndex(
                 UnbindVectorSetFromIndexRequest.newBuilder()
                         .setVectorSetId(vsId).setIndexName(indexName).build()
-        ).await().indefinitely();
+        );
 
         assertThat(second.getUnbound())
                 .as("repeat unbind on an already-removed binding must be a silent no-op (unbound=false), not an error")
@@ -244,13 +244,13 @@ class VectorSetBindingGrpcTest {
             vectorSetClient.bindVectorSetToIndex(
                     BindVectorSetToIndexRequest.newBuilder()
                             .setVectorSetId(vsId).setIndexName(idx).build()
-            ).await().indefinitely();
+            );
         }
 
         var resp = vectorSetClient.listIndicesForVectorSet(
                 ListIndicesForVectorSetRequest.newBuilder()
                         .setVectorSetId(vsId).setPageSize(50).build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getBindingsList())
                 .as("listIndicesForVectorSet must return exactly the %d indices we bound", indices.size())
@@ -275,15 +275,15 @@ class VectorSetBindingGrpcTest {
         String vsB = createRecipe(uid + "-b");
         vectorSetClient.bindVectorSetToIndex(
                 BindVectorSetToIndexRequest.newBuilder().setVectorSetId(vsA).setIndexName(indexName).build()
-        ).await().indefinitely();
+        );
         vectorSetClient.bindVectorSetToIndex(
                 BindVectorSetToIndexRequest.newBuilder().setVectorSetId(vsB).setIndexName(indexName).build()
-        ).await().indefinitely();
+        );
 
         var resp = vectorSetClient.listVectorSetsForIndex(
                 ListVectorSetsForIndexRequest.newBuilder()
                         .setIndexName(indexName).setPageSize(50).build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getEntriesList())
                 .as("listVectorSetsForIndex must return one entry per bound recipe (we bound 2)")
@@ -317,7 +317,7 @@ class VectorSetBindingGrpcTest {
                         .addVectorSetIds(vsA)
                         .addVectorSetIds(vsB)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertThat(resp.getIndexName())
                 .as("response must echo back the index name we asked to create")
@@ -330,7 +330,7 @@ class VectorSetBindingGrpcTest {
         var listed = vectorSetClient.listVectorSetsForIndex(
                 ListVectorSetsForIndexRequest.newBuilder()
                         .setIndexName(indexName).setPageSize(50).build()
-        ).await().indefinitely();
+        );
         assertThat(listed.getEntriesList())
                 .as("read-back via listVectorSetsForIndex must show both bindings persisted")
                 .hasSize(2);
@@ -350,7 +350,7 @@ class VectorSetBindingGrpcTest {
                                 .addVectorSetIds(vsA)        // valid
                                 .addVectorSetIds(fakeVs)     // invalid → whole call must fail
                                 .build()
-                ).await().indefinitely()
+                )
         )
                 .as("createIndexWithVectorSets containing any unknown vector_set_id must fail the whole call as NOT_FOUND")
                 .satisfies(t -> assertThat(rootStatusCode(t))
@@ -361,7 +361,7 @@ class VectorSetBindingGrpcTest {
         var listed = vectorSetClient.listVectorSetsForIndex(
                 ListVectorSetsForIndexRequest.newBuilder()
                         .setIndexName(indexName).setPageSize(50).build()
-        ).await().indefinitely();
+        );
         assertThat(listed.getEntriesList())
                 .as("atomicity: a partial bind of vsA after the second id failed would be a contract violation; bindings must be empty")
                 .isEmpty();
@@ -374,7 +374,7 @@ class VectorSetBindingGrpcTest {
                         CreateIndexWithVectorSetsRequest.newBuilder()
                                 .setIndexName("any-idx")
                                 .build()
-                ).await().indefinitely()
+                )
         )
                 .as("createIndexWithVectorSets with no vector_set_ids must reject as INVALID_ARGUMENT (creating an index with zero recipes is meaningless)")
                 .satisfies(t -> assertThat(rootStatusCode(t))

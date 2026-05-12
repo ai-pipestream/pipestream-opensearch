@@ -5,15 +5,20 @@ import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.IndexEmbeddingBinding;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
-import com.google.protobuf.Struct;
+import ai.pipestream.schemamanager.repository.EmbeddingModelConfigRepository;
+import ai.pipestream.schemamanager.repository.IndexEmbeddingBindingRepository;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
 import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.hibernate.reactive.panache.common.WithSession;
-import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.panache.common.Page;
+import io.smallrye.common.annotation.RunOnVirtualThread;
+import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
+import org.hibernate.exception.ConstraintViolationException;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
@@ -24,20 +29,31 @@ import java.util.UUID;
 
 /**
  * gRPC service for embedding model configuration and index embedding bindings.
+ * Runs on virtual threads with blocking Hibernate ORM (classic) repositories.
  */
 @GrpcService
-public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc.EmbeddingConfigServiceImplBase {
+public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.EmbeddingConfigServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(EmbeddingConfigServiceImpl.class);
     private static final String DEFAULT_RESULT_SET_NAME = "default";
 
     private final SemanticMetadataEventProducer eventProducer;
 
+    @Inject
+    EmbeddingModelConfigRepository modelRepo;
+
+    @Inject
+    IndexEmbeddingBindingRepository bindingRepo;
+
+    @Inject
+    VectorSetRepository vectorSetRepo;
+
     /**
      * Creates the gRPC service with its Kafka side-effect producer.
      *
      * @param eventProducer Kafka metadata event producer for semantic config updates
      */
+    @Inject
     public EmbeddingConfigServiceImpl(SemanticMetadataEventProducer eventProducer) {
         this.eventProducer = eventProducer;
     }
@@ -45,281 +61,354 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
     // --- EmbeddingModelConfig CRUD ---
 
     @Override
-    @WithTransaction
-    public Uni<CreateEmbeddingModelConfigResponse> createEmbeddingModelConfig(CreateEmbeddingModelConfigRequest request) {
-        if (!request.hasDimensions() || request.getDimensions() <= 0) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("dimensions is required and must be > 0")
-                    .asRuntimeException());
+    @RunOnVirtualThread
+    public void createEmbeddingModelConfig(CreateEmbeddingModelConfigRequest request,
+                                           StreamObserver<CreateEmbeddingModelConfigResponse> obs) {
+        try {
+            if (!request.hasDimensions() || request.getDimensions() <= 0) {
+                obs.onError(Status.INVALID_ARGUMENT
+                        .withDescription("dimensions is required and must be > 0")
+                        .asRuntimeException());
+                return;
+            }
+            if (request.getName().isBlank()) {
+                obs.onError(Status.INVALID_ARGUMENT
+                        .withDescription("name is required")
+                        .asRuntimeException());
+                return;
+            }
+            EmbeddingModelConfig entity;
+            try {
+                entity = persistNewModel(request);
+            } catch (ConstraintViolationException dup) {
+                LOG.infof("Embedding model config '%s' already exists — returning existing", request.getName());
+                entity = modelRepo.findByName(request.getName());
+                if (entity == null) {
+                    throw Status.ALREADY_EXISTS
+                            .withDescription("Constraint violation but row not found by name: " + request.getName())
+                            .asRuntimeException();
+                }
+            }
+            ai.pipestream.opensearch.v1.EmbeddingModelConfig proto = toEmbeddingModelConfigProto(entity);
+            eventProducer.publishEmbeddingModelConfigCreated(proto);
+            obs.onNext(CreateEmbeddingModelConfigResponse.newBuilder().setConfig(proto).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
         }
-        if (request.getName().isBlank()) {
-            return Uni.createFrom().failure(Status.INVALID_ARGUMENT
-                    .withDescription("name is required")
-                    .asRuntimeException());
+    }
+
+    @Transactional
+    protected EmbeddingModelConfig persistNewModel(CreateEmbeddingModelConfigRequest request) {
+        String id = request.hasId() && !request.getId().isBlank()
+                ? request.getId()
+                : UUID.randomUUID().toString();
+        EmbeddingModelConfig entity = new EmbeddingModelConfig();
+        entity.id = id;
+        entity.name = request.getName();
+        entity.modelIdentifier = request.getModelIdentifier();
+        entity.dimensions = request.getDimensions();
+        entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
+        if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
+        if (request.hasServingName()) entity.servingName = request.getServingName();
+        if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
+        if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
+        if (request.hasEnabled()) entity.enabled = request.getEnabled();
+        if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
+        if (request.hasProvider()) entity.provider = request.getProvider();
+        modelRepo.persist(entity);
+        return entity;
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void getEmbeddingModelConfig(GetEmbeddingModelConfigRequest request,
+                                        StreamObserver<GetEmbeddingModelConfigResponse> obs) {
+        try {
+            EmbeddingModelConfig e = request.getByName()
+                    ? modelRepo.findByName(request.getId())
+                    : modelRepo.findById(request.getId());
+            if (e == null) {
+                obs.onError(Status.NOT_FOUND
+                        .withDescription("Embedding model config not found: " + request.getId())
+                        .asRuntimeException());
+                return;
+            }
+            obs.onNext(GetEmbeddingModelConfigResponse.newBuilder()
+                    .setConfig(toEmbeddingModelConfigProto(e)).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
         }
-        return Panache.withTransaction(() -> {
-            String id = request.hasId() && !request.getId().isBlank()
-                    ? request.getId()
-                    : UUID.randomUUID().toString();
-            EmbeddingModelConfig entity = new EmbeddingModelConfig();
-            entity.id = id;
-            entity.name = request.getName();
-            entity.modelIdentifier = request.getModelIdentifier();
-            entity.dimensions = request.getDimensions();
-            entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
-            if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
-            if (request.hasServingName()) entity.servingName = request.getServingName();
-            if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
-            if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
-            if (request.hasEnabled()) entity.enabled = request.getEnabled();
-            if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
-            if (request.hasProvider()) entity.provider = request.getProvider();
-            return entity.persist()
-                    .replaceWith(entity);
-        })
-                // If a model with the same name already exists, return the existing one.
-                // Recovery needs its own session — the original session is corrupted after constraint violation.
-                .onFailure().recoverWithUni(err -> {
-                    if (isConstraintViolation(err)) {
-                        LOG.infof("Embedding model config '%s' already exists — returning existing", request.getName());
-                        return Panache.withSession(() -> EmbeddingModelConfig.findByName(request.getName()));
-                    }
-                    return Uni.createFrom().failure(err);
-                })
-                .onItem().transform(this::toEmbeddingModelConfigProto)
-                .call(config -> eventProducer.publishEmbeddingModelConfigCreated(config))
-                .map(config -> CreateEmbeddingModelConfigResponse.newBuilder().setConfig(config).build());
     }
 
     @Override
-    @WithSession
-    public Uni<GetEmbeddingModelConfigResponse> getEmbeddingModelConfig(GetEmbeddingModelConfigRequest request) {
-        Uni<EmbeddingModelConfig> lookup = request.getByName()
-                ? EmbeddingModelConfig.findByName(request.getId())
-                : EmbeddingModelConfig.findById(request.getId());
-        return Panache.withSession(() -> lookup)
-                .onItem().transformToUni(e -> e != null
-                        ? Uni.createFrom().item(GetEmbeddingModelConfigResponse.newBuilder()
-                                .setConfig(toEmbeddingModelConfigProto((EmbeddingModelConfig) e)).build())
-                        : Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Embedding model config not found: " + request.getId())
-                                .asRuntimeException()));
+    @RunOnVirtualThread
+    public void updateEmbeddingModelConfig(UpdateEmbeddingModelConfigRequest request,
+                                           StreamObserver<UpdateEmbeddingModelConfigResponse> obs) {
+        try {
+            ModelUpdate result = applyModelUpdate(request);
+            ai.pipestream.opensearch.v1.EmbeddingModelConfig current = toEmbeddingModelConfigProto(result.entity);
+            eventProducer.publishEmbeddingModelConfigUpdated(result.previous, current);
+            obs.onNext(UpdateEmbeddingModelConfigResponse.newBuilder().setConfig(current).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Transactional
+    protected ModelUpdate applyModelUpdate(UpdateEmbeddingModelConfigRequest request) {
+        EmbeddingModelConfig entity = modelRepo.findById(request.getId());
+        if (entity == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Embedding model config not found: " + request.getId())
+                    .asRuntimeException();
+        }
+        ai.pipestream.opensearch.v1.EmbeddingModelConfig previous = toEmbeddingModelConfigProto(entity);
+        if (request.hasName()) entity.name = request.getName();
+        if (request.hasModelIdentifier()) entity.modelIdentifier = request.getModelIdentifier();
+        if (request.hasDimensions()) entity.dimensions = request.getDimensions();
+        if (request.hasMetadata()) entity.metadata = structToJson(request.getMetadata());
+        if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
+        if (request.hasServingName()) entity.servingName = request.getServingName();
+        if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
+        if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
+        if (request.hasEnabled()) entity.enabled = request.getEnabled();
+        if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
+        if (request.hasProvider()) entity.provider = request.getProvider();
+        modelRepo.persist(entity);
+        return new ModelUpdate(previous, entity);
+    }
+
+    private record ModelUpdate(ai.pipestream.opensearch.v1.EmbeddingModelConfig previous,
+                               EmbeddingModelConfig entity) {
     }
 
     @Override
-    @WithTransaction
-    public Uni<UpdateEmbeddingModelConfigResponse> updateEmbeddingModelConfig(UpdateEmbeddingModelConfigRequest request) {
-        return Panache.withTransaction(() -> EmbeddingModelConfig.findById(request.getId())
-                .onItem().transformToUni(e -> {
-                    if (e == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Embedding model config not found: " + request.getId())
-                                .asRuntimeException());
-                    }
-                    EmbeddingModelConfig entity = (EmbeddingModelConfig) e;
-                    ai.pipestream.opensearch.v1.EmbeddingModelConfig previous = toEmbeddingModelConfigProto(entity);
-                    if (request.hasName()) entity.name = request.getName();
-                    if (request.hasModelIdentifier()) entity.modelIdentifier = request.getModelIdentifier();
-                    if (request.hasDimensions()) entity.dimensions = request.getDimensions();
-                    if (request.hasMetadata()) entity.metadata = structToJson(request.getMetadata());
-                    if (request.hasEndpointUrl()) entity.endpointUrl = request.getEndpointUrl();
-                    if (request.hasServingName()) entity.servingName = request.getServingName();
-                    if (request.hasQueryPrefix()) entity.queryPrefix = request.getQueryPrefix();
-                    if (request.hasIndexPrefix()) entity.indexPrefix = request.getIndexPrefix();
-                    if (request.hasEnabled()) entity.enabled = request.getEnabled();
-                    if (request.hasTlsConfigName()) entity.tlsConfigName = request.getTlsConfigName();
-                    if (request.hasProvider()) entity.provider = request.getProvider();
-                    return entity.persist()
-                            .replaceWith(Uni.createFrom().item(new Object[] { previous, entity }));
-                }))
-                .onItem().transformToUni(pair -> {
-                    var previous = (ai.pipestream.opensearch.v1.EmbeddingModelConfig) ((Object[]) pair)[0];
-                    var entity = (EmbeddingModelConfig) ((Object[]) pair)[1];
-                    var current = toEmbeddingModelConfigProto(entity);
-                    return eventProducer.publishEmbeddingModelConfigUpdated(previous, current)
-                            .replaceWith(UpdateEmbeddingModelConfigResponse.newBuilder().setConfig(current).build());
-                });
+    @RunOnVirtualThread
+    public void deleteEmbeddingModelConfig(DeleteEmbeddingModelConfigRequest request,
+                                           StreamObserver<DeleteEmbeddingModelConfigResponse> obs) {
+        try {
+            DeleteOutcome outcome = applyModelDelete(request);
+            if (outcome.deleted) {
+                eventProducer.publishEmbeddingModelConfigDeleted(request.getId());
+            }
+            obs.onNext(DeleteEmbeddingModelConfigResponse.newBuilder()
+                    .setSuccess(outcome.deleted)
+                    .setMessage(outcome.message)
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Transactional
+    protected DeleteOutcome applyModelDelete(DeleteEmbeddingModelConfigRequest request) {
+        EmbeddingModelConfig entity = modelRepo.findById(request.getId());
+        if (entity == null) {
+            return new DeleteOutcome(false, "Not found: " + request.getId());
+        }
+        List<VectorSetEntity> refs = vectorSetRepo.findByEmbeddingModelConfigId(request.getId());
+        if (!refs.isEmpty()) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription(String.format(
+                            "Cannot delete embedding model config '%s': referenced by %d VectorSet(s)",
+                            request.getId(), refs.size()))
+                    .asRuntimeException();
+        }
+        modelRepo.delete(entity);
+        return new DeleteOutcome(true, "Deleted");
+    }
+
+    private record DeleteOutcome(boolean deleted, String message) {
     }
 
     @Override
-    @WithTransaction
-    public Uni<DeleteEmbeddingModelConfigResponse> deleteEmbeddingModelConfig(DeleteEmbeddingModelConfigRequest request) {
-        return Panache.withTransaction(() -> EmbeddingModelConfig.findById(request.getId())
-                .onItem().transformToUni(e -> {
-                    if (e == null) {
-                        return Uni.createFrom().item(DeleteEmbeddingModelConfigResponse.newBuilder()
-                                .setSuccess(false)
-                                .setMessage("Not found: " + request.getId()).build());
-                    }
-                    // Check VectorSet references before deleting
-                    return VectorSetEntity.findByEmbeddingModelConfigId(request.getId())
-                            .onItem().transformToUni(refs -> {
-                                if (!refs.isEmpty()) {
-                                    return Uni.createFrom().<DeleteEmbeddingModelConfigResponse>failure(
-                                            Status.FAILED_PRECONDITION
-                                                    .withDescription(String.format(
-                                                            "Cannot delete embedding model config '%s': referenced by %d VectorSet(s)",
-                                                            request.getId(), refs.size()))
-                                                    .asRuntimeException());
-                                }
-                                return ((EmbeddingModelConfig) e).delete()
-                                        .replaceWith(DeleteEmbeddingModelConfigResponse.newBuilder()
-                                                .setSuccess(true)
-                                                .setMessage("Deleted").build())
-                                        .call(() -> eventProducer.publishEmbeddingModelConfigDeleted(request.getId()));
-                            });
-                }));
-    }
-
-    @Override
-    @WithSession
-    public Uni<ListEmbeddingModelConfigsResponse> listEmbeddingModelConfigs(ListEmbeddingModelConfigsRequest request) {
-        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
-        int page = parsePageToken(request.getPageToken());
-        return Panache.withSession(() -> EmbeddingModelConfig.findAll()
-                .page(io.quarkus.panache.common.Page.of(page, pageSize))
-                .list())
-                .onItem().transform(list -> {
-                    List<EmbeddingModelConfig> entities = list.stream()
-                            .map(EmbeddingModelConfig.class::cast)
-                            .toList();
-                    return ListEmbeddingModelConfigsResponse.newBuilder()
-                            .addAllConfigs(entities.stream().map(this::toEmbeddingModelConfigProto).toList())
-                            .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
-                            .build();
-                });
+    @RunOnVirtualThread
+    public void listEmbeddingModelConfigs(ListEmbeddingModelConfigsRequest request,
+                                          StreamObserver<ListEmbeddingModelConfigsResponse> obs) {
+        try {
+            int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+            int page = parsePageToken(request.getPageToken());
+            List<EmbeddingModelConfig> entities = modelRepo.findAll()
+                    .page(Page.of(page, pageSize))
+                    .list();
+            obs.onNext(ListEmbeddingModelConfigsResponse.newBuilder()
+                    .addAllConfigs(entities.stream().map(this::toEmbeddingModelConfigProto).toList())
+                    .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
     }
 
     // --- IndexEmbeddingBinding CRUD ---
 
     @Override
-    @WithTransaction
-    public Uni<CreateIndexEmbeddingBindingResponse> createIndexEmbeddingBinding(CreateIndexEmbeddingBindingRequest request) {
-        return Panache.withTransaction(() -> EmbeddingModelConfig.findById(request.getEmbeddingModelConfigId())
-                .onItem().transformToUni(emc -> {
-                    if (emc == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
-                                .asRuntimeException());
-                    }
-                    String id = request.hasId() && !request.getId().isBlank()
-                            ? request.getId()
-                            : UUID.randomUUID().toString();
-                    IndexEmbeddingBinding entity = new IndexEmbeddingBinding();
-                    entity.id = id;
-                    entity.indexName = request.getIndexName();
-                    entity.embeddingModelConfig = (EmbeddingModelConfig) emc;
-                    entity.fieldName = request.getFieldName();
-                    entity.resultSetName = normalizeResultSetName(request.hasResultSetName() ? request.getResultSetName() : null);
-                    return entity.persist().replaceWith(entity);
-                }))
-                .onItem().transform(e -> toIndexEmbeddingBindingProto((IndexEmbeddingBinding) e))
-                .call(binding -> eventProducer.publishIndexEmbeddingBindingCreated(binding))
-                .map(binding -> CreateIndexEmbeddingBindingResponse.newBuilder().setBinding(binding).build());
+    @RunOnVirtualThread
+    public void createIndexEmbeddingBinding(CreateIndexEmbeddingBindingRequest request,
+                                            StreamObserver<CreateIndexEmbeddingBindingResponse> obs) {
+        try {
+            IndexEmbeddingBinding entity = persistNewBinding(request);
+            ai.pipestream.opensearch.v1.IndexEmbeddingBinding proto = toIndexEmbeddingBindingProto(entity);
+            eventProducer.publishIndexEmbeddingBindingCreated(proto);
+            obs.onNext(CreateIndexEmbeddingBindingResponse.newBuilder().setBinding(proto).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Transactional
+    protected IndexEmbeddingBinding persistNewBinding(CreateIndexEmbeddingBindingRequest request) {
+        EmbeddingModelConfig emc = modelRepo.findById(request.getEmbeddingModelConfigId());
+        if (emc == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
+                    .asRuntimeException();
+        }
+        String id = request.hasId() && !request.getId().isBlank()
+                ? request.getId()
+                : UUID.randomUUID().toString();
+        IndexEmbeddingBinding entity = new IndexEmbeddingBinding();
+        entity.id = id;
+        entity.indexName = request.getIndexName();
+        entity.embeddingModelConfig = emc;
+        entity.fieldName = request.getFieldName();
+        entity.resultSetName = normalizeResultSetName(request.hasResultSetName() ? request.getResultSetName() : null);
+        bindingRepo.persist(entity);
+        return entity;
     }
 
     @Override
-    @WithSession
-    public Uni<GetIndexEmbeddingBindingResponse> getIndexEmbeddingBinding(GetIndexEmbeddingBindingRequest request) {
-        Uni<IndexEmbeddingBinding> lookup = request.hasIndexName() && request.hasFieldName()
-                ? IndexEmbeddingBinding.findByIndexFieldAndResultSetName(
+    @RunOnVirtualThread
+    public void getIndexEmbeddingBinding(GetIndexEmbeddingBindingRequest request,
+                                         StreamObserver<GetIndexEmbeddingBindingResponse> obs) {
+        try {
+            IndexEmbeddingBinding b;
+            if (request.hasIndexName() && request.hasFieldName()) {
+                b = bindingRepo.findByIndexFieldAndResultSetName(
                         request.getIndexName(),
                         request.getFieldName(),
-                        DEFAULT_RESULT_SET_NAME)
-                        .onItem().transformToUni(binding -> binding != null
-                                ? Uni.createFrom().item(binding)
-                                : IndexEmbeddingBinding.findByIndexAndField(request.getIndexName(), request.getFieldName()))
-                : IndexEmbeddingBinding.findById(request.getId());
-        return Panache.withSession(() -> lookup)
-                .onItem().transformToUni(b -> b != null
-                        ? Uni.createFrom().item(GetIndexEmbeddingBindingResponse.newBuilder()
-                                .setBinding(toIndexEmbeddingBindingProto(b)).build())
-                        : Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Index embedding binding not found")
-                                .asRuntimeException()));
-    }
-
-    @Override
-    @WithTransaction
-    public Uni<UpdateIndexEmbeddingBindingResponse> updateIndexEmbeddingBinding(UpdateIndexEmbeddingBindingRequest request) {
-        return Panache.withTransaction(() -> IndexEmbeddingBinding.findById(request.getId())
-                .onItem().transformToUni(b -> {
-                    if (b == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Index embedding binding not found: " + request.getId())
-                                .asRuntimeException());
-                    }
-                    IndexEmbeddingBinding entity = (IndexEmbeddingBinding) b;
-                    ai.pipestream.opensearch.v1.IndexEmbeddingBinding previous = toIndexEmbeddingBindingProto(entity);
-                    if (request.hasIndexName()) entity.indexName = request.getIndexName();
-                    if (request.hasFieldName()) entity.fieldName = request.getFieldName();
-                    if (request.hasResultSetName()) entity.resultSetName = normalizeResultSetName(request.getResultSetName());
-                    if (request.hasEmbeddingModelConfigId()) {
-                        return EmbeddingModelConfig.findById(request.getEmbeddingModelConfigId())
-                                .onItem().transformToUni(emc -> {
-                                    if (emc == null) {
-                                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                                .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
-                                                .asRuntimeException());
-                                    }
-                                    entity.embeddingModelConfig = (EmbeddingModelConfig) emc;
-                                    return entity.persist().replaceWith(Uni.createFrom().item(new Object[] { previous, entity }));
-                                });
-                    }
-                    return entity.persist().replaceWith(Uni.createFrom().item(new Object[] { previous, entity }));
-                }))
-                .onItem().transformToUni(pair -> {
-                    var previous = (ai.pipestream.opensearch.v1.IndexEmbeddingBinding) ((Object[]) pair)[0];
-                    var entity = (IndexEmbeddingBinding) ((Object[]) pair)[1];
-                    var current = toIndexEmbeddingBindingProto(entity);
-                    return eventProducer.publishIndexEmbeddingBindingUpdated(previous, current)
-                            .replaceWith(UpdateIndexEmbeddingBindingResponse.newBuilder().setBinding(current).build());
-                });
-    }
-
-    @Override
-    @WithTransaction
-    public Uni<DeleteIndexEmbeddingBindingResponse> deleteIndexEmbeddingBinding(DeleteIndexEmbeddingBindingRequest request) {
-        return Panache.withTransaction(() -> IndexEmbeddingBinding.findById(request.getId())
-                .onItem().transformToUni(b -> b != null
-                        ? ((IndexEmbeddingBinding) b).delete()
-                                .replaceWith(DeleteIndexEmbeddingBindingResponse.newBuilder()
-                                        .setSuccess(true)
-                                        .setMessage("Deleted").build())
-                                .call(() -> eventProducer.publishIndexEmbeddingBindingDeleted(request.getId()))
-                        : Uni.createFrom().item(DeleteIndexEmbeddingBindingResponse.newBuilder()
-                                .setSuccess(false)
-                                .setMessage("Not found: " + request.getId()).build())));
-    }
-
-    @Override
-    @WithSession
-    public Uni<ListIndexEmbeddingBindingsResponse> listIndexEmbeddingBindings(ListIndexEmbeddingBindingsRequest request) {
-        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
-        int page = parsePageToken(request.getPageToken());
-        Uni<List<IndexEmbeddingBinding>> query = request.hasIndexName()
-                ? IndexEmbeddingBinding.<IndexEmbeddingBinding>find("indexName", request.getIndexName())
-                        .page(io.quarkus.panache.common.Page.of(page, pageSize))
-                        .list()
-                : IndexEmbeddingBinding.findAll()
-                        .page(io.quarkus.panache.common.Page.of(page, pageSize))
-                        .list();
-        return Panache.withSession(() -> query)
-                .onItem().transform(entities -> ListIndexEmbeddingBindingsResponse.newBuilder()
-                        .addAllBindings(entities.stream().map(this::toIndexEmbeddingBindingProto).toList())
-                        .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
-                        .build());
-    }
-
-    private static boolean isConstraintViolation(Throwable t) {
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
-                return true;
+                        DEFAULT_RESULT_SET_NAME);
+                if (b == null) {
+                    b = bindingRepo.findByIndexAndField(request.getIndexName(), request.getFieldName());
+                }
+            } else {
+                b = bindingRepo.findById(request.getId());
             }
-            t = t.getCause();
+            if (b == null) {
+                obs.onError(Status.NOT_FOUND
+                        .withDescription("Index embedding binding not found")
+                        .asRuntimeException());
+                return;
+            }
+            obs.onNext(GetIndexEmbeddingBindingResponse.newBuilder()
+                    .setBinding(toIndexEmbeddingBindingProto(b)).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
         }
-        return false;
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void updateIndexEmbeddingBinding(UpdateIndexEmbeddingBindingRequest request,
+                                            StreamObserver<UpdateIndexEmbeddingBindingResponse> obs) {
+        try {
+            BindingUpdate result = applyBindingUpdate(request);
+            ai.pipestream.opensearch.v1.IndexEmbeddingBinding current = toIndexEmbeddingBindingProto(result.entity);
+            eventProducer.publishIndexEmbeddingBindingUpdated(result.previous, current);
+            obs.onNext(UpdateIndexEmbeddingBindingResponse.newBuilder().setBinding(current).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Transactional
+    protected BindingUpdate applyBindingUpdate(UpdateIndexEmbeddingBindingRequest request) {
+        IndexEmbeddingBinding entity = bindingRepo.findById(request.getId());
+        if (entity == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Index embedding binding not found: " + request.getId())
+                    .asRuntimeException();
+        }
+        ai.pipestream.opensearch.v1.IndexEmbeddingBinding previous = toIndexEmbeddingBindingProto(entity);
+        if (request.hasIndexName()) entity.indexName = request.getIndexName();
+        if (request.hasFieldName()) entity.fieldName = request.getFieldName();
+        if (request.hasResultSetName()) entity.resultSetName = normalizeResultSetName(request.getResultSetName());
+        if (request.hasEmbeddingModelConfigId()) {
+            EmbeddingModelConfig emc = modelRepo.findById(request.getEmbeddingModelConfigId());
+            if (emc == null) {
+                throw Status.NOT_FOUND
+                        .withDescription("Embedding model config not found: " + request.getEmbeddingModelConfigId())
+                        .asRuntimeException();
+            }
+            entity.embeddingModelConfig = emc;
+        }
+        bindingRepo.persist(entity);
+        return new BindingUpdate(previous, entity);
+    }
+
+    private record BindingUpdate(ai.pipestream.opensearch.v1.IndexEmbeddingBinding previous,
+                                 IndexEmbeddingBinding entity) {
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void deleteIndexEmbeddingBinding(DeleteIndexEmbeddingBindingRequest request,
+                                            StreamObserver<DeleteIndexEmbeddingBindingResponse> obs) {
+        try {
+            DeleteOutcome outcome = applyBindingDelete(request);
+            if (outcome.deleted) {
+                eventProducer.publishIndexEmbeddingBindingDeleted(request.getId());
+            }
+            obs.onNext(DeleteIndexEmbeddingBindingResponse.newBuilder()
+                    .setSuccess(outcome.deleted)
+                    .setMessage(outcome.message)
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Transactional
+    protected DeleteOutcome applyBindingDelete(DeleteIndexEmbeddingBindingRequest request) {
+        IndexEmbeddingBinding entity = bindingRepo.findById(request.getId());
+        if (entity == null) {
+            return new DeleteOutcome(false, "Not found: " + request.getId());
+        }
+        bindingRepo.delete(entity);
+        return new DeleteOutcome(true, "Deleted");
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void listIndexEmbeddingBindings(ListIndexEmbeddingBindingsRequest request,
+                                           StreamObserver<ListIndexEmbeddingBindingsResponse> obs) {
+        try {
+            int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+            int page = parsePageToken(request.getPageToken());
+            List<IndexEmbeddingBinding> entities = request.hasIndexName()
+                    ? bindingRepo.find("indexName", request.getIndexName())
+                            .page(Page.of(page, pageSize))
+                            .list()
+                    : bindingRepo.findAll()
+                            .page(Page.of(page, pageSize))
+                            .list();
+            obs.onNext(ListIndexEmbeddingBindingsResponse.newBuilder()
+                    .addAllBindings(entities.stream().map(this::toIndexEmbeddingBindingProto).toList())
+                    .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
     }
 
     // --- Proto conversion helpers ---
@@ -334,14 +423,13 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
         if (e.updatedAt != null) b.setUpdatedAt(toTimestamp(e.updatedAt));
         if (e.metadata != null && !e.metadata.isBlank()) {
             try {
-                com.google.protobuf.Struct.Builder sb = Struct.newBuilder();
+                Struct.Builder sb = Struct.newBuilder();
                 JsonFormat.parser().merge(e.metadata, sb);
                 b.setMetadata(sb.build());
             } catch (InvalidProtocolBufferException ex) {
                 LOG.warnf("Could not parse metadata JSON for config %s: %s", e.id, ex.getMessage());
             }
         }
-        // Serving configuration fields
         if (e.endpointUrl != null) b.setEndpointUrl(e.endpointUrl);
         if (e.servingName != null) b.setServingName(e.servingName);
         if (e.queryPrefix != null) b.setQueryPrefix(e.queryPrefix);
@@ -372,7 +460,7 @@ public class EmbeddingConfigServiceImpl extends MutinyEmbeddingConfigServiceGrpc
                 .build();
     }
 
-    private String structToJson(com.google.protobuf.Struct s) {
+    private String structToJson(Struct s) {
         if (s == null || s.getFieldsCount() == 0) return null;
         try {
             return JsonFormat.printer().print(s);
