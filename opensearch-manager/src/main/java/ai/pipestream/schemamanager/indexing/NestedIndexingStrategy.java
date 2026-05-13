@@ -15,6 +15,7 @@ import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
 /**
@@ -143,9 +144,50 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         return enqueueDocuments(batch);
     }
 
+    /**
+     * Submit every request in the batch to the bulk queue, then wait once for
+     * all submissions to complete. Returns responses aligned with input order.
+     *
+     * <p><b>Why this shape matters.</b> The naive form &mdash; submit, await,
+     * submit, await &mdash; serialises a "bulk" batch into one bulk-flush window
+     * per document, because {@link ai.pipestream.schemamanager.bulk.BulkQueueSetBean#submitWithFuture}
+     * returns a future that only completes when the next flush actually fires.
+     * With a 500&nbsp;ms flush interval a 100-doc batch would take ~50&nbsp;s
+     * minimum. The correct shape is to submit every future first so they all
+     * ride a single flush window, then block once on
+     * {@link CompletableFuture#allOf(CompletableFuture[])}.
+     *
+     * <p>Failures are partitioned into two kinds:
+     * <ul>
+     *   <li><b>Conversion errors</b> (protobuf-to-JSON or semantic-set
+     *       transform) surface inline during stage&nbsp;1 and never reach the
+     *       bulk queue; their response slot is filled immediately.</li>
+     *   <li><b>Bulk-queue failures</b> surface after stage&nbsp;2 as a failed
+     *       per-item future and are reported as {@code success=false} with the
+     *       cause message in stage&nbsp;3.</li>
+     * </ul>
+     *
+     * <p>If the calling thread is interrupted while waiting on
+     * {@link CompletableFuture#allOf(CompletableFuture[])}, the interrupt flag
+     * is restored and every still-pending response is marked as
+     * "Interrupted awaiting bulk submission". Futures that had already
+     * completed are reported with their actual outcome.
+     *
+     * @param batch input requests, all assumed to target the same OpenSearch
+     *              index (the caller groups by index before calling this).
+     * @return one {@link StreamIndexDocumentsResponse} per input, in input order.
+     */
     private List<StreamIndexDocumentsResponse> enqueueDocuments(List<StreamIndexDocumentsRequest> batch) {
-        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(batch.size());
-        for (var req : batch) {
+        StreamIndexDocumentsResponse[] slotted = new StreamIndexDocumentsResponse[batch.size()];
+        List<PendingSubmission> pending = new ArrayList<>(batch.size());
+
+        // Stage 1: build the doc map and submit a bulk future for every
+        // request. No blocking calls in this loop &mdash; submitWithFuture
+        // returns immediately and the future completes when the bulk queue's
+        // next flush fires. Conversion errors short-circuit into the response
+        // slot directly so we don't queue work that can't proceed.
+        for (int i = 0; i < batch.size(); i++) {
+            StreamIndexDocumentsRequest req = batch.get(i);
             String requestId = req.getRequestId();
             String indexName = req.getIndexName();
             String docId = req.hasDocumentId() ? req.getDocumentId() : req.getDocument().getOriginalDocId();
@@ -153,32 +195,80 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
             try {
                 String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(req.getDocument());
                 Map<String, Object> finalDoc = transformSemanticSetsToNestedFieldsMap(jsonDoc, req.getDocument());
-                try {
-                    var result = awaitBulk(bulkQueueSet.submitWithFuture(indexName, docId, finalDoc, routing));
-                    responses.add(StreamIndexDocumentsResponse.newBuilder()
-                            .setRequestId(requestId)
-                            .setDocumentId(docId)
-                            .setSuccess(result.success())
-                            .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail())
-                            .build());
-                } catch (RuntimeException t) {
-                    responses.add(StreamIndexDocumentsResponse.newBuilder()
-                            .setRequestId(requestId)
-                            .setDocumentId(docId)
-                            .setSuccess(false)
-                            .setMessage("Bulk queue failure: " + t.getMessage())
-                            .build());
-                }
+                CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future =
+                        bulkQueueSet.submitWithFuture(indexName, docId, finalDoc, routing);
+                pending.add(new PendingSubmission(i, requestId, docId, future));
             } catch (IOException e) {
-                responses.add(StreamIndexDocumentsResponse.newBuilder()
+                slotted[i] = StreamIndexDocumentsResponse.newBuilder()
                         .setRequestId(requestId)
                         .setDocumentId(docId)
                         .setSuccess(false)
                         .setMessage("Conversion error: " + e.getMessage())
-                        .build());
+                        .build();
             }
         }
-        return responses;
+
+        // Stage 2: block once on every submitted future. One flush window
+        // services the entire batch; the wall-time cost is bounded by the
+        // bulk-queue's flush interval, not by N &times; flush interval.
+        boolean batchInterrupted = false;
+        if (!pending.isEmpty()) {
+            CompletableFuture<?>[] all = new CompletableFuture<?>[pending.size()];
+            for (int i = 0; i < pending.size(); i++) {
+                all[i] = pending.get(i).future();
+            }
+            try {
+                CompletableFuture.allOf(all).get();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                batchInterrupted = true;
+            } catch (ExecutionException ee) {
+                // allOf signals only that at least one future completed
+                // exceptionally; the per-future loop below inspects each
+                // individual outcome and reports it on its response slot.
+            }
+        }
+
+        // Stage 3: build response slots in submission order. Futures are
+        // already complete unless the await was interrupted before they
+        // resolved, in which case the slot reports the interrupt rather than
+        // blocking again.
+        for (PendingSubmission p : pending) {
+            StreamIndexDocumentsResponse.Builder rsp = StreamIndexDocumentsResponse.newBuilder()
+                    .setRequestId(p.requestId())
+                    .setDocumentId(p.docId());
+            if (batchInterrupted && !p.future().isDone()) {
+                rsp.setSuccess(false).setMessage("Interrupted awaiting bulk submission");
+            } else {
+                try {
+                    ai.pipestream.schemamanager.bulk.BulkItemResult result = p.future().get();
+                    rsp.setSuccess(result.success())
+                            .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail());
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    rsp.setSuccess(false).setMessage("Interrupted awaiting bulk submission");
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    rsp.setSuccess(false).setMessage("Bulk queue failure: "
+                            + (cause != null ? cause.getMessage() : ee.getMessage()));
+                }
+            }
+            slotted[p.index()] = rsp.build();
+        }
+        return Arrays.asList(slotted);
+    }
+
+    /**
+     * One submitted bulk item awaiting its flush-window completion. Carries
+     * the original request slot index so stage&nbsp;3 can place the response
+     * back in input order, plus the request/document identifiers needed to
+     * build the response.
+     */
+    private record PendingSubmission(
+            int index,
+            String requestId,
+            String docId,
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future) {
     }
 
     private static ai.pipestream.schemamanager.bulk.BulkItemResult awaitBulk(
