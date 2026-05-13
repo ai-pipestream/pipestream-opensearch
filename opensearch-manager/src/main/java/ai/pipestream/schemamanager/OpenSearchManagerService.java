@@ -6,11 +6,13 @@ import ai.pipestream.schemamanager.util.AnyDocumentMapper;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsResponse;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
 import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
@@ -52,6 +54,21 @@ public class OpenSearchManagerService extends OpenSearchManagerServiceGrpc.OpenS
 
     @Inject
     IndexProvisioningEngine indexProvisioningEngine;
+
+    /**
+     * Master switch for the bidirectional {@code streamIndexDocuments} RPC.
+     * <p>The bidi path is the legacy entry into OSM indexing &mdash; the
+     * sink originally called it directly before
+     * {@link ai.pipestream.schemamanager.indexing.redis.RedisIndexingConsumer}
+     * shipped. With the redis path now in place, this flag gates whether
+     * the bidi RPC remains available. Default is {@code true} so existing
+     * callers (the bidi-streaming RPC test, ad-hoc admin tools) keep
+     * working; flipping it to {@code false} is the operator's call once
+     * the redis path is proven over a long-running sweep.
+     */
+    @ConfigProperty(name = "pipestream.opensearch-manager.bidi-indexing.enabled",
+            defaultValue = "true")
+    boolean bidiIndexingEnabled;
 
     /** CDI; dependencies injected after construction. */
     public OpenSearchManagerService() {}
@@ -100,6 +117,25 @@ public class OpenSearchManagerService extends OpenSearchManagerServiceGrpc.OpenS
     @RunOnVirtualThread
     public StreamObserver<StreamIndexDocumentsRequest> streamIndexDocuments(
             StreamObserver<StreamIndexDocumentsResponse> obs) {
+        if (!bidiIndexingEnabled) {
+            // The bidi path was retired by operator config. Return an
+            // observer that fails immediately on any inbound request so
+            // the client surfaces FAILED_PRECONDITION rather than a
+            // silent drop. The redis indexing consumer is the supported
+            // path; callers should publish to pipestream:indexing:<plan_id>
+            // via opensearch-sink instead.
+            obs.onError(Status.FAILED_PRECONDITION
+                    .withDescription("streamIndexDocuments is disabled "
+                            + "(pipestream.opensearch-manager.bidi-indexing.enabled=false). "
+                            + "Publish via the redis indexing path instead.")
+                    .asRuntimeException());
+            return new StreamObserver<>() {
+                @Override public void onNext(StreamIndexDocumentsRequest req) { /* drop */ }
+                @Override public void onError(Throwable t) { /* already failed */ }
+                @Override public void onCompleted() { /* already failed */ }
+            };
+        }
+
         final List<StreamIndexDocumentsRequest> batch = new ArrayList<>(STREAM_BATCH_SIZE);
 
         return new StreamObserver<>() {
