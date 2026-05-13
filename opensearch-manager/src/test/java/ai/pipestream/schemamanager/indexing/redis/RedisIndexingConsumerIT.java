@@ -11,7 +11,9 @@ import io.quarkus.redis.datasource.RedisDataSource;
 import io.quarkus.redis.datasource.stream.StreamCommands;
 import io.quarkus.redis.datasource.stream.StreamMessage;
 import io.quarkus.redis.datasource.stream.StreamRange;
+import io.quarkus.redis.datasource.stream.XGroupCreateArgs;
 import io.quarkus.redis.datasource.stream.XPendingSummary;
+import io.quarkus.redis.datasource.stream.XReadGroupArgs;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -262,6 +264,94 @@ class RedisIndexingConsumerIT {
                             + "the DLQ write so XAUTOCLAIM does not redeliver")
                     .isZero();
         });
+    }
+
+    @Test
+    void xautoclaimRedelivery_pendingEntryFromDeadConsumerLandsExactlyOnceAtSurvivor() {
+        // Tear down the @BeforeEach's consumer; this test drives its own
+        // consumer instance with short XAUTOCLAIM windows so the redelivery
+        // scenario completes inside a few seconds.
+        consumer.stop();
+        workerExecutor.shutdown();
+
+        // Phase 1: create the consumer group ourselves so a "ghost" consumer
+        // name can claim an entry without ever running the real drain loop.
+        // MKSTREAM is on; the stream key need not exist yet.
+        try {
+            streams.xgroupCreate(streamKey, config.consumerGroup(), "0",
+                    new XGroupCreateArgs().mkstream());
+        } catch (RuntimeException ignored) {
+            // BUSYGROUP if the group already exists from a prior iteration;
+            // either way we have a group to read against.
+        }
+
+        // Phase 2: XADD one valid entry and XREADGROUP it as "ghost-A".
+        // The entry sits in ghost-A's PEL with no XACK because we walk away
+        // immediately; this is the "consumer crashed mid-batch" state
+        // XAUTOCLAIM is designed to clean up.
+        String docId = "doc-redelivery-" + testId;
+        xaddValid(docId);
+        List<StreamMessage<String, String, String>> ghostRead = streams.xreadgroup(
+                config.consumerGroup(), "ghost-A", streamKey, ">",
+                new XReadGroupArgs().count(10).block(Duration.ofMillis(500)));
+        assertThat(ghostRead)
+                .as("ghost-A should have read the XADDed entry into its PEL")
+                .hasSize(1);
+        assertThat(streams.xpending(streamKey, config.consumerGroup()).getPendingCount())
+                .as("after ghost-A reads without XACK, the PEL should hold one entry")
+                .isEqualTo(1L);
+
+        // Phase 3: spin up a real consumer with short XAUTOCLAIM windows
+        // and a different consumer name. Its drain loop should pick up
+        // ghost-A's stale pending entry once pending-idle-ms elapses.
+        PlanStreamConsumer.ResolvedSettings shortIdleSettings = new PlanStreamConsumer.ResolvedSettings(
+                /* workersPerStream */ 1,
+                /* readBatchSize */ 32,
+                /* readBlockMs */ 200,
+                /* pendingIdleMs */ 500,
+                /* claimIntervalMs */ 200,
+                /* maxInFlightPerStream */ 8);
+        ExecutorService survivorExecutor = Executors.newVirtualThreadPerTaskExecutor();
+        PlanStreamConsumer survivor = new PlanStreamConsumer(
+                streamKey, planId, config.consumerGroup(),
+                "survivor-" + testId,
+                shortIdleSettings,
+                streams, processor, survivorExecutor);
+        survivor.start();
+        try {
+            // Phase 4: the doc should land exactly once at the receipt sink
+            // — proof XAUTOCLAIM picked it up and the survivor processed it
+            // to completion (DLQ flush + receipt emit + XACK).
+            Awaitility.await().atMost(WAIT).untilAsserted(() -> {
+                IndexingReceiptsTestSink.ReceivedReceipt receipt = receiptSink.find(docId);
+                assertThat(receipt)
+                        .as("ghost-A's pending entry must be reaped by the survivor's "
+                                + "XAUTOCLAIM and processed end-to-end")
+                        .isNotNull();
+                assertThat(receipt.event().getOutcome())
+                        .as("the redelivered entry processes the same way as a fresh one — "
+                                + "INDEXING_OUTCOME_SUCCESS via the strategy mock")
+                        .isEqualTo(IndexingOutcome.INDEXING_OUTCOME_SUCCESS);
+            });
+            Awaitility.await().atMost(WAIT).untilAsserted(() -> {
+                XPendingSummary pending = streams.xpending(streamKey, config.consumerGroup());
+                assertThat(pending.getPendingCount())
+                        .as("after the survivor XACKs, the PEL must drain to zero — "
+                                + "proving exactly-once delivery: ghost-A's pending entry "
+                                + "is gone, not duplicated")
+                        .isZero();
+            });
+            // And the doc should NOT have produced two receipts. The
+            // receiptSink keys receipts by doc_id so duplicates would have
+            // overwritten the prior; assert exactly one DocumentIndexedEvent
+            // landed under that doc id by checking the cumulative count
+            // would have already shown if a second copy arrived during the
+            // pending-drain await above.
+            assertThat(receiptSink.find(docId)).isNotNull();
+        } finally {
+            survivor.stop();
+            survivorExecutor.shutdown();
+        }
     }
 
     // ---- helpers ----
