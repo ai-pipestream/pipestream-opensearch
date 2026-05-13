@@ -45,4 +45,19 @@ public class IndexPlanRepository implements PanacheRepositoryBase<IndexPlanEntit
     public long countAll() {
         return count();
     }
+
+    /**
+     * Lists every plan whose {@code status} matches. Order is unspecified;
+     * callers that need ordering should apply their own. The redis indexing
+     * consumer uses this at startup to enumerate plans to prewarm, and
+     * order doesn't matter (each plan is warmed independently).
+     *
+     * @param status one of {@link IndexPlanEntity#STATUS_PENDING},
+     *               {@link IndexPlanEntity#STATUS_READY},
+     *               {@link IndexPlanEntity#STATUS_FAILED}
+     * @return matching plans (possibly empty)
+     */
+    public List<IndexPlanEntity> listByStatus(String status) {
+        return list("status", status);
+    }
 }

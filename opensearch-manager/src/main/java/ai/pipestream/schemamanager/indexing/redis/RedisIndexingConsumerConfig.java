@@ -3,24 +3,27 @@ package ai.pipestream.schemamanager.indexing.redis;
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
 
+import java.util.Optional;
+
 /**
  * Typed configuration for the OpenSearch-manager redis indexing consumer.
  *
- * <p>Every operator-tunable knob is intentionally undefaulted — a missing
- * property fails fast at startup rather than picking a "reasonable" value
- * that masks an operations gap. The two exceptions are:
+ * <p>Every operator-tunable knob is declared {@link Optional} so the
+ * {@code @ConfigMapping} validates cleanly when {@link #enabled()} is
+ * {@code false} (the common case for tests and for a freshly-deployed
+ * service that has not yet opted in). When {@link #enabled()} is
+ * {@code true}, the consumer's lifecycle bean unwraps each property via
+ * {@code .orElseThrow(...)} so any missing knob fails the startup with a
+ * specific error message pointing at the missing property name. There
+ * are still NO defaults: an enabled consumer demands every value be set
+ * explicitly. The two exceptions:
  * <ul>
- *   <li>{@link #enabled()} — defaults to {@code false} so a fresh deployment
- *       does not start the consumer until the operator opts in.</li>
- *   <li>{@link #consumerGroup()} — defaults to {@code "opensearch-manager"}
- *       because horizontal fan-out across OSM instances is the only correct
- *       answer and there is no scenario where a different value is right.</li>
+ *   <li>{@link #enabled()} &mdash; defaults to {@code false} so a fresh
+ *       deployment does not start the consumer until the operator opts in.</li>
+ *   <li>{@link #consumerGroup()} &mdash; defaults to
+ *       {@code "opensearch-manager"} because horizontal fan-out across
+ *       OSM instances is the only correct value.</li>
  * </ul>
- *
- * <p>Other properties expose a value that the operator MUST set explicitly
- * for the consumer to start. Yes, that is verbose; it is also the only
- * defence against "the default looked fine in dev, blew up in production"
- * regressions.
  *
  * <h2>Knob choices</h2>
  *
@@ -36,8 +39,7 @@ import io.smallrye.config.WithDefault;
  *       plan stream. Mirrors the engine's {@code workers-per-edge} knob.</li>
  *   <li><b>{@code read-batch-size}</b> &mdash; XREADGROUP COUNT. SHOULD equal
  *       {@code BulkIndexingConfig.capacity()} so one redis read fills one
- *       bulk flush window. A startup guard logs a warning when the two
- *       differ by more than 2&times;.</li>
+ *       bulk flush window.</li>
  *   <li><b>{@code read-block-ms}</b> &mdash; XREADGROUP BLOCK timeout. Drives
  *       worker shutdown latency: a worker exits {@code read-block-ms} after
  *       the consumer's {@code stop} flag flips.</li>
@@ -48,9 +50,9 @@ import io.smallrye.config.WithDefault;
  *   <li><b>{@code claim-interval-ms}</b> &mdash; How often each worker tries
  *       XAUTOCLAIM. Set well below {@code pending-idle-ms}.</li>
  *   <li><b>{@code max-in-flight-per-stream}</b> &mdash; Semaphore cap on
- *       in-flight bulk batches per stream. Mirrors the engine's same-named
- *       knob; slow downstream OpenSearch exerts backpressure on the read
- *       loop instead of growing the in-flight virtual-thread set.</li>
+ *       in-flight bulk batches per stream. Slow downstream OpenSearch
+ *       exerts backpressure on the read loop instead of growing the
+ *       in-flight virtual-thread set.</li>
  *   <li><b>{@code dlq-maxlen}</b> &mdash; XADD MAXLEN cap on each DLQ stream.
  *       Should be set high &mdash; a DLQ exists to retain failures for
  *       triage, not to silently drop the oldest. The cap is a runaway-
@@ -72,26 +74,6 @@ public interface RedisIndexingConsumerConfig {
     boolean enabled();
 
     /**
-     * Redis stream key prefix the sink publishes to. MUST equal
-     * {@code OpenSearchIndexingPublisher.STREAM_KEY_PREFIX} on the producer
-     * side. The full stream key for a plan is
-     * {@code <streamKeyPrefix><planId>}.
-     *
-     * @return stream key prefix (typically {@code "pipestream:indexing:"})
-     */
-    String streamKeyPrefix();
-
-    /**
-     * Redis stream key prefix for the per-plan dead-letter queue. The full
-     * DLQ stream for a plan is {@code <dlqKeyPrefix><planId>}; the consumer
-     * XADDs poison entries here and XACKs them on the live stream so they
-     * never redeliver.
-     *
-     * @return DLQ stream key prefix (typically {@code "pipestream:indexing-dlq:"})
-     */
-    String dlqKeyPrefix();
-
-    /**
      * Consumer group name. Every OSM instance registers a unique consumer
      * within this fixed group so redis fans messages out across instances
      * (exactly-once delivery within the group). Per-instance group names
@@ -104,11 +86,31 @@ public interface RedisIndexingConsumerConfig {
     String consumerGroup();
 
     /**
+     * Redis stream key prefix the sink publishes to. MUST equal
+     * {@code OpenSearchIndexingPublisher.STREAM_KEY_PREFIX} on the producer
+     * side. The full stream key for a plan is
+     * {@code <streamKeyPrefix><planId>}.
+     *
+     * @return stream key prefix (typically {@code "pipestream:indexing:"})
+     */
+    Optional<String> streamKeyPrefix();
+
+    /**
+     * Redis stream key prefix for the per-plan dead-letter queue. The full
+     * DLQ stream for a plan is {@code <dlqKeyPrefix><planId>}; the consumer
+     * XADDs poison entries here and XACKs them on the live stream so they
+     * never redeliver.
+     *
+     * @return DLQ stream key prefix (typically {@code "pipestream:indexing-dlq:"})
+     */
+    Optional<String> dlqKeyPrefix();
+
+    /**
      * Number of virtual-thread workers draining each plan stream.
      *
      * @return workers per stream (must be &gt;= 1)
      */
-    int workersPerStream();
+    Optional<Integer> workersPerStream();
 
     /**
      * XREADGROUP COUNT — maximum messages per redis read. SHOULD equal
@@ -117,22 +119,21 @@ public interface RedisIndexingConsumerConfig {
      *
      * @return read batch size (must be &gt;= 1)
      */
-    int readBatchSize();
+    Optional<Integer> readBatchSize();
 
     /**
      * XREADGROUP BLOCK timeout in milliseconds.
      *
      * @return block duration in ms
      */
-    long readBlockMs();
+    Optional<Long> readBlockMs();
 
     /**
-     * XAUTOCLAIM idle threshold in milliseconds. Pending entries older than
-     * this become candidates for redistribution to live consumers.
+     * XAUTOCLAIM idle threshold in milliseconds.
      *
      * @return idle threshold in ms
      */
-    long pendingIdleMs();
+    Optional<Long> pendingIdleMs();
 
     /**
      * How often each worker attempts XAUTOCLAIM, in milliseconds. Should
@@ -140,24 +141,21 @@ public interface RedisIndexingConsumerConfig {
      *
      * @return claim attempt interval in ms
      */
-    long claimIntervalMs();
+    Optional<Long> claimIntervalMs();
 
     /**
-     * Per-stream in-flight bulk-batch cap. The drain loop acquires a permit
-     * before submitting a batch and releases it on completion; slow
-     * downstream OpenSearch exerts backpressure on the read side instead of
-     * growing the in-flight virtual-thread set unboundedly.
+     * Per-stream in-flight bulk-batch cap.
      *
      * @return semaphore size (must be &gt;= 1)
      */
-    int maxInFlightPerStream();
+    Optional<Integer> maxInFlightPerStream();
 
     /**
-     * MAXLEN cap on each DLQ stream. Set high — the DLQ retains failures
-     * for forensic triage and silently dropping the oldest entry defeats
-     * its purpose. This cap is a runaway-producer safety net.
+     * MAXLEN cap on each DLQ stream. Set high &mdash; the DLQ retains
+     * failures for forensic triage and silently dropping the oldest
+     * entry defeats its purpose. This cap is a runaway-producer safety net.
      *
      * @return DLQ MAXLEN cap (must be &gt;= 1)
      */
-    long dlqMaxlen();
+    Optional<Long> dlqMaxlen();
 }
