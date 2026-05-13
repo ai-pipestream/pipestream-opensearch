@@ -27,7 +27,7 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
     gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
-    gitRef = "main"
+    gitRef = "bom/engine-refactor-pr0"
 
     modules {
         // Register modules by name only - workspace mode handles cross-module imports
@@ -61,9 +61,15 @@ dependencies {
     implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-stork'
     implementation 'io.quarkus:quarkus-messaging-kafka'
+    // Redis client for the indexing stream consumer: drains
+    // pipestream:indexing:<plan_id> streams produced by opensearch-sink,
+    // dispatches to the strategy handlers, XACKs on success / XADD-to-DLQ
+    // on failure. Mirrors the redis-streams transport already used by
+    // pipestream-engine for routing edges.
+    implementation 'io.quarkus:quarkus-redis-client'
     implementation 'io.quarkus:quarkus-jdbc-postgresql'
-    implementation 'io.quarkus:quarkus-hibernate-reactive-panache'
-    implementation 'io.quarkus:quarkus-reactive-pg-client'
+    implementation 'io.quarkus:quarkus-hibernate-orm-panache'
+    implementation 'io.quarkus:quarkus-narayana-jta'
     implementation 'io.quarkus:quarkus-flyway'
     implementation 'org.flywaydb:flyway-database-postgresql'
 
@@ -100,6 +106,9 @@ dependencies {
     testImplementation 'org.testcontainers:testcontainers'
     testImplementation 'org.testcontainers:testcontainers-junit-jupiter'
     testImplementation libs.assertj.core
+    // Awaitility for async-completion assertions in tests — replaces hand-rolled
+    // CountDownLatch wait loops on the one remaining bidi-streaming gRPC test.
+    testImplementation libs.awaitility
 }
 
 // Always re-check SNAPSHOT dependencies (Gradle caches for 24h by default, causing stale artifacts in CI)
@@ -126,7 +135,7 @@ tasks.named('javadoc') {
 
 test {
     systemProperty "java.util.logging.manager", "org.jboss.logmanager.LogManager"
-    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.56"
+    systemProperty "pipestream.wiremock.image", "docker.io/pipestreamai/pipestream-wiremock-server:0.1.60"
 }
 compileJava {
     options.encoding = 'UTF-8'

@@ -1,8 +1,6 @@
 package ai.pipestream.schemamanager.indexing;
 
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -92,26 +90,111 @@ public class IndexKnnProvisioner {
     }
 
     /**
-     * Ensures the given index exists with KNN settings and that the given field
-     * has a {@code knn_vector} mapping of the given dimension. Idempotent.
-     * O(1) on a warm cache.
+     * Strict-verify variant of {@link #ensureIndex}: succeeds only if the
+     * index has already been provisioned (cache hit). Throws otherwise.
+     * NEVER touches OpenSearch. Use from hot paths (per-doc indexing) where
+     * silently creating an index would mask a missing bind-time provisioning
+     * step and add latency to every first-doc-per-(JVM, index) write.
+     *
+     * <p>Hot paths used to call {@link #ensureIndex} for safety. That made
+     * the first doc per (JVM, index) pay 2-4 cluster-state round trips, and
+     * worse, masked the case where bind-time provisioning never ran (sink would
+     * silently create indices that nothing else expects). Strict-mode here
+     * fails fast: callers see "not provisioned at bind time" with a pointer to
+     * the eager RPCs.
+     */
+    public void requireIndex(String indexName) {
+        if (!indexExistsCache.contains(indexName)) {
+            throw new IllegalStateException(
+                    "Index '" + indexName + "' was not provisioned at bind time. "
+                            + "Call BindVectorSetToIndex / AssignSemanticConfigToIndex / ProvisionIndex "
+                            + "before indexing.");
+        }
+    }
+
+    /**
+     * Strict-verify variant of {@link #ensureKnnField}: succeeds only if the
+     * (index, field, dim) triple has already been provisioned (cache hit).
+     * Throws otherwise. NEVER touches OpenSearch.
+     */
+    public void requireKnnField(String indexName, String fieldName, int dimensions) {
+        String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
+        if (!ensured.contains(cacheKey)) {
+            throw new IllegalStateException(
+                    "KNN field not provisioned at bind time: index=" + indexName
+                            + " field=" + fieldName + " dim=" + dimensions
+                            + ". Call BindVectorSetToIndex / AssignSemanticConfigToIndex first.");
+        }
+    }
+
+    /**
+     * Eagerly ensures the given index exists. If it doesn't, creates it with
+     * standard settings. Idempotent. O(1) on a warm cache.
+     *
+     * <p><b>Eager paths only.</b> Hot paths must use {@link #requireIndex}
+     * — see its javadoc for why.
+     *
+     * @param indexName target OpenSearch index name
+     * @return completion when provisioning finishes (possibly no-op when cached)
+     */
+    public void ensureIndex(String indexName) {
+        if (indexExistsCache.contains(indexName)) {
+            return;
+        }
+        provisionIndexBlocking(indexName);
+    }
+
+    private void provisionIndexBlocking(String indexName) {
+        try {
+            boolean exists;
+            try {
+                exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to check whether index exists: " + indexName, e);
+            }
+            if (!exists) {
+                LOG.infof("IndexKnnProvisioner: creating non-KNN index %s", indexName);
+                try {
+                    openSearchAsyncClient.indices().create(c -> c
+                            .index(indexName)
+                            .settings(s -> s
+                                    .numberOfShards(knnConfig.numberOfShards())
+                                    .numberOfReplicas(knnConfig.numberOfReplicas())
+                            )
+                    ).get();
+                } catch (Exception createErr) {
+                    if (!createErr.getMessage().contains("resource_already_exists_exception")) {
+                        throw createErr;
+                    }
+                }
+            }
+            indexExistsCache.add(indexName);
+        } catch (Exception e) {
+            LOG.errorf(e, "IndexKnnProvisioner: failed to ensure index %s", indexName);
+            throw new RuntimeException("Failed to provision index " + indexName, e);
+        }
+    }
+
+    /**
+     * Eagerly ensures the given index exists with KNN settings and that the
+     * given field has a {@code knn_vector} mapping of the given dimension.
+     * Idempotent. O(1) on a warm cache.
+     *
+     * <p><b>Eager paths only.</b> Hot paths must use {@link #requireKnnField}
+     * — see its javadoc.
      *
      * @param indexName  target OpenSearch index name
      * @param fieldName  KNN field name (e.g. "vector" or an embedding id)
      * @param dimensions vector dimension for the field
      * @return completion when provisioning finishes (possibly no-op when cached)
      */
-    public Uni<Void> ensureKnnField(String indexName, String fieldName, int dimensions) {
+    public void ensureKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
         if (ensured.contains(cacheKey)) {
-            return Uni.createFrom().voidItem();
+            return;
         }
-        // Off the event loop — OpenSearch client calls can block on the HTTP round trip.
-        return Uni.createFrom().item(() -> {
-            provisionBlocking(indexName, fieldName, dimensions);
-            ensured.add(cacheKey);
-            return (Void) null;
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+        provisionBlocking(indexName, fieldName, dimensions);
+        ensured.add(cacheKey);
     }
 
     private void provisionBlocking(String indexName, String fieldName, int dimensions) {
@@ -121,7 +204,7 @@ public class IndexKnnProvisioner {
                 try {
                     exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
                 } catch (Exception e) {
-                    exists = false;
+                    throw new RuntimeException("Failed to check whether index exists: " + indexName, e);
                 }
                 if (!exists) {
                     LOG.infof("IndexKnnProvisioner: creating index %s (shards=%d, replicas=%d, refresh=%s)",

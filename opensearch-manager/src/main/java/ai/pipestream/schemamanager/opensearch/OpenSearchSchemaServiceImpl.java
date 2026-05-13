@@ -2,8 +2,6 @@ package ai.pipestream.schemamanager.opensearch;
 
 import ai.pipestream.schemamanager.v1.KnnMethodDefinition;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.hc.client5.http.HttpHostConnectException;
@@ -18,17 +16,25 @@ import org.opensearch.client.opensearch._types.mapping.Property;
 import org.opensearch.client.opensearch._types.mapping.TextProperty;
 import org.opensearch.client.opensearch._types.mapping.TypeMapping;
 import org.opensearch.client.json.JsonData;
+import org.jboss.logging.Logger;
 
 import java.io.IOException;
-import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.function.Supplier;
 
 /**
  * OpenSearch schema operations for index creation and nested vector mappings.
+ * Blocking-on-VT with manual exponential-backoff retry for transient errors.
  */
 @ApplicationScoped
 public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
+
+    private static final Logger LOG = Logger.getLogger(OpenSearchSchemaServiceImpl.class);
+
+    private static final int MAX_RETRY_ATTEMPTS = 6;
+    private static final long INITIAL_BACKOFF_MS = 250L;
+    private static final long MAX_BACKOFF_MS = 3_000L;
 
     @Inject
     OpenSearchClient client;
@@ -44,32 +50,26 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
      * @return {@code true} when the nested field already exists
      */
     @Override
-    public Uni<Boolean> nestedMappingExists(String indexName, String nestedFieldName) {
-        return Uni.createFrom().item(() -> {
+    public boolean nestedMappingExists(String indexName, String nestedFieldName) {
+        return withRetry(() -> {
             try {
                 boolean exists = client.indices().exists(new ExistsRequest.Builder().index(indexName).build()).value();
                 if (!exists) {
                     return false;
                 }
-
                 var mapping = client.indices().getMapping(b -> b.index(indexName));
                 return mappingContainsNestedField(mapping, nestedFieldName);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
-        })
-        .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
-        .onFailure(this::isRetryable)
-        .retry()
-        .withBackOff(Duration.ofMillis(250), Duration.ofSeconds(3))
-        .atMost(6);
+        });
     }
 
     private boolean mappingContainsNestedField(GetMappingResponse mapping, String nestedFieldName) {
         return mapping.result().values().stream()
                 .anyMatch(indexMapping -> {
                     var properties = indexMapping.mappings().properties();
-                    return properties.containsKey(nestedFieldName) && 
+                    return properties.containsKey(nestedFieldName) &&
                            properties.get(nestedFieldName).isNested();
                 });
     }
@@ -81,8 +81,8 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
      * @return {@code true} when the index exists or is created successfully
      */
     @Override
-    public Uni<Boolean> ensurePlainIndex(String indexName) {
-        return Uni.createFrom().item(() -> {
+    public boolean ensurePlainIndex(String indexName) {
+        return withRetry(() -> {
             try {
                 if (indexExists(indexName)) {
                     return true;
@@ -101,12 +101,7 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
             } catch (IOException e) {
                 throw new RuntimeException("Failed to ensure plain index " + indexName, e);
             }
-        })
-        .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
-        .onFailure(this::isRetryable)
-        .retry()
-        .withBackOff(Duration.ofMillis(250), Duration.ofSeconds(3))
-        .atMost(6);
+        });
     }
 
     /**
@@ -118,8 +113,8 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
      * @return {@code true} when the mapping change is acknowledged
      */
     @Override
-    public Uni<Boolean> createIndexWithNestedMapping(String indexName, String nestedFieldName, VectorFieldDefinition vectorFieldDefinition) {
-        return Uni.createFrom().item(() -> {
+    public boolean createIndexWithNestedMapping(String indexName, String nestedFieldName, VectorFieldDefinition vectorFieldDefinition) {
+        return withRetry(() -> {
             try {
                 var settings = new IndexSettings.Builder().knn(true).build();
                 TypeMapping mapping = buildNestedFieldMapping(nestedFieldName, vectorFieldDefinition);
@@ -145,12 +140,36 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
                 }
                 throw new RuntimeException("Failed to create nested mapping for index " + indexName + " field " + nestedFieldName, e);
             }
-        })
-        .runSubscriptionOn(Infrastructure.getDefaultWorkerPool())
-        .onFailure(this::isRetryable)
-        .retry()
-        .withBackOff(Duration.ofMillis(250), Duration.ofSeconds(3))
-        .atMost(6);
+        });
+    }
+
+    /**
+     * Retries the supplied operation with exponential backoff on transient
+     * IO/connect failures. Non-retryable errors bubble up immediately.
+     */
+    private <T> T withRetry(Supplier<T> op) {
+        long backoff = INITIAL_BACKOFF_MS;
+        RuntimeException last = null;
+        for (int attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
+            try {
+                return op.get();
+            } catch (RuntimeException re) {
+                if (!isRetryable(re)) {
+                    throw re;
+                }
+                last = re;
+                LOG.debugf("OpenSearch op failed (attempt %d/%d): %s — backing off %d ms",
+                        attempt + 1, MAX_RETRY_ATTEMPTS, re.getMessage(), backoff);
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw re;
+                }
+                backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+            }
+        }
+        throw last;
     }
 
     private TypeMapping buildNestedFieldMapping(String nestedFieldName, VectorFieldDefinition vectorFieldDefinition) {
@@ -193,18 +212,18 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
     private KnnVectorProperty createKnnVectorProperty(VectorFieldDefinition vectorDef) {
         return KnnVectorProperty.of(knn -> {
             knn.dimension(vectorDef.getDimension());
-            
+
             if (vectorDef.hasKnnMethod()) {
                 var method = vectorDef.getKnnMethod();
                 knn.method(methodDef -> {
                     methodDef.name(getMethodName(method.getSpaceType()));
                     methodDef.engine(mapEngine(method.getEngine()));
                     methodDef.spaceType(mapSpaceType(method.getSpaceType()));
-                    
+
                     if (method.hasParameters()) {
                         var params = method.getParameters();
                         var paramsMap = new HashMap<String, JsonData>();
-                        
+
                         if (params.hasM()) {
                             paramsMap.put("m", JsonData.of(params.getM().getValue()));
                         }
@@ -218,22 +237,22 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
                             methodDef.parameters(paramsMap);
                         }
                     }
-                    
+
                     return methodDef;
                 });
             }
-            
+
             return knn;
         });
     }
-    
+
     private String mapEngine(KnnMethodDefinition.KnnEngine engine) {
         return switch (engine) {
             case KNN_ENGINE_UNSPECIFIED -> "lucene"; // Default to Lucene engine
             case UNRECOGNIZED -> "lucene";
         };
     }
-    
+
     private String mapSpaceType(KnnMethodDefinition.SpaceType spaceType) {
         return switch (spaceType) {
             case SPACE_TYPE_UNSPECIFIED -> "cosinesimil";
@@ -242,7 +261,7 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
             case UNRECOGNIZED -> "cosinesimil";
         };
     }
-    
+
     private String getMethodName(KnnMethodDefinition.SpaceType spaceType) {
         return switch (spaceType) {
             case SPACE_TYPE_UNSPECIFIED -> "hnsw";

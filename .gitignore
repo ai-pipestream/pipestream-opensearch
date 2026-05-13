@@ -322,3 +322,6 @@ build
 /.idea/
 bin/
 .dev-helpers/
+
+# Quarkus CLI plugin cache (not source)
+.quarkus/

@@ -2,42 +2,36 @@ package ai.pipestream.schemamanager.indexing;
 
 import ai.pipestream.data.v1.GranularityLevel;
 import ai.pipestream.opensearch.v1.*;
-import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
-import ai.pipestream.schemamanager.entity.EmbeddingModelConfig;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.protobuf.util.JsonFormat;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
-import io.smallrye.mutiny.Uni;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 
 /**
- * NESTED indexing strategy: stores all vector sets as nested fields (vs_*) on the parent
- * document in a single OpenSearch index. This is the original/default indexing layout.
+ * NESTED indexing strategy: stores all vector sets as nested fields ({@code vs_*})
+ * on the parent document in a single OpenSearch index.
+ *
+ * <p>Relay architecture: validate / provision schema once per batch, then
+ * hand documents to the BulkQueueSet for background draining. Blocking-on-VT.
  */
 @ApplicationScoped
 public class NestedIndexingStrategy implements IndexingStrategyHandler {
 
     private static final Logger LOG = Logger.getLogger(NestedIndexingStrategy.class);
 
-    /** CDI; dependencies are injected after construction. */
-    public NestedIndexingStrategy() {
-    }
-
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
-
-    @Inject
-    org.opensearch.client.opensearch.OpenSearchAsyncClient openSearchAsyncClient;
 
     @Inject
     ObjectMapper objectMapper;
@@ -49,34 +43,98 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
     IndexBindingCache bindingCache;
 
     @Inject
+    VectorSetRepository vectorSetRepo;
+
+    @Inject
     io.micrometer.core.instrument.MeterRegistry meterRegistry;
 
-    /**
-     * Counts every time {@link #resolveOrCreateAndBind} fires — i.e. every doc
-     * that arrived for a (index, vector_set) pair the canonical
-     * {@code OpenSearchManagerService.ProvisionIndex} flow had not pre-bound.
-     *
-     * <p>Steady-state expected value: <b>0</b> per minute. A non-zero rate
-     * means somebody is sending documents to an index whose semantic side
-     * indices were not provisioned up front, and we're paying for slow-tier
-     * DB writes + cluster-state churn on the per-document hot path. Watch
-     * this in dashboards; alert if it stays non-zero for more than a few
-     * minutes after a deploy / index rotation.
-     */
     private io.micrometer.core.instrument.Counter lazyBindFallbackCounter;
 
     @jakarta.annotation.PostConstruct
     void initMetrics() {
         this.lazyBindFallbackCounter = io.micrometer.core.instrument.Counter
                 .builder("opensearch_manager_lazy_bind_fallback_total")
-                .description("Documents that triggered the slow-tier vector-set bind+provision fallback "
-                        + "because their index was not pre-provisioned via ProvisionIndex. "
-                        + "Steady-state value should be 0/min.")
+                .description("Documents that triggered the slow-tier vector-set bind+provision fallback. Steady-state should be 0/min; non-zero means an index was not pre-provisioned.")
                 .register(meterRegistry);
     }
 
     @Override
-    public Uni<IndexDocumentResponse> indexDocument(IndexDocumentRequest request) {
+    public IndexingStrategy strategy() {
+        return IndexingStrategy.INDEXING_STRATEGY_NESTED;
+    }
+
+    @Override
+    public String resolveIndexName(String baseIndex, String chunkConfigId, String embeddingModelId) {
+        // NESTED keeps everything on the parent index — vector sets live as
+        // nested fields on the same doc.
+        return baseIndex;
+    }
+
+    @Override
+    public String resolveFieldName(String embeddingModelId) {
+        // For NESTED, the {@code embeddingModelId} parameter is overloaded to
+        // carry the VectorSet name (the binding gives one nested field per
+        // (chunker, embedder) combination). Caller passes the VectorSet name.
+        return "vs_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_");
+    }
+
+    @Override
+    public void provisionKnnField(String baseIndex, String chunkConfigId,
+                                  String embeddingModelId, int dimensions) {
+        // Eager, idempotent. createIndexWithNestedMapping creates the parent
+        // index with the nested KNN mapping if absent, or adds the nested
+        // field to an existing index. Called by the bind/assign paths before
+        // any doc flows; the runtime indexDocument path fails loud on miss.
+        String indexName = resolveIndexName(baseIndex, chunkConfigId, embeddingModelId);
+        String fieldName = resolveFieldName(embeddingModelId);
+        VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
+                .setDimension(dimensions)
+                .build();
+        openSearchSchemaClient.createIndexWithNestedMapping(indexName, fieldName, vfd);
+    }
+
+    /**
+     * Warm the {@link IndexBindingCache} entry for {@code baseIndex} and confirm
+     * every bound nested KNN field is materialised on the live OpenSearch index.
+     *
+     * <p>Steps:
+     * <ol>
+     *   <li>{@code bindingCache.getOrLoad(baseIndex)} — pulls the binding rows
+     *       once. Subsequent per-doc lookups are O(1) on the in-memory map.</li>
+     *   <li>For every {@link IndexBindingCache.VectorSetMapping} in the loaded
+     *       entry, probe {@code nestedMappingExists}. A missing field is a
+     *       contract violation — {@code IndexProvisioningEngine.provision} was
+     *       supposed to create it before the plan reached {@code READY}.</li>
+     *   <li>On confirmation, call {@link IndexBindingCache.IndexEntry#markOsFieldVerified}
+     *       so the per-doc path skips the redundant cluster-state probe in
+     *       {@code ensureSingleMapping}.</li>
+     * </ol>
+     *
+     * @param baseIndex the parent OpenSearch index name owned by a READY plan
+     * @throws IllegalStateException when any expected nested KNN field is
+     *                               missing on the live OpenSearch index
+     */
+    @Override
+    public void prewarm(String baseIndex) {
+        IndexBindingCache.IndexEntry entry = bindingCache.getOrLoad(baseIndex);
+        for (IndexBindingCache.VectorSetMapping mapping : entry.byVectorSetId().values()) {
+            String fieldName = mapping.fieldName();
+            boolean exists = openSearchSchemaClient.nestedMappingExists(baseIndex, fieldName);
+            if (!exists) {
+                throw new IllegalStateException(String.format(
+                        "NESTED prewarm failed: nested KNN field '%s' is missing on index '%s'. "
+                                + "IndexProvisioningEngine.provision must have run to READY before "
+                                + "this plan can be consumed.",
+                        fieldName, baseIndex));
+            }
+            entry.markOsFieldVerified(fieldName);
+        }
+        LOG.infof("NESTED prewarm complete: index=%s bindings=%d",
+                baseIndex, entry.byVectorSetId().size());
+    }
+
+    @Override
+    public IndexDocumentResponse indexDocument(IndexDocumentRequest request) {
         var document = request.getDocument();
         var indexName = request.getIndexName();
         var documentId = request.hasDocumentId() ? request.getDocumentId() : document.getOriginalDocId();
@@ -84,179 +142,236 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         var accountId = request.hasAccountId() ? request.getAccountId() : null;
         var datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
 
-        // Phase 1: DB operations in transaction — resolve/create VectorSets and bindings
-        return resolveVectorSetsForDocument(indexName, document, accountId, datasourceId)
-            // Phase 2: OpenSearch I/O outside transaction — ensure mappings exist, then index
-            .flatMap(vectorSetMappings -> ensureOpenSearchMappings(indexName, vectorSetMappings))
-            .flatMap(v -> {
-                try {
-                    String jsonDoc = JsonFormat.printer()
-                            .preservingProtoFieldNames()
-                            .print(document);
+        List<VectorSetMapping> mappings = resolveVectorSetsForDocument(indexName, document, accountId, datasourceId);
+        ensureOpenSearchMappings(indexName, mappings);
 
-                    // Transform: move semantic_sets embeddings into their KNN-enabled nested fields
-                    jsonDoc = transformSemanticSetsToNestedFields(jsonDoc, document);
-
-                    return indexDocumentToOpenSearch(indexName, documentId, jsonDoc, routing)
-                        .map(outcome -> {
-                            String msg;
-                            if (outcome.success()) {
-                                msg = "Document indexed successfully";
-                            } else if (outcome.failureDetail() != null && !outcome.failureDetail().isBlank()) {
-                                msg = "Failed to index document: " + outcome.failureDetail();
-                            } else {
-                                msg = "Failed to index document";
-                            }
-                            return IndexDocumentResponse.newBuilder()
-                                .setSuccess(outcome.success())
-                                .setDocumentId(documentId)
-                                .setMessage(msg)
-                                .build();
-                        });
-                } catch (IOException e) {
-                    LOG.errorf(e, "Failed to serialize or index document %s", documentId);
-                    return Uni.createFrom().item(IndexDocumentResponse.newBuilder()
-                        .setSuccess(false)
-                        .setDocumentId(documentId)
-                        .setMessage("Failed to index: " + e.getMessage())
-                        .build());
-                }
-            });
+        try {
+            String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(document);
+            Map<String, Object> finalDoc = transformSemanticSetsToNestedFieldsMap(jsonDoc, document);
+            var result = awaitBulk(bulkQueueSet.submitWithFuture(indexName, documentId, finalDoc, routing));
+            return IndexDocumentResponse.newBuilder()
+                    .setSuccess(result.success())
+                    .setDocumentId(documentId)
+                    .setMessage(result.success() ? "Document indexed successfully" : result.failureDetail())
+                    .build();
+        } catch (IOException e) {
+            LOG.errorf(e, "Serialization failed for document %s", documentId);
+            return IndexDocumentResponse.newBuilder()
+                    .setSuccess(false)
+                    .setDocumentId(documentId)
+                    .setMessage("Serialization error: " + e.getMessage())
+                    .build();
+        }
     }
 
     @Override
-    public Uni<List<StreamIndexDocumentsResponse>> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
+    public List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
-            return Uni.createFrom().item(Collections.emptyList());
+            return Collections.emptyList();
         }
 
-        // 1. Group documents by target index to ensure schema/bindings exist
         Map<String, List<StreamIndexDocumentsRequest>> byIndex = new HashMap<>();
         for (var req : batch) {
             byIndex.computeIfAbsent(req.getIndexName(), k -> new ArrayList<>()).add(req);
         }
-
-        List<Uni<Void>> schemaTasks = new ArrayList<>();
         for (var entry : byIndex.entrySet()) {
             var firstReq = entry.getValue().get(0);
-            String idx = entry.getKey();
-            String acct = firstReq.hasAccountId() ? firstReq.getAccountId() : null;
-            String ds = firstReq.hasDatasourceId() ? firstReq.getDatasourceId() : null;
-            schemaTasks.add(
-                resolveVectorSetsForDocument(idx, firstReq.getDocument(), acct, ds)
-                    .flatMap(mappings -> ensureOpenSearchMappings(idx, mappings)));
+            List<VectorSetMapping> mappings = resolveVectorSetsForDocument(
+                    entry.getKey(), firstReq.getDocument(),
+                    firstReq.getAccountId(), firstReq.getDatasourceId());
+            ensureOpenSearchMappings(entry.getKey(), mappings);
         }
-
-        return Uni.combine().all().unis(schemaTasks).discardItems()
-            .flatMap(v -> indexDocumentsIndividuallyFallback(batch));
+        return enqueueDocuments(batch);
     }
 
-    private Uni<List<StreamIndexDocumentsResponse>> indexDocumentsIndividuallyFallback(List<StreamIndexDocumentsRequest> batch) {
-        List<Uni<StreamIndexDocumentsResponse>> tasks = batch.stream().map(req -> {
+    /**
+     * Submit every request in the batch to the bulk queue, then wait once for
+     * all submissions to complete. Returns responses aligned with input order.
+     *
+     * <p><b>Why this shape matters.</b> The naive form &mdash; submit, await,
+     * submit, await &mdash; serialises a "bulk" batch into one bulk-flush window
+     * per document, because {@link ai.pipestream.schemamanager.bulk.BulkQueueSetBean#submitWithFuture}
+     * returns a future that only completes when the next flush actually fires.
+     * With a 500&nbsp;ms flush interval a 100-doc batch would take ~50&nbsp;s
+     * minimum. The correct shape is to submit every future first so they all
+     * ride a single flush window, then block once on
+     * {@link CompletableFuture#allOf(CompletableFuture[])}.
+     *
+     * <p>Failures are partitioned into two kinds:
+     * <ul>
+     *   <li><b>Conversion errors</b> (protobuf-to-JSON or semantic-set
+     *       transform) surface inline during stage&nbsp;1 and never reach the
+     *       bulk queue; their response slot is filled immediately.</li>
+     *   <li><b>Bulk-queue failures</b> surface after stage&nbsp;2 as a failed
+     *       per-item future and are reported as {@code success=false} with the
+     *       cause message in stage&nbsp;3.</li>
+     * </ul>
+     *
+     * <p>If the calling thread is interrupted while waiting on
+     * {@link CompletableFuture#allOf(CompletableFuture[])}, the interrupt flag
+     * is restored and every still-pending response is marked as
+     * "Interrupted awaiting bulk submission". Futures that had already
+     * completed are reported with their actual outcome.
+     *
+     * @param batch input requests, all assumed to target the same OpenSearch
+     *              index (the caller groups by index before calling this).
+     * @return one {@link StreamIndexDocumentsResponse} per input, in input order.
+     */
+    private List<StreamIndexDocumentsResponse> enqueueDocuments(List<StreamIndexDocumentsRequest> batch) {
+        StreamIndexDocumentsResponse[] slotted = new StreamIndexDocumentsResponse[batch.size()];
+        List<PendingSubmission> pending = new ArrayList<>(batch.size());
+
+        // Stage 1: build the doc map and submit a bulk future for every
+        // request. No blocking calls in this loop &mdash; submitWithFuture
+        // returns immediately and the future completes when the bulk queue's
+        // next flush fires. Conversion errors short-circuit into the response
+        // slot directly so we don't queue work that can't proceed.
+        for (int i = 0; i < batch.size(); i++) {
+            StreamIndexDocumentsRequest req = batch.get(i);
+            String requestId = req.getRequestId();
+            String indexName = req.getIndexName();
+            String docId = req.hasDocumentId() ? req.getDocumentId() : req.getDocument().getOriginalDocId();
+            String routing = req.hasRouting() ? req.getRouting() : null;
             try {
                 String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(req.getDocument());
-                jsonDoc = transformSemanticSetsToNestedFields(jsonDoc, req.getDocument());
-                String docId = req.hasDocumentId() ? req.getDocumentId() : req.getDocument().getOriginalDocId();
-                return indexDocumentToOpenSearch(req.getIndexName(), docId, jsonDoc, req.hasRouting() ? req.getRouting() : null)
-                    .map(outcome -> {
-                        String msg;
-                        if (outcome.success()) {
-                            msg = "Indexed via REST";
-                        } else if (outcome.failureDetail() != null && !outcome.failureDetail().isBlank()) {
-                            msg = "REST index failed: " + outcome.failureDetail();
-                        } else {
-                            msg = "REST index failed";
-                        }
-                        return StreamIndexDocumentsResponse.newBuilder()
-                            .setRequestId(req.getRequestId())
-                            .setDocumentId(docId)
-                            .setSuccess(outcome.success())
-                            .setMessage(msg)
-                            .build();
-                    });
+                Map<String, Object> finalDoc = transformSemanticSetsToNestedFieldsMap(jsonDoc, req.getDocument());
+                CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future =
+                        bulkQueueSet.submitWithFuture(indexName, docId, finalDoc, routing);
+                pending.add(new PendingSubmission(i, requestId, docId, future));
             } catch (IOException e) {
-                return Uni.createFrom().item(StreamIndexDocumentsResponse.newBuilder()
-                    .setRequestId(req.getRequestId())
-                    .setSuccess(false)
-                    .setMessage("Serialization error: " + e.getMessage())
-                    .build());
+                slotted[i] = StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(requestId)
+                        .setDocumentId(docId)
+                        .setSuccess(false)
+                        .setMessage("Conversion error: " + e.getMessage())
+                        .build();
             }
-        }).toList();
-
-        if (tasks.isEmpty()) {
-            return Uni.createFrom().item(Collections.emptyList());
         }
 
-        return Uni.join().all(tasks).andCollectFailures();
+        // Stage 2: block once on every submitted future. One flush window
+        // services the entire batch; the wall-time cost is bounded by the
+        // bulk-queue's flush interval, not by N &times; flush interval.
+        boolean batchInterrupted = false;
+        if (!pending.isEmpty()) {
+            CompletableFuture<?>[] all = new CompletableFuture<?>[pending.size()];
+            for (int i = 0; i < pending.size(); i++) {
+                all[i] = pending.get(i).future();
+            }
+            try {
+                CompletableFuture.allOf(all).get();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                batchInterrupted = true;
+            } catch (ExecutionException ee) {
+                // allOf signals only that at least one future completed
+                // exceptionally; the per-future loop below inspects each
+                // individual outcome and reports it on its response slot.
+            }
+        }
+
+        // Stage 3: build response slots in submission order. Futures are
+        // already complete unless the await was interrupted before they
+        // resolved, in which case the slot reports the interrupt rather than
+        // blocking again.
+        for (PendingSubmission p : pending) {
+            StreamIndexDocumentsResponse.Builder rsp = StreamIndexDocumentsResponse.newBuilder()
+                    .setRequestId(p.requestId())
+                    .setDocumentId(p.docId());
+            if (batchInterrupted && !p.future().isDone()) {
+                rsp.setSuccess(false).setMessage("Interrupted awaiting bulk submission");
+            } else {
+                try {
+                    ai.pipestream.schemamanager.bulk.BulkItemResult result = p.future().get();
+                    rsp.setSuccess(result.success())
+                            .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail());
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    rsp.setSuccess(false).setMessage("Interrupted awaiting bulk submission");
+                } catch (ExecutionException ee) {
+                    Throwable cause = ee.getCause();
+                    rsp.setSuccess(false).setMessage("Bulk queue failure: "
+                            + (cause != null ? cause.getMessage() : ee.getMessage()));
+                }
+            }
+            slotted[p.index()] = rsp.build();
+        }
+        return Arrays.asList(slotted);
     }
 
     /**
-     * Transforms the serialized document JSON so that semantic vector embeddings are placed
-     * under their corresponding KNN-enabled nested field names (vs_{semanticId}) instead of
-     * the generic semantic_sets array.
+     * One submitted bulk item awaiting its flush-window completion. Carries
+     * the original request slot index so stage&nbsp;3 can place the response
+     * back in input order, plus the request/document identifiers needed to
+     * build the response.
      */
-    String transformSemanticSetsToNestedFields(String jsonDoc, OpenSearchDocument document) {
+    private record PendingSubmission(
+            int index,
+            String requestId,
+            String docId,
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future) {
+    }
+
+    private static ai.pipestream.schemamanager.bulk.BulkItemResult awaitBulk(
+            java.util.concurrent.CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future) {
         try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> docMap = objectMapper.readValue(jsonDoc, Map.class);
-
-            // Sanitize analytics: remove punctuation_counts maps
-            sanitizePunctuationCounts(docMap);
-
-            if (document.getSemanticSetsCount() == 0) {
-                return objectMapper.writeValueAsString(docMap);
-            }
-
-            // Remove the raw semantic_sets array
-            Object semanticSetsRaw = docMap.remove("semantic_sets");
-
-            for (SemanticVectorSet vset : document.getSemanticSetsList()) {
-                String semanticId = String.format("%s_%s_%s",
-                        vset.getSourceFieldName(), vset.getChunkConfigId(), vset.getEmbeddingId())
-                        .replaceAll("[^a-zA-Z0-9_]", "_");
-                String fieldName = (vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank())
-                        ? vset.getNestedFieldName()
-                        : "vs_" + semanticId;
-
-                List<Map<String, Object>> nestedDocs = new ArrayList<>();
-                for (OpenSearchEmbedding embedding : vset.getEmbeddingsList()) {
-                    Map<String, Object> nestedDoc = new LinkedHashMap<>();
-                    nestedDoc.put("vector", embedding.getVectorList());
-                    nestedDoc.put("source_text", embedding.getSourceText());
-                    nestedDoc.put("chunk_config_id", vset.getChunkConfigId());
-                    nestedDoc.put("embedding_id", vset.getEmbeddingId());
-                    nestedDoc.put("is_primary", embedding.getIsPrimary());
-                    if (embedding.hasChunkAnalytics()) {
-                        try {
-                            String analyticsJson = JsonFormat.printer().print(embedding.getChunkAnalytics());
-                            @SuppressWarnings("unchecked")
-                            Map<String, Object> analyticsMap = objectMapper.readValue(analyticsJson, Map.class);
-                            analyticsMap.remove("punctuationCounts");
-                            analyticsMap.remove("punctuation_counts");
-                            nestedDoc.put("chunk_analytics", analyticsMap);
-                        } catch (Exception e) {
-                            LOG.warnf("Failed to serialize chunk_analytics for embedding in %s: %s",
-                                    fieldName, e.getMessage());
-                        }
-                    }
-                    nestedDocs.add(nestedDoc);
-                }
-
-                if (!nestedDocs.isEmpty()) {
-                    docMap.put(fieldName, nestedDocs);
-                }
-            }
-
-            return objectMapper.writeValueAsString(docMap);
-        } catch (Exception e) {
-            LOG.warnf("Failed to transform semantic_sets to nested fields, indexing with original structure: %s", e.getMessage());
-            return jsonDoc;
+            return future.get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted awaiting bulk submission", ie);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            throw cause instanceof RuntimeException re
+                    ? re
+                    : new RuntimeException("Bulk submit failed", cause);
         }
     }
 
-    /**
-     * Removes punctuation_counts maps from analytics objects in the document.
-     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> transformSemanticSetsToNestedFieldsMap(String jsonDoc, OpenSearchDocument document) throws IOException {
+        Map<String, Object> docMap = objectMapper.readValue(jsonDoc, Map.class);
+        sanitizePunctuationCounts(docMap);
+
+        if (document.getSemanticSetsCount() == 0) {
+            return docMap;
+        }
+
+        docMap.remove("semantic_sets");
+
+        for (SemanticVectorSet vset : document.getSemanticSetsList()) {
+            String semanticId = String.format("%s_%s_%s",
+                    vset.getSourceFieldName(), vset.getChunkConfigId(), vset.getEmbeddingId())
+                    .replaceAll("[^a-zA-Z0-9_]", "_");
+            String fieldName = (vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank())
+                    ? vset.getNestedFieldName()
+                    : "vs_" + semanticId;
+
+            List<Map<String, Object>> nestedDocs = new ArrayList<>();
+            for (OpenSearchEmbedding embedding : vset.getEmbeddingsList()) {
+                Map<String, Object> nestedDoc = new LinkedHashMap<>();
+                nestedDoc.put("vector", embedding.getVectorList());
+                nestedDoc.put("source_text", embedding.getSourceText());
+                nestedDoc.put("chunk_config_id", vset.getChunkConfigId());
+                nestedDoc.put("embedding_id", vset.getEmbeddingId());
+                nestedDoc.put("is_primary", embedding.getIsPrimary());
+
+                if (embedding.hasChunkAnalytics()) {
+                    String analyticsJson = JsonFormat.printer().print(embedding.getChunkAnalytics());
+                    Map<String, Object> analyticsMap = objectMapper.readValue(analyticsJson, Map.class);
+                    analyticsMap.remove("punctuationCounts");
+                    analyticsMap.remove("punctuation_counts");
+                    nestedDoc.put("chunk_analytics", analyticsMap);
+                }
+                nestedDocs.add(nestedDoc);
+            }
+
+            if (!nestedDocs.isEmpty()) {
+                docMap.put(fieldName, nestedDocs);
+            }
+        }
+
+        return docMap;
+    }
+
     @SuppressWarnings("unchecked")
     void sanitizePunctuationCounts(Map<String, Object> docMap) {
         Object sfaRaw = docMap.get("source_field_analytics");
@@ -274,15 +389,6 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
-    /**
-     * Reverses the write-path transform: scans the raw OpenSearch source for vs_* nested fields
-     * and reconstructs SemanticVectorSet objects on the OpenSearchDocument builder.
-     * <p>
-     * Public because the read path (GetOpenSearchDocument) needs to call this.
-     *
-     * @param sourceMap  raw OpenSearch document source as a generic map
-     * @param docBuilder  protobuf builder receiving reconstructed semantic sets
-     */
     @SuppressWarnings("unchecked")
     public void reconstructSemanticSets(Map<String, Object> sourceMap, OpenSearchDocument.Builder docBuilder) {
         for (Map.Entry<String, Object> entry : sourceMap.entrySet()) {
@@ -295,7 +401,6 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
             SemanticVectorSet.Builder vsetBuilder = SemanticVectorSet.newBuilder()
                     .setNestedFieldName(key);
 
-            String semanticId = key.substring(3); // strip "vs_"
             if (!nestedDocs.isEmpty()) {
                 Map<String, Object> first = nestedDocs.get(0);
                 if (first.containsKey("chunk_config_id")) {
@@ -340,87 +445,31 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
-    // ===== Phase 1: cache-first binding resolution =====
-
-    /**
-     * Phase 1: Resolve every {@link SemanticVectorSet} on the inbound document
-     * to a ({@code fieldName}, {@code dimensions}) pair.
-     *
-     * <p><b>Two-tier resolution</b></p>
-     * <ol>
-     *   <li><b>Fast tier</b> (steady state): {@link IndexBindingCache} returns
-     *       the mapping with no DB call. After the first doc per index loads
-     *       the cache, every subsequent doc resolves in pure CPU. This is the
-     *       100%-of-traffic path once
-     *       {@code SemanticConfigService.AssignSemanticConfigToIndex} has been
-     *       called — see {@code SemanticConfigServiceEngine} javadoc.</li>
-     *   <li><b>Slow tier</b> (cold start / unprovisioned doc): on cache miss,
-     *       fall through to {@link #resolveOrCreateAndBind} which runs the
-     *       legacy "find or create vector set + create index binding" logic
-     *       inside a transaction, then invalidates the cache for that index
-     *       so the next miss reloads the freshly-bound state. Slow path runs
-     *       at most once per (index, vector_set) pair before steady state.</li>
-     * </ol>
-     *
-     * <p>The slow tier preserves the contract for callers that hand in
-     * ad-hoc vector sets (without first calling AssignToIndex) — no
-     * regression on existing crawls. The fast tier delivers the perf win:
-     * the per-doc DB lookups + INSERT-ON-CONFLICT against
-     * {@code vector_set_index_binding} that drove p99 IndexDocument latency
-     * past 700 seconds disappear.
-     *
-     * <p>The {@code accountId}/{@code datasourceId} parameters are still
-     * recorded on the binding row by the slow path but no longer consulted
-     * by the hot path.
-     *
-     * @param indexName    target OpenSearch index
-     * @param document     inbound document containing semantic vector sets
-     * @param accountId    account id used when the slow path creates bindings
-     * @param datasourceId datasource id used when the slow path creates bindings
-     * @return resolved nested field names and dimensions for each semantic set
-     */
-    protected Uni<List<VectorSetMapping>> resolveVectorSetsForDocument(
+    protected List<VectorSetMapping> resolveVectorSetsForDocument(
             String indexName, OpenSearchDocument document, String accountId, String datasourceId) {
         if (document.getSemanticSetsCount() == 0) {
-            return Uni.createFrom().item(Collections.emptyList());
+            return Collections.emptyList();
         }
-
-        return bindingCache.getOrLoad(indexName).flatMap(entry -> {
-            List<VectorSetMapping> mappings = new ArrayList<>(document.getSemanticSetsCount());
-            Uni<Void> chain = Uni.createFrom().voidItem();
-            for (SemanticVectorSet vset : document.getSemanticSetsList()) {
-                final SemanticVectorSet capturedVset = vset;
-                IndexBindingCache.VectorSetMapping cached = lookupInEntry(entry, capturedVset);
-                if (cached != null) {
-                    String nested = (capturedVset.hasNestedFieldName()
-                            && !capturedVset.getNestedFieldName().isBlank())
-                            ? capturedVset.getNestedFieldName()
-                            : cached.fieldName();
-                    mappings.add(new VectorSetMapping(nested, cached.dimensions()));
-                    continue;
-                }
-                // Cache miss: fall through to slow tier (creates if needed,
-                // invalidates the cache so the next access reloads).
-                chain = chain.flatMap(v -> resolveOrCreateAndBind(
-                        indexName, capturedVset, accountId, datasourceId)
-                        .invoke(resolved -> {
-                            String nested = (capturedVset.hasNestedFieldName()
-                                    && !capturedVset.getNestedFieldName().isBlank())
-                                    ? capturedVset.getNestedFieldName()
-                                    : resolved.fieldName;
-                            mappings.add(new VectorSetMapping(nested, resolved.vectorDimensions));
-                        })
-                        .replaceWithVoid());
+        IndexBindingCache.IndexEntry entry = bindingCache.getOrLoad(indexName);
+        List<VectorSetMapping> mappings = new ArrayList<>(document.getSemanticSetsCount());
+        for (SemanticVectorSet vset : document.getSemanticSetsList()) {
+            IndexBindingCache.VectorSetMapping cached = lookupInEntry(entry, vset);
+            if (cached != null) {
+                String nested = (vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank())
+                        ? vset.getNestedFieldName()
+                        : cached.fieldName();
+                mappings.add(new VectorSetMapping(nested, cached.dimensions()));
+                continue;
             }
-            return chain.replaceWith(mappings);
-        });
+            VectorSetEntity resolved = resolveOrCreateAndBind(indexName, vset, accountId, datasourceId);
+            String nested = (vset.hasNestedFieldName() && !vset.getNestedFieldName().isBlank())
+                    ? vset.getNestedFieldName()
+                    : resolved.fieldName;
+            mappings.add(new VectorSetMapping(nested, resolved.vectorDimensions));
+        }
+        return mappings;
     }
 
-    /**
-     * Look up a {@link SemanticVectorSet} in a loaded
-     * {@link IndexBindingCache.IndexEntry}. Returns {@code null} on miss —
-     * caller decides whether to fall through to the slow tier or fail.
-     */
     private IndexBindingCache.VectorSetMapping lookupInEntry(
             IndexBindingCache.IndexEntry entry, SemanticVectorSet vset) {
         if (vset.hasVectorSetId() && !vset.getVectorSetId().isBlank()) {
@@ -438,252 +487,90 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         return entry.byName().get(name);
     }
 
-    /**
-     * Slow-tier fallback: resolve or create the {@link VectorSetEntity} +
-     * upsert its binding row, then invalidate the cache for {@code indexName}
-     * so subsequent docs see the freshly-written state. Runs in a transaction.
-     *
-     * <p>This path is the legacy hot-path code, demoted to a fallback. It only
-     * fires on cache misses — typically only on cold start or for the first
-     * doc per (index, vector_set) combination. Steady-state traffic never
-     * touches this method.
-     *
-     * @param indexName    OpenSearch index receiving the document
-     * @param vset         semantic vector set from the inbound document
-     * @param accountId    account id recorded on new bindings
-     * @param datasourceId datasource id recorded on new bindings
-     * @return persisted vector set entity after resolve/create and bind
-     */
-    @WithTransaction
-    protected Uni<VectorSetEntity> resolveOrCreateAndBind(
+    @Transactional
+    protected VectorSetEntity resolveOrCreateAndBind(
             String indexName, SemanticVectorSet vset, String accountId, String datasourceId) {
-        // Hot path observability: every entry into this method is a missed
-        // pre-provisioning opportunity. Tag with index so dashboards can pin
-        // the offending crawl/test/admin flow that's bypassing ProvisionIndex.
         lazyBindFallbackCounter.increment();
-        LOG.warnf("Lazy vector-set bind fallback fired for index=%s vector_set_id=%s semantic_config=%s — "
-                        + "this index should have been pre-provisioned via OpenSearchManagerService.ProvisionIndex. "
-                        + "Continuing with slow-tier resolve+bind+provision; subsequent docs to the same index will be fast.",
-                indexName,
-                vset.hasVectorSetId() ? vset.getVectorSetId() : "(none)",
-                vset.hasSemanticConfigId() ? vset.getSemanticConfigId() : "(none)");
-        Uni<VectorSetEntity> resolveVs;
+        VectorSetEntity resolved;
         if (vset.hasVectorSetId() && !vset.getVectorSetId().isBlank()) {
-            resolveVs = VectorSetEntity.<VectorSetEntity>findById(vset.getVectorSetId())
-                    .onItem().ifNull().failWith(() -> new IllegalStateException(
-                            "SemanticVectorSet references unknown vector_set_id: " + vset.getVectorSetId()));
+            resolved = vectorSetRepo.findById(vset.getVectorSetId());
+            if (resolved == null) {
+                throw new IllegalStateException("Unknown vector_set_id: " + vset.getVectorSetId());
+            }
         } else if (vset.hasSemanticConfigId() && !vset.getSemanticConfigId().isBlank()
                 && vset.hasGranularity()
                 && vset.getGranularity() != GranularityLevel.GRANULARITY_LEVEL_UNSPECIFIED) {
             String granStr = vset.getGranularity().name().replace("GRANULARITY_LEVEL_", "");
-            resolveVs = VectorSetEntity.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr)
-                    .onItem().ifNull().failWith(() -> new IllegalStateException(String.format(
-                            "No VectorSet for semantic_config=%s granularity=%s — provision via "
-                                    + "SemanticConfigService before indexing.",
-                            vset.getSemanticConfigId(), granStr)));
+            resolved = vectorSetRepo.findBySemanticConfigAndGranularity(vset.getSemanticConfigId(), granStr);
+            if (resolved == null) {
+                throw new IllegalStateException(String.format(
+                        "No VectorSet for semantic_config=%s granularity=%s",
+                        vset.getSemanticConfigId(), granStr));
+            }
         } else {
             String semanticId = String.format("%s_%s_%s",
                     vset.getSourceFieldName(), vset.getChunkConfigId(), vset.getEmbeddingId())
                     .replaceAll("[^a-zA-Z0-9_]", "_");
-            resolveVs = resolveOrCreateVectorSet(semanticId, vset);
+            resolved = resolveOrCreateVectorSet(semanticId, vset);
         }
-        return resolveVs
-                .flatMap(vs -> {
-                    if (vs.id != null && vs.id.startsWith("transient-")) {
-                        return Uni.createFrom().item(vs);
-                    }
-                    return ensureIndexBinding(indexName, vs, accountId, datasourceId).replaceWith(vs);
-                })
-                .invoke(vs -> bindingCache.invalidate(indexName));
+        // STRICT — bindings must exist by the time a doc reaches this path.
+        // CreateVectorSet (with index_name) and BindVectorSetToIndex are the
+        // only ways to insert a binding row, and both run at config-save time.
+        // We do NOT lazy-insert here. If the binding row is missing the doc
+        // will fail loudly downstream when no VectorSetIndexBinding matches.
+        bindingCache.invalidate(indexName);
+        return resolved;
     }
 
-    // ===== Phase 2: OpenSearch I/O =====
-
-    /**
-     * Phase 2 (OpenSearch I/O): Ensure nested KNN mappings exist.
-     *
-     * <p>Fast path: every mapping that the {@link IndexBindingCache} entry has
-     * already marked verified short-circuits with no OpenSearch call. This is
-     * the steady-state behaviour because
-     * {@code SemanticConfigServiceEngine.assignToIndex} provisions all
-     * mappings up front and the first doc to use each (index, field) marks it
-     * verified for the rest of the JVM's life.
-     *
-     * <p>Slow path (cold cache or a brand-new field): the unverified mappings
-     * are checked + created in parallel via {@code Uni.combine().all()}; the
-     * old serial {@code flatMap} chain forced N sequential cluster-state round
-     * trips per doc.
-     */
-    private Uni<Void> ensureOpenSearchMappings(String indexName, List<VectorSetMapping> mappings) {
+    private void ensureOpenSearchMappings(String indexName, List<VectorSetMapping> mappings) {
         if (mappings.isEmpty()) {
-            return Uni.createFrom().voidItem();
+            return;
         }
-        return bindingCache.getOrLoad(indexName).flatMap(entry -> {
-            List<Uni<Void>> tasks = new ArrayList<>(mappings.size());
-            for (VectorSetMapping m : mappings) {
-                if (entry.isOsFieldVerified(m.fieldName())) {
-                    continue;
-                }
-                tasks.add(ensureSingleMapping(indexName, m, entry));
+        IndexBindingCache.IndexEntry entry = bindingCache.getOrLoad(indexName);
+        for (VectorSetMapping m : mappings) {
+            if (entry.isOsFieldVerified(m.fieldName())) {
+                continue;
             }
-            if (tasks.isEmpty()) {
-                return Uni.createFrom().voidItem();
-            }
-            return Uni.combine().all().unis(tasks).discardItems().replaceWithVoid();
-        });
+            ensureSingleMapping(indexName, m, entry);
+        }
     }
 
-    private Uni<Void> ensureSingleMapping(
+    private void ensureSingleMapping(
             String indexName, VectorSetMapping m, IndexBindingCache.IndexEntry entry) {
-        return openSearchSchemaClient.nestedMappingExists(indexName, m.fieldName())
-                .flatMap(exists -> {
-                    if (exists) {
-                        entry.markOsFieldVerified(m.fieldName());
-                        return Uni.createFrom().voidItem();
-                    }
-                    VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
-                            .setDimension(m.dimensions())
-                            .build();
-                    return openSearchSchemaClient.createIndexWithNestedMapping(indexName, m.fieldName(), vfd)
-                            .invoke(() -> entry.markOsFieldVerified(m.fieldName()))
-                            .replaceWithVoid();
-                });
-    }
-
-    // ===== Internal records =====
-
-    record VectorSetMapping(String fieldName, int dimensions) {}
-
-    record BulkIndexOutcome(boolean success, String failureDetail) {
-        static BulkIndexOutcome ok() {
-            return new BulkIndexOutcome(true, null);
+        // STRICT — runtime indexing is lookup-only. The nested KNN field MUST
+        // already exist; eager creation belongs at config-save time
+        // (BindVectorSetToIndex / AssignSemanticConfigToIndex). A missing field
+        // here means the caller activated a graph (or sent a doc) before
+        // binding the vector set, and we want that mistake loud rather than
+        // papered over with a per-doc round-trip-to-create.
+        boolean exists = openSearchSchemaClient.nestedMappingExists(indexName, m.fieldName());
+        if (exists) {
+            entry.markOsFieldVerified(m.fieldName());
+            return;
         }
+        throw new IllegalStateException(
+                "Nested KNN field not provisioned at bind time: index=" + indexName
+                        + " field=" + m.fieldName()
+                        + ". Call BindVectorSetToIndex / AssignSemanticConfigToIndex"
+                        + " before sending docs.");
     }
 
-    // ===== Slow-tier DB helpers (cache-miss fallback only) =====
-
-    private Uni<VectorSetEntity> resolveOrCreateVectorSet(String semanticId, SemanticVectorSet vset) {
-        return VectorSetEntity.findByName(semanticId)
-            .onItem().transformToUni(existing -> {
-                if (existing != null) {
-                    return Uni.createFrom().item(existing);
-                }
-                return resolveChunkerConfig(vset.getChunkConfigId())
-                    .onItem().transformToUni(cc -> resolveEmbeddingConfig(vset.getEmbeddingId())
-                        .onItem().transformToUni(emc -> {
-                            VectorSetEntity entity = new VectorSetEntity();
-                            entity.id = java.util.UUID.randomUUID().toString();
-                            entity.name = semanticId;
-                            entity.chunkerConfig = cc;
-                            entity.embeddingModelConfig = emc;
-                            entity.fieldName = "vs_" + semanticId;
-                            entity.resultSetName = "default";
-                            entity.sourceCel = vset.getSourceFieldName();
-                            entity.vectorDimensions = emc.dimensions;
-                            entity.provenance = "SEMANTIC_INDEXING";
-                            return entity.<VectorSetEntity>persist().replaceWith(entity);
-                        })
-                    )
-                    .onFailure().recoverWithUni(err -> {
-                        if (isConstraintViolation(err)) {
-                            LOG.infof("VectorSet '%s' created by concurrent request — re-fetching", semanticId);
-                            return VectorSetEntity.findByName(semanticId);
-                        }
-                        LOG.errorf(err, "VectorSet resolution failed for '%s' — chunker or embedding config not found in DB.",
-                                semanticId);
-                        return Uni.createFrom().failure(err);
-                    });
-            });
+    record VectorSetMapping(String fieldName, int dimensions) {
     }
 
-    private Uni<ChunkerConfigEntity> resolveChunkerConfig(String configId) {
-        return ChunkerConfigEntity.<ChunkerConfigEntity>findById(configId)
-            .onItem().transformToUni(found -> {
-                if (found != null) return Uni.createFrom().item(found);
-                return ChunkerConfigEntity.findByName(configId)
-                    .onItem().transformToUni(byName -> {
-                        if (byName != null) return Uni.createFrom().item(byName);
-                        return ChunkerConfigEntity.findByConfigId(configId)
-                            .onItem().transformToUni(byConfigId -> byConfigId != null
-                                    ? Uni.createFrom().item(byConfigId)
-                                    : Uni.createFrom().failure(new IllegalStateException(
-                                            "Chunker config not found: " + configId)));
-                    });
-            });
-    }
-
-    private Uni<EmbeddingModelConfig> resolveEmbeddingConfig(String configId) {
-        return EmbeddingModelConfig.<EmbeddingModelConfig>findById(configId)
-            .onItem().transformToUni(found -> {
-                if (found != null) return Uni.createFrom().item(found);
-                return EmbeddingModelConfig.findByName(configId)
-                    .onItem().transformToUni(byName -> byName != null
-                            ? Uni.createFrom().item(byName)
-                            : Uni.createFrom().failure(new IllegalStateException(
-                                    "Embedding model config not found: " + configId)));
-            });
-    }
-
-    private Uni<Void> ensureIndexBinding(String indexName, VectorSetEntity vs, String accountId, String datasourceId) {
-        String id = java.util.UUID.nameUUIDFromBytes(
-                (vs.id + "|" + indexName).getBytes(java.nio.charset.StandardCharsets.UTF_8)).toString();
-        String sql = "INSERT INTO vector_set_index_binding "
-                + "(id, vector_set_id, index_name, account_id, datasource_id, status, created_at, updated_at) "
-                + "VALUES (?1, ?2, ?3, ?4, ?5, ?6, now(), now()) "
-                + "ON CONFLICT ON CONSTRAINT unique_vs_index_binding DO NOTHING";
-        return Panache.getSession()
-                .flatMap(session -> session.flush().replaceWith(session))
-                .flatMap(session -> session.createNativeQuery(sql)
-                        .setParameter(1, id)
-                        .setParameter(2, vs.id)
-                        .setParameter(3, indexName)
-                        .setParameter(4, accountId != null ? accountId : "")
-                        .setParameter(5, datasourceId != null ? datasourceId : "")
-                        .setParameter(6, "ACTIVE")
-                        .executeUpdate()
-                        .invoke(rowCount -> {
-                            if (rowCount > 0) {
-                                LOG.infof("Created index binding (slow-tier fallback): vectorSet=%s index=%s",
-                                        vs.id, indexName);
-                            }
-                        })
-                        .replaceWithVoid());
-    }
-
-    private static boolean isConstraintViolation(Throwable t) {
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint")
-                    || msg.contains("duplicate key"))) {
-                return true;
-            }
-            t = t.getCause();
+    private VectorSetEntity resolveOrCreateVectorSet(String semanticId, SemanticVectorSet vset) {
+        // STRICT — VectorSets must be created via CreateVectorSet before any
+        // doc references them. Lazy create at write time was cheap on SQLite
+        // and absurdly expensive on Postgres-under-load. Method name kept for
+        // caller ergonomics; "OrCreate" is now a hard error.
+        VectorSetEntity vs = vectorSetRepo.findByName(semanticId);
+        if (vs == null) {
+            throw new IllegalStateException(
+                    "VectorSet '" + semanticId + "' not found. Call CreateVectorSet "
+                            + "(chunker=" + vset.getChunkConfigId()
+                            + ", embedder=" + vset.getEmbeddingId()
+                            + ") and BindVectorSetToIndex before indexing.");
         }
-        return false;
+        return vs;
     }
-
-    // ===== OpenSearch REST indexing =====
-
-    private Uni<BulkIndexOutcome> indexDocumentToOpenSearch(String indexName, String documentId, String jsonDoc, String routing) {
-        return indexDocumentToOpenSearchViaRest(indexName, documentId, jsonDoc, routing);
-    }
-
-    private Uni<BulkIndexOutcome> indexDocumentToOpenSearchViaRest(String indexName, String documentId, String jsonDoc, String routing) {
-        Map<String, Object> docMap;
-        try {
-            docMap = objectMapper.readValue(jsonDoc, new TypeReference<>() {});
-        } catch (IOException e) {
-            return Uni.createFrom().item(new BulkIndexOutcome(false, "JSON parse: " + e.getMessage()));
-        }
-
-        return Uni.createFrom().completionStage(
-                bulkQueueSet.submitWithFuture(indexName, documentId, docMap, routing)
-        ).map(result -> {
-            if (result.success()) {
-                return BulkIndexOutcome.ok();
-            }
-            return new BulkIndexOutcome(false, result.failureDetail());
-        });
-    }
-
 }

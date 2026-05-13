@@ -4,14 +4,20 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.v1.EnsureNestedEmbeddingsFieldExistsRequest;
 import ai.pipestream.schemamanager.v1.KnnMethodDefinition;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
+import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcClient;
 import io.quarkus.test.junit.QuarkusTest;
-import io.smallrye.mutiny.Multi;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.time.Duration;
+import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
@@ -22,10 +28,10 @@ import static org.junit.jupiter.api.Assertions.*;
 class SchemaManagerServiceTest {
 
     @GrpcClient
-    MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub openSearchManagerService;
+    OpenSearchManagerServiceGrpc.OpenSearchManagerServiceBlockingStub openSearchManagerService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingConfigClient;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingConfigClient;
 
     @Test
     void testEnsureNestedEmbeddingsFieldExists() {
@@ -46,7 +52,7 @@ class SchemaManagerServiceTest {
 
         // Execute the request
         var response = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request)
-                .await().indefinitely();
+                ;
 
         // Verify response
         assertThat("Response should not be null", response, notNullValue());
@@ -76,9 +82,9 @@ class SchemaManagerServiceTest {
 
         // Execute the request twice
         var response1 = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request)
-                .await().indefinitely();
+                ;
         var response2 = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request)
-                .await().indefinitely();
+                ;
 
         // Verify both responses are successful
         assertNotNull(response1);
@@ -117,19 +123,19 @@ class SchemaManagerServiceTest {
                 .build();
 
         var response384 = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request384)
-                .await().indefinitely();
+                ;
         assertNotNull(response384);
         assertThat(response384.getSchemaExisted(), is(false));
 
         var response768 = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request768)
-                .await().indefinitely();
+                ;
         assertNotNull(response768);
         assertThat(response768.getSchemaExisted(), is(false));
 
         var response384Again = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request384)
-                .await().indefinitely();
+                ;
         var response768Again = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request768)
-                .await().indefinitely();
+                ;
 
         assertNotNull(response384Again);
         assertNotNull(response768Again);
@@ -149,7 +155,7 @@ class SchemaManagerServiceTest {
                         .setModelIdentifier("test/model")
                         .setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
         String configId = createConfigResp.getConfig().getId();
 
         embeddingConfigClient.createIndexEmbeddingBinding(
@@ -158,7 +164,7 @@ class SchemaManagerServiceTest {
                         .setEmbeddingModelConfigId(configId)
                         .setFieldName(fieldName)
                         .build()
-        ).await().indefinitely();
+        );
 
         // Call without vector_field_definition - should resolve from binding
         var request = EnsureNestedEmbeddingsFieldExistsRequest.newBuilder()
@@ -167,7 +173,7 @@ class SchemaManagerServiceTest {
                 .build();
 
         var response = openSearchManagerService.ensureNestedEmbeddingsFieldExists(request)
-                .await().indefinitely();
+                ;
 
         assertNotNull(response);
         assertThat("Schema should be created", response.getSchemaExisted(), is(false));
@@ -177,6 +183,10 @@ class SchemaManagerServiceTest {
         void testStreamIndexDocuments() {
         String indexName = "test-stream-" + UUID.randomUUID();
 
+        // Stream-index test exercises the nested-on-parent path (uses
+        // .setDocument(...), not .setDocumentMap(...)). Pin the strategy
+        // explicitly — UNSPECIFIED now defaults to CHUNK_COMBINED which
+        // requires document_map and would fail this shape.
         StreamIndexDocumentsRequest req1 = StreamIndexDocumentsRequest.newBuilder()
                 .setRequestId("req-1")
                 .setIndexName(indexName)
@@ -184,6 +194,7 @@ class SchemaManagerServiceTest {
                         .setOriginalDocId("doc-1")
                         .setTitle("Stream Doc 1")
                         .build())
+                .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                 .build();
 
         StreamIndexDocumentsRequest req2 = StreamIndexDocumentsRequest.newBuilder()
@@ -193,15 +204,48 @@ class SchemaManagerServiceTest {
                         .setOriginalDocId("doc-2")
                         .setTitle("Stream Doc 2")
                         .build())
+                .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                 .build();
 
-        List<StreamIndexDocumentsResponse> responses = openSearchManagerService.streamIndexDocuments(Multi.createFrom().items(req1, req2))
-                .collect().asList().await().indefinitely();
+        // Bidi-streaming RPC — blocking stubs don't support it, so use the
+        // async stub with the plain gRPC StreamObserver pattern. Awaitility
+        // polls until either the server signals completion or fails. No
+        // Mutiny, no CountDownLatch, no .await().indefinitely() — a hang at
+        // this site times out in 30s and surfaces a real test failure.
+        List<StreamIndexDocumentsResponse> responses = new CopyOnWriteArrayList<>();
+        AtomicBoolean completed = new AtomicBoolean(false);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
 
-        assertNotNull(responses);
-        assertThat("Should have 2 responses", responses.size(), is(2));
-        assertThat("First response should be success", responses.get(0).getSuccess(), is(true));
-        assertThat("Second response should be success", responses.get(1).getSuccess(), is(true));
-        assertThat("Ids should match", responses.get(0).getRequestId(), anyOf(is("req-1"), is("req-2")));
+        // Build the async stub from the blocking stub's channel — Quarkus
+        // @GrpcClient won't inject plain async stubs (only blocking, Mutiny,
+        // or io.grpc.Channel), but every gRPC stub exposes its channel.
+        OpenSearchManagerServiceGrpc.OpenSearchManagerServiceStub asyncStub =
+                OpenSearchManagerServiceGrpc.newStub(openSearchManagerService.getChannel());
+
+        StreamObserver<StreamIndexDocumentsRequest> requestStream = asyncStub.streamIndexDocuments(
+                new StreamObserver<>() {
+                    @Override public void onNext(StreamIndexDocumentsResponse value) { responses.add(value); }
+                    @Override public void onError(Throwable t) { failure.set(t); completed.set(true); }
+                    @Override public void onCompleted() { completed.set(true); }
+                });
+        requestStream.onNext(req1);
+        requestStream.onNext(req2);
+        requestStream.onCompleted();
+
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofMillis(50))
+                .until(completed::get);
+
+        if (failure.get() != null) {
+            throw new AssertionError("streamIndexDocuments failed", failure.get());
+        }
+
+        List<StreamIndexDocumentsResponse> snapshot = Collections.unmodifiableList(responses);
+        assertNotNull(snapshot);
+        assertThat("Should have 2 responses", snapshot.size(), is(2));
+        assertThat("First response should be success", snapshot.get(0).getSuccess(), is(true));
+        assertThat("Second response should be success", snapshot.get(1).getSuccess(), is(true));
+        assertThat("Ids should match", snapshot.get(0).getRequestId(), anyOf(is("req-1"), is("req-2")));
         }
         }
