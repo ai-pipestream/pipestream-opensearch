@@ -99,4 +99,32 @@ public interface IndexingStrategyHandler {
      * @return one response per request, aligned with input order
      */
     List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch);
+
+    // ---------- Hot-path warmup (called at consumer startup) ----------
+
+    /**
+     * Pre-populate every per-JVM cache this strategy uses for {@code baseIndex},
+     * so the runtime hot path can resolve mappings without DB reads or
+     * OpenSearch cluster-state round trips.
+     *
+     * <p>Called by the redis indexing consumer at startup, once per
+     * {@code READY} plan, AFTER {@code IndexProvisioningEngine.provision} has
+     * already created the parent index, every side index, every KNN field,
+     * and inserted the binding rows. Implementations are entitled to assume
+     * those artefacts exist; the prewarm just teaches the in-JVM caches what
+     * the cluster already shows on disk.
+     *
+     * <p>Implementations MUST throw on any inconsistency they detect (missing
+     * KNN field, dimension mismatch, missing binding row) — the prewarm is
+     * the early-failure boundary that prevents a misconfigured plan from
+     * silently slow-pathing through DB and cluster-state lookups under load.
+     *
+     * <p>Default implementation is a no-op for strategies that maintain no
+     * private cache. Strategies that DO maintain private caches override
+     * this and warm them.
+     *
+     * @param baseIndex the OpenSearch base index name owned by a READY plan
+     */
+    default void prewarm(String baseIndex) {
+    }
 }

@@ -93,6 +93,46 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         openSearchSchemaClient.createIndexWithNestedMapping(indexName, fieldName, vfd);
     }
 
+    /**
+     * Warm the {@link IndexBindingCache} entry for {@code baseIndex} and confirm
+     * every bound nested KNN field is materialised on the live OpenSearch index.
+     *
+     * <p>Steps:
+     * <ol>
+     *   <li>{@code bindingCache.getOrLoad(baseIndex)} — pulls the binding rows
+     *       once. Subsequent per-doc lookups are O(1) on the in-memory map.</li>
+     *   <li>For every {@link IndexBindingCache.VectorSetMapping} in the loaded
+     *       entry, probe {@code nestedMappingExists}. A missing field is a
+     *       contract violation — {@code IndexProvisioningEngine.provision} was
+     *       supposed to create it before the plan reached {@code READY}.</li>
+     *   <li>On confirmation, call {@link IndexBindingCache.IndexEntry#markOsFieldVerified}
+     *       so the per-doc path skips the redundant cluster-state probe in
+     *       {@code ensureSingleMapping}.</li>
+     * </ol>
+     *
+     * @param baseIndex the parent OpenSearch index name owned by a READY plan
+     * @throws IllegalStateException when any expected nested KNN field is
+     *                               missing on the live OpenSearch index
+     */
+    @Override
+    public void prewarm(String baseIndex) {
+        IndexBindingCache.IndexEntry entry = bindingCache.getOrLoad(baseIndex);
+        for (IndexBindingCache.VectorSetMapping mapping : entry.byVectorSetId().values()) {
+            String fieldName = mapping.fieldName();
+            boolean exists = openSearchSchemaClient.nestedMappingExists(baseIndex, fieldName);
+            if (!exists) {
+                throw new IllegalStateException(String.format(
+                        "NESTED prewarm failed: nested KNN field '%s' is missing on index '%s'. "
+                                + "IndexProvisioningEngine.provision must have run to READY before "
+                                + "this plan can be consumed.",
+                        fieldName, baseIndex));
+            }
+            entry.markOsFieldVerified(fieldName);
+        }
+        LOG.infof("NESTED prewarm complete: index=%s bindings=%d",
+                baseIndex, entry.byVectorSetId().size());
+    }
+
     @Override
     public IndexDocumentResponse indexDocument(IndexDocumentRequest request) {
         var document = request.getDocument();

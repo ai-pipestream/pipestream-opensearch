@@ -61,6 +61,12 @@ dependencies {
     implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-stork'
     implementation 'io.quarkus:quarkus-messaging-kafka'
+    // Redis client for the indexing stream consumer: drains
+    // pipestream:indexing:<plan_id> streams produced by opensearch-sink,
+    // dispatches to the strategy handlers, XACKs on success / XADD-to-DLQ
+    // on failure. Mirrors the redis-streams transport already used by
+    // pipestream-engine for routing edges.
+    implementation 'io.quarkus:quarkus-redis-client'
     implementation 'io.quarkus:quarkus-jdbc-postgresql'
     implementation 'io.quarkus:quarkus-hibernate-orm-panache'
     implementation 'io.quarkus:quarkus-narayana-jta'

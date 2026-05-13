@@ -38,6 +38,9 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
     @Inject
     ai.pipestream.schemamanager.bulk.BulkQueueSetBean bulkQueueSet;
 
+    @Inject
+    ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository bindingRepo;
+
     @Override
     public IndexingStrategy strategy() {
         return IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES;
@@ -60,6 +63,64 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
                                   String embeddingModelId, int dimensions) {
         String indexName = resolveIndexName(baseIndex, chunkConfigId, embeddingModelId);
         indexKnnProvisioner.ensureKnnField(indexName, resolveFieldName(embeddingModelId), dimensions);
+    }
+
+    /**
+     * Pre-populate every cache the per-doc hot path consults for {@code baseIndex}.
+     *
+     * <p>Steps, in order:
+     * <ol>
+     *   <li>{@link IndexKnnProvisioner#ensureIndex} on {@code baseIndex} so the
+     *       parent metadata index is in the provisioner's
+     *       {@code indexExistsCache}. The per-doc path's
+     *       {@link IndexKnnProvisioner#requireIndex} call is O(1) afterward.</li>
+     *   <li>For every {@code (vector_set, index)} binding row whose
+     *       {@code indexName} equals {@code baseIndex}: derive the canonical
+     *       {@link VectorSetIndexingKey} and call
+     *       {@link IndexKnnProvisioner#ensureKnnField} on the per-(chunker,
+     *       embedder) side index ({@code <baseIndex>--vs--<chunker>--<embedder>})
+     *       using the canonical field name {@code "vector"}. SEPARATE_INDICES
+     *       places exactly one KNN field per side index.</li>
+     * </ol>
+     *
+     * <p>A binding whose VectorSet has no {@code chunkerConfig} is a contract
+     * violation: SEPARATE_INDICES side indices are keyed on the chunker, so
+     * a chunker-less VectorSet has no valid side-index name. Prewarm rejects
+     * it.
+     *
+     * @param baseIndex parent OpenSearch index name owned by a READY plan
+     * @throws IllegalStateException when {@code baseIndex} is missing from
+     *                               OpenSearch, when a binding's VectorSet
+     *                               has no chunker, or when a side-index
+     *                               KNN field cannot be ensured
+     */
+    @Override
+    public void prewarm(String baseIndex) {
+        indexKnnProvisioner.ensureIndex(baseIndex);
+
+        var bindings = bindingRepo.findAllByIndexNames(java.util.List.of(baseIndex));
+        int warmed = 0;
+        for (var binding : bindings) {
+            var vs = binding.vectorSet;
+            if (vs == null) {
+                LOG.warnf("Skipping prewarm of binding %s on '%s': null vectorSet (data corruption)",
+                        binding.id, baseIndex);
+                continue;
+            }
+            if (vs.chunkerConfig == null) {
+                throw new IllegalStateException(String.format(
+                        "SEPARATE_INDICES prewarm: VectorSet '%s' bound to index '%s' has no "
+                                + "chunkerConfig. This strategy requires a chunker on every "
+                                + "VectorSet because the side index name is keyed on the chunker.",
+                        vs.id, baseIndex));
+            }
+            VectorSetIndexingKey key = VectorSetIndexingKey.of(vs);
+            String vsIndex = resolveIndexName(baseIndex, key.chunkConfigId(), key.embeddingModelId());
+            indexKnnProvisioner.ensureKnnField(vsIndex, resolveFieldName(key.embeddingModelId()), key.dimensions());
+            warmed++;
+        }
+        LOG.infof("SEPARATE_INDICES prewarm complete: base=%s bindings=%d warmed=%d",
+                baseIndex, bindings.size(), warmed);
     }
 
     @Override

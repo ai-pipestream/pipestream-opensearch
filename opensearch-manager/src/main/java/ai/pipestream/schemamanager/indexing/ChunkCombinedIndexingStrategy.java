@@ -57,6 +57,103 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         indexKnnProvisioner.ensureKnnField(indexName, fieldName, dimensions);
     }
 
+    /**
+     * Pre-populate every cache the per-doc hot path consults for {@code baseIndex}.
+     *
+     * <p>Steps, in order:
+     * <ol>
+     *   <li>Mark {@code baseIndex} as ensured in {@link #ensuredBaseIndices} after
+     *       confirming OpenSearch carries it. The hot path's
+     *       {@code ensureBaseIndex} guard then short-circuits without a
+     *       cluster-state round trip on the first doc.</li>
+     *   <li>For every {@code (vector_set, index)} binding row whose
+     *       {@code indexName} equals {@code baseIndex}: derive the canonical
+     *       {@link VectorSetIndexingKey} from the linked {@link ai.pipestream.schemamanager.entity.VectorSetEntity},
+     *       call {@link IndexKnnProvisioner#ensureKnnField} on the chunk side
+     *       index ({@code <baseIndex>--chunk--<chunker>}) using the per-embedder
+     *       {@code em_<embedder>} field name. {@code ensureKnnField} is idempotent
+     *       and populates the provisioner's per-JVM cache so the hot path's
+     *       {@link IndexKnnProvisioner#requireKnnField} call is O(1) afterward.</li>
+     * </ol>
+     *
+     * <p>A binding whose VectorSet has no {@code chunkerConfig} is a contract
+     * violation for this strategy — CHUNK_COMBINED side indices are keyed on
+     * the chunker, so an unchunked VectorSet has no valid side index name —
+     * and prewarm rejects it. NESTED tolerates chunker-less VectorSets in its
+     * own override; this strategy does not.
+     *
+     * @param baseIndex parent OpenSearch index name owned by a READY plan
+     * @throws IllegalStateException when {@code baseIndex} is missing from
+     *                               OpenSearch, when any binding's VectorSet
+     *                               has no chunker, or when a KNN field
+     *                               cannot be ensured
+     */
+    @Override
+    public void prewarm(String baseIndex) {
+        verifyBaseIndexExists(baseIndex);
+        ensuredBaseIndices.add(baseIndex);
+
+        var bindings = bindingRepo.findAllByIndexNames(java.util.List.of(baseIndex));
+        int warmed = 0;
+        for (var binding : bindings) {
+            var vs = binding.vectorSet;
+            if (vs == null) {
+                LOG.warnf("Skipping prewarm of binding %s on '%s': null vectorSet (data corruption)",
+                        binding.id, baseIndex);
+                continue;
+            }
+            if (vs.chunkerConfig == null) {
+                throw new IllegalStateException(String.format(
+                        "CHUNK_COMBINED prewarm: VectorSet '%s' bound to index '%s' has no "
+                                + "chunkerConfig. This strategy requires a chunker on every "
+                                + "VectorSet because the side index name is keyed on the chunker.",
+                        vs.id, baseIndex));
+            }
+            VectorSetIndexingKey key = VectorSetIndexingKey.of(vs);
+            String chunkIndex = resolveIndexName(baseIndex, key.chunkConfigId(), key.embeddingModelId());
+            String emField = resolveFieldName(key.embeddingModelId());
+            indexKnnProvisioner.ensureKnnField(chunkIndex, emField, key.dimensions());
+            ensuredFields.add(chunkIndex + "|" + emField);
+            warmed++;
+        }
+        LOG.infof("CHUNK_COMBINED prewarm complete: base=%s bindings=%d warmed=%d",
+                baseIndex, bindings.size(), warmed);
+    }
+
+    /**
+     * Probe OpenSearch for {@code baseIndex} and throw if it is missing.
+     * Idempotent on the {@link #ensuredBaseIndices} cache: every successful
+     * call adds {@code baseIndex} so a redundant probe never fires twice in
+     * a JVM lifetime.
+     */
+    private void verifyBaseIndexExists(String baseIndex) {
+        if (ensuredBaseIndices.contains(baseIndex)) {
+            return;
+        }
+        boolean exists;
+        try {
+            exists = openSearchAsyncClient.indices().exists(e -> e.index(baseIndex)).get().value();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted probing base index existence", ie);
+        } catch (java.util.concurrent.ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            throw new RuntimeException(
+                    "OpenSearch exists() failed for base index '" + baseIndex + "'",
+                    cause != null ? cause : ee);
+        } catch (java.io.IOException ioe) {
+            throw new RuntimeException(
+                    "OpenSearch transport I/O error probing base index '" + baseIndex + "'", ioe);
+        }
+        if (!exists) {
+            throw new IllegalStateException(String.format(
+                    "CHUNK_COMBINED prewarm: base index '%s' does not exist on OpenSearch. "
+                            + "IndexProvisioningEngine.provision must run to READY before "
+                            + "this plan can be consumed.",
+                    baseIndex));
+        }
+    }
+
     @Inject
     OpenSearchSchemaService openSearchSchemaClient;
 
@@ -74,6 +171,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     @Inject
     IndexKnnProvisioner indexKnnProvisioner;
+
+    @Inject
+    ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository bindingRepo;
 
     /**
      * When false (default), {@code nlp_analysis.sentences} is stripped from the
