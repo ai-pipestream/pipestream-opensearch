@@ -121,16 +121,29 @@ public class BindingCachePrewarmer {
     }
 
     /**
-     * Resolve a plan's wire-name strategy string (e.g. {@code "NESTED"}) to the
-     * proto enum value. Returns {@code null} when the string does not match
-     * any enum value; the caller surfaces that as a skipped plan rather
-     * than crashing the whole prewarm walk.
+     * Resolve a plan's wire-name strategy string to the proto enum value.
+     *
+     * <p>Tolerates BOTH wire-name forms produced by upstream callers:
+     * <ul>
+     *   <li>{@code "NESTED"} &mdash; short form ({@link IndexProlong} on the
+     *       admin UI; the legacy {@code IndexPlanServiceEngine} normalised
+     *       to this when writing).</li>
+     *   <li>{@code "INDEXING_STRATEGY_NESTED"} &mdash; full enum-name form
+     *       (used by newer write paths that mirror the proto enum
+     *       verbatim). This is what real production rows look like in
+     *       {@code IndexPlanEntity.indexingStrategy} as of 2026-05-13.</li>
+     * </ul>
+     *
+     * <p>Returns {@code null} when the string does not match any enum
+     * value; the caller surfaces that as a skipped plan rather than
+     * crashing the whole prewarm walk.
      */
     static IndexingStrategy parseStrategy(IndexPlanEntity plan) {
         if (plan.indexingStrategy == null || plan.indexingStrategy.isBlank()) {
             return null;
         }
-        String enumName = "INDEXING_STRATEGY_" + plan.indexingStrategy.trim().toUpperCase();
+        String raw = plan.indexingStrategy.trim().toUpperCase();
+        String enumName = raw.startsWith("INDEXING_STRATEGY_") ? raw : "INDEXING_STRATEGY_" + raw;
         try {
             return IndexingStrategy.valueOf(enumName);
         } catch (IllegalArgumentException unknown) {
