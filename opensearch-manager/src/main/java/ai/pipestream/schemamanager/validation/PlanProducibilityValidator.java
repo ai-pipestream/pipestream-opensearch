@@ -471,11 +471,28 @@ public class PlanProducibilityValidator {
      * {@link #repositoryLookup()}; tests pass a mocked variant.
      */
     public interface Lookup {
-        /** Resolves a plan by id. Returns {@code null} when missing. */
+        /**
+         * Resolves a plan by id. Returns {@code null} when missing.
+         *
+         * @param planId plan id
+         * @return matching plan or null
+         */
         IndexPlanEntity findPlan(String planId);
-        /** Returns ordered membership rows for a plan (possibly empty). */
+
+        /**
+         * Returns ordered membership rows for a plan (possibly empty).
+         *
+         * @param planId plan id
+         * @return membership rows
+         */
         List<IndexPlanVectorSetEntity> findPlanMembership(String planId);
-        /** Resolves a vector set by id. Returns {@code null} when missing. */
+
+        /**
+         * Resolves a vector set by id. Returns {@code null} when missing.
+         *
+         * @param vectorSetId vector set id
+         * @return matching vector set or null
+         */
         VectorSetEntity findVectorSet(String vectorSetId);
     }
 

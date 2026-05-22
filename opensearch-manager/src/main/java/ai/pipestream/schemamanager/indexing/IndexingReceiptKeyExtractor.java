@@ -28,6 +28,10 @@ import java.util.UUID;
 @ApplicationScoped
 public class IndexingReceiptKeyExtractor implements UuidKeyExtractor<DocumentIndexedEvent> {
 
+    /** Default constructor. */
+    public IndexingReceiptKeyExtractor() {
+    }
+
     @Override
     public UUID extractKey(DocumentIndexedEvent event) {
         String docId = event.getDocId();

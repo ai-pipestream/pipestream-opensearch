@@ -28,6 +28,10 @@ import java.util.concurrent.ExecutionException;
 @ApplicationScoped
 public class NestedIndexingStrategy implements IndexingStrategyHandler {
 
+    /** Default constructor. */
+    public NestedIndexingStrategy() {
+    }
+
     private static final Logger LOG = Logger.getLogger(NestedIndexingStrategy.class);
 
     @Inject
@@ -389,6 +393,12 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
+    /**
+     * Reconstructs semantic sets from a raw source map into the document builder.
+     *
+     * @param sourceMap  raw document map from OpenSearch
+     * @param docBuilder builder to populate with semantic sets
+     */
     @SuppressWarnings("unchecked")
     public void reconstructSemanticSets(Map<String, Object> sourceMap, OpenSearchDocument.Builder docBuilder) {
         for (Map.Entry<String, Object> entry : sourceMap.entrySet()) {
@@ -445,6 +455,15 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         }
     }
 
+    /**
+     * Resolves vector sets for a document, using the cache if possible.
+     *
+     * @param indexName    target index
+     * @param document     document being indexed
+     * @param accountId    account id
+     * @param datasourceId datasource id
+     * @return list of resolved mappings
+     */
     protected List<VectorSetMapping> resolveVectorSetsForDocument(
             String indexName, OpenSearchDocument document, String accountId, String datasourceId) {
         if (document.getSemanticSetsCount() == 0) {
@@ -487,6 +506,15 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
         return entry.byName().get(name);
     }
 
+    /**
+     * Resolves or creates a vector set and binds it to the index.
+     *
+     * @param indexName    target index
+     * @param vset         semantic vector set from the document
+     * @param accountId    account id
+     * @param datasourceId datasource id
+     * @return resolved entity
+     */
     @Transactional
     protected VectorSetEntity resolveOrCreateAndBind(
             String indexName, SemanticVectorSet vset, String accountId, String datasourceId) {

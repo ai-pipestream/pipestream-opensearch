@@ -14,6 +14,10 @@ import java.util.List;
 @ApplicationScoped
 public class SemanticConfigRepository implements PanacheRepositoryBase<SemanticConfigEntity, String> {
 
+    /** Default constructor. */
+    public SemanticConfigRepository() {
+    }
+
     /**
      * Finds a semantic config by its unique name.
      *

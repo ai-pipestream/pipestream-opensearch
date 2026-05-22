@@ -4,7 +4,7 @@ import ai.pipestream.apicurio.registry.protobuf.ProtobufChannel;
 import ai.pipestream.apicurio.registry.protobuf.ProtobufEmitter;
 import ai.pipestream.repository.v1.DocumentIndexedEvent;
 import ai.pipestream.repository.v1.IndexingOutcome;
-import ai.pipestream.schemamanager.indexing.redis.IndexingRequestDecoder;
+import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
 import com.google.protobuf.Timestamp;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -42,11 +42,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *       sees a single wait for the slowest send, not N serial waits.</li>
  * </ul>
  *
- * <p>The redis indexing consumer's {@code IndexingBatchProcessor} uses
- * {@link #appendReceipt} to build receipts as it walks bulk outcomes,
- * then calls {@link #emitAll} once per redis batch. The attempt id minter
- * lives here too so both paths produce ids drawn from the same monotonic
- * counter.
+ * <p>The attempts id minter lives here too so both paths produce ids drawn
+ * from the same monotonic counter.
  *
  * <h2>attempt_id minting</h2>
  *
@@ -56,18 +53,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * monotonically-incremented sequence breaks ties inside a millisecond. The
  * monotonic guarantee is what the repository-service UPSERT relies on; the
  * "real ULID" representation is a future enhancement (backlog).
- *
- * <h2>Failure handling</h2>
- *
- * <p>{@link #emit} and {@link #emitAll} propagate the first underlying
- * send failure as a {@link RuntimeException}. Callers driving the redis
- * indexing consumer's pipeline MUST NOT XACK the owning redis batch in
- * that case; the redis PEL retains the entries and XAUTOCLAIM redelivers
- * them later. The repository ledger's monotonic-{@code attempt_id} UPSERT
- * keeps the redelivery safe.
  */
 @ApplicationScoped
 public class IndexingReceiptEmitter {
+
+    /** Default constructor. */
+    public IndexingReceiptEmitter() {
+    }
 
     private static final Logger LOG = Logger.getLogger(IndexingReceiptEmitter.class);
 
@@ -112,8 +104,7 @@ public class IndexingReceiptEmitter {
      *
      * @param receipts receipts to publish
      * @throws RuntimeException when any send fails or the wait is
-     *                          interrupted; the caller MUST NOT XACK the
-     *                          owning redis batch in that case
+     *                          interrupted
      */
     public void emitAll(List<DocumentIndexedEvent> receipts) {
         if (receipts.isEmpty()) {
@@ -140,14 +131,9 @@ public class IndexingReceiptEmitter {
      * Build a receipt for one decoded request + bulk outcome and append it
      * to {@code batchOut}. Pure CPU; no side effects. The actual Kafka send
      * happens later in {@link #emitAll}.
-     *
-     * @param request          the decoded redis entry this receipt describes
-     * @param outcome          proto outcome mapped from the bulk classifier
-     * @param failureReason    human-readable failure summary; {@code ""} for SUCCESS
-     * @param deliveryCount    redis PEL delivery count at outcome materialization
-     * @param batchOut         output list to append the new receipt to
      */
-    public void appendReceipt(IndexingRequestDecoder.DecodedRequest request,
+    public void appendReceipt(StreamIndexDocumentsRequest request,
+                              String planId,
                               IndexingOutcome outcome,
                               String failureReason,
                               int deliveryCount,
@@ -158,20 +144,20 @@ public class IndexingReceiptEmitter {
                 .setNanos(now.getNano())
                 .build();
         DocumentIndexedEvent.Builder b = DocumentIndexedEvent.newBuilder()
-                .setDocId(request.docId())
-                .setAccountId(request.accountId())
-                .setPlanId(request.planId())
-                .setIndexName(request.indexName())
+                .setDocId(request.getDocumentId())
+                .setAccountId(request.getAccountId())
+                .setPlanId(planId)
+                .setIndexName(request.getIndexName())
                 .setOutcome(outcome)
                 .setFailureReason(failureReason == null ? "" : failureReason)
                 .setAttemptId(mintAttemptId())
                 .setDeliveryCount(deliveryCount)
                 .setEmittedAt(emittedAt);
-        if (request.crawlId() != null && !request.crawlId().isEmpty()) {
-            b.setCrawlId(request.crawlId());
+        if (request.hasDocument() && !request.getDocument().getCrawlId().isEmpty()) {
+            b.setCrawlId(request.getDocument().getCrawlId());
         }
-        if (request.request().hasDatasourceId()) {
-            b.setDatasourceId(request.request().getDatasourceId());
+        if (request.hasDatasourceId() && !request.getDatasourceId().isEmpty()) {
+            b.setDatasourceId(request.getDatasourceId());
         }
         batchOut.add(b.build());
     }

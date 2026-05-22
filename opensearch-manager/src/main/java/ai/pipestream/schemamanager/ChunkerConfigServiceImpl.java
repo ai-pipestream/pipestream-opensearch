@@ -92,6 +92,12 @@ public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerCo
         }
     }
 
+    /**
+     * Persist a new chunker config row.
+     *
+     * @param request creation request
+     * @return persisted entity
+     */
     @Transactional
     protected ChunkerConfigEntity persistNew(CreateChunkerConfigRequest request) {
         String id = request.hasId() && !request.getId().isBlank()
@@ -150,6 +156,12 @@ public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerCo
         }
     }
 
+    /**
+     * Apply updates to an existing chunker config.
+     *
+     * @param request update request
+     * @return update result with previous and current state
+     */
     @Transactional
     protected UpdateResult applyUpdate(UpdateChunkerConfigRequest request) {
         ChunkerConfigEntity entity = chunkerRepo.findById(request.getId());
@@ -190,6 +202,12 @@ public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerCo
         }
     }
 
+    /**
+     * Delete a chunker config if not in use.
+     *
+     * @param request delete request
+     * @return outcome with success flag and optional message
+     */
     @Transactional
     protected DeleteOutcome applyDelete(DeleteChunkerConfigRequest request) {
         ChunkerConfigEntity entity = chunkerRepo.findById(request.getId());

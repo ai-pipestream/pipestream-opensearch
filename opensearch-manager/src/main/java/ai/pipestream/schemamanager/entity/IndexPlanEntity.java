@@ -21,7 +21,7 @@ import java.time.LocalDateTime;
  *
  * <p>Membership is intentionally NOT navigated through a JPA association.
  * Reactive Hibernate's lazy fetch behavior under Mutiny is fragile; callers
- * read membership via {@link IndexPlanVectorSetEntity#findByPlanIdOrdered}
+ * read membership via {@link ai.pipestream.schemamanager.repository.IndexPlanVectorSetRepository#findByPlanIdOrdered}
  * in the same Panache session.
  */
 @Entity
@@ -30,8 +30,11 @@ import java.time.LocalDateTime;
 })
 public class IndexPlanEntity extends PanacheEntityBase {
 
+    /** Pending status &mdash; index not yet provisioned. */
     public static final String STATUS_PENDING = "PENDING";
+    /** Ready status &mdash; index provisioned and accepting documents. */
     public static final String STATUS_READY   = "READY";
+    /** Failed status &mdash; provisioning failed; check {@link #lastError}. */
     public static final String STATUS_FAILED  = "FAILED";
 
     /** JPA persistence constructor. */
@@ -61,53 +64,68 @@ public class IndexPlanEntity extends PanacheEntityBase {
 
     // --- HNSW knobs. Null = use manager server-side default. ---
 
+    /** Lucene HNSW engine (e.g. "lucene"). */
     @Column(name = "hnsw_engine")
     public String hnswEngine;
 
+    /** HNSW method name (e.g. "hnsw"). */
     @Column(name = "hnsw_method_name")
     public String hnswMethodName;
 
+    /** HNSW space type (e.g. "l2", "cosinesimil"). */
     @Column(name = "hnsw_space_type")
     public String hnswSpaceType;
 
+    /** HNSW M parameter (number of neighbors). */
     @Column(name = "hnsw_m")
     public Integer hnswM;
 
+    /** HNSW ef_construction parameter (build-time accuracy). */
     @Column(name = "hnsw_ef_construction")
     public Integer hnswEfConstruction;
 
+    /** HNSW ef_search parameter (search-time accuracy). */
     @Column(name = "hnsw_ef_search")
     public Integer hnswEfSearch;
 
     // --- Index-level settings. Null = use manager server-side default. ---
 
+    /** Number of shards for the index. */
     @Column(name = "number_of_shards")
     public Integer numberOfShards;
 
+    /** Number of replicas for the index. */
     @Column(name = "number_of_replicas")
     public Integer numberOfReplicas;
 
+    /** OpenSearch refresh interval (e.g. "1s"). */
     @Column(name = "refresh_interval")
     public String refreshInterval;
 
+    /** Whether KNN is enabled on this index. */
     @Column(name = "knn_enabled")
     public Boolean knnEnabled;
 
     // --- Description + lifecycle ---
 
+    /** Optional description. */
     @Column(name = "description", columnDefinition = "TEXT")
     public String description;
 
+    /** Current lifecycle status (PENDING, READY, FAILED). */
     @Column(name = "status", nullable = false)
     public String status;
 
+    /** Last error message if status is FAILED. */
     @Column(name = "last_error", columnDefinition = "TEXT")
     public String lastError;
 
+    /** Row creation timestamp. */
     @CreationTimestamp
     @Column(name = "created_at", nullable = false)
     public LocalDateTime createdAt;
 
+    /** Row update timestamp. */
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     public LocalDateTime updatedAt;

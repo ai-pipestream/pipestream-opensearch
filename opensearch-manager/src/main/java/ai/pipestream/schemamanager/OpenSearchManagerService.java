@@ -59,8 +59,8 @@ public class OpenSearchManagerService extends OpenSearchManagerServiceGrpc.OpenS
      * Master switch for the bidirectional {@code streamIndexDocuments} RPC.
      * <p>The bidi path is the legacy entry into OSM indexing &mdash; the
      * sink originally called it directly before
-     * {@link ai.pipestream.schemamanager.indexing.redis.RedisIndexingConsumer}
-     * shipped. With the redis path now in place, this flag gates whether
+     * {@link ai.pipestream.schemamanager.indexing.kafka.KafkaIndexingConsumer}
+     * shipped. With the kafka path now in place, this flag gates whether
      * the bidi RPC remains available. Default is {@code true} so existing
      * callers (the bidi-streaming RPC test, ad-hoc admin tools) keep
      * working; flipping it to {@code false} is the operator's call once

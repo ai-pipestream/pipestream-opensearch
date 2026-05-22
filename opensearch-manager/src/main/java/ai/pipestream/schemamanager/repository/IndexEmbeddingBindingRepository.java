@@ -13,6 +13,10 @@ import java.util.List;
 @ApplicationScoped
 public class IndexEmbeddingBindingRepository implements PanacheRepositoryBase<IndexEmbeddingBinding, String> {
 
+    /** Default constructor. */
+    public IndexEmbeddingBindingRepository() {
+    }
+
     /**
      * Lists all embedding bindings for an index.
      *

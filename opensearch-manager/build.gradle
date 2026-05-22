@@ -26,7 +26,7 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 // Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
-    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
+    gitRepo = "/work/worktrees/pipestream-protos-pr0"
     gitRef = "bom/engine-refactor-pr0"
 
     modules {
@@ -61,12 +61,15 @@ dependencies {
     implementation 'io.quarkus:quarkus-micrometer-registry-prometheus'
     implementation 'io.quarkus:quarkus-smallrye-stork'
     implementation 'io.quarkus:quarkus-messaging-kafka'
-    // Redis client for the indexing stream consumer: drains
-    // pipestream:indexing:<plan_id> streams produced by opensearch-sink,
-    // dispatches to the strategy handlers, XACKs on success / XADD-to-DLQ
-    // on failure. Mirrors the redis-streams transport already used by
-    // pipestream-engine for routing edges.
-    implementation 'io.quarkus:quarkus-redis-client'
+    // Redis dependency removed: the indexing transport moved from
+    // pipestream:indexing:<plan_id> Redis streams to a Kafka topic
+    // (indexing-requests). The Redis-consumer classes that owned the
+    // old path are deleted; nothing in this module touches Redis
+    // anymore. Keeping quarkus-redis-client on the classpath would
+    // auto-start a Redis devservice in dev mode that tries to join
+    // pipeline-shared-devservices_default and fails when that compose
+    // network isn't up (which is the case whenever the manager runs
+    // outside the full stack).
     implementation 'io.quarkus:quarkus-jdbc-postgresql'
     implementation 'io.quarkus:quarkus-hibernate-orm-panache'
     implementation 'io.quarkus:quarkus-narayana-jta'

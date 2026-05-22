@@ -173,7 +173,6 @@ public class OpenSearchIndexingService {
      *
      * @param drive drive payload to index
      * @param key Kafka key used as the OpenSearch document id
-     * @return a completion signal after the document is queued
      */
     public void indexDrive(Drive drive, java.util.UUID key) {
         Map<String, Object> document = new HashMap<>();
@@ -189,7 +188,6 @@ public class OpenSearchIndexingService {
      * Deletes an indexed drive document.
      *
      * @param key Kafka key used as the OpenSearch document id
-     * @return a completion signal for the delete request
      */
     public void deleteDrive(java.util.UUID key) {
         try {
@@ -211,7 +209,6 @@ public class OpenSearchIndexingService {
      * @param node filesystem node payload
      * @param drive drive name that owns the node
      * @param kafkaKey Kafka key used as the OpenSearch document id
-     * @return a completion signal after the document is queued
      */
     public void indexNode(Node node, String drive, UUID kafkaKey) {
         indexNode(node, drive, kafkaKey, null, 30);
@@ -223,7 +220,6 @@ public class OpenSearchIndexingService {
      *
      * @param event repository event to project into catalog, history, and filesystem indices
      * @param kafkaKey Kafka key used as the OpenSearch document id for the filesystem entry
-     * @return a completion signal after the relevant indexing or delete work is queued
      */
     public void indexRepositoryEvent(ai.pipestream.repository.filesystem.v1.RepositoryEvent event, UUID kafkaKey) {
         String operation = event.hasCreated() ? "CREATED"
@@ -324,7 +320,6 @@ public class OpenSearchIndexingService {
      * @param kafkaKey Kafka key used as the OpenSearch document id
      * @param datasourceId datasource identifier to persist when available
      * @param retentionIntentDays retention hint stored on the indexed document
-     * @return a completion signal after the document is queued
      */
     public void indexNode(Node node, String drive, UUID kafkaKey, String datasourceId, int retentionIntentDays) {
         Map<String, Object> document = new HashMap<>();
@@ -351,7 +346,6 @@ public class OpenSearchIndexingService {
      * Deletes the filesystem node document indexed under the Kafka message key (must match {@link #indexNode}).
      *
      * @param kafkaKey Kafka key used as the OpenSearch document id
-     * @return a completion signal for the idempotent delete attempt
      */
     public void deleteFilesystemNodeByKafkaKey(UUID kafkaKey) {
         try {
@@ -368,7 +362,6 @@ public class OpenSearchIndexingService {
      *
      * @param nodeId legacy node identifier
      * @param drive drive name previously used to compose the document id
-     * @return a completion signal for the delete request
      */
     @Deprecated
     public void deleteNode(String nodeId, String drive) {
@@ -387,7 +380,6 @@ public class OpenSearchIndexingService {
      * Indexes module metadata for repository search.
      *
      * @param module module definition to index
-     * @return a completion signal after the document is queued
      */
     public void indexModule(ModuleDefinition module) {
         Map<String, Object> document = new HashMap<>();
@@ -401,7 +393,6 @@ public class OpenSearchIndexingService {
      * Deletes an indexed module document.
      *
      * @param moduleId module identifier used as the OpenSearch document id
-     * @return a completion signal for the delete request
      */
     public void deleteModule(String moduleId) {
         try {
@@ -418,7 +409,6 @@ public class OpenSearchIndexingService {
      * Indexes repository metadata for a PipeDoc update.
      *
      * @param notification PipeDoc update payload to project into OpenSearch
-     * @return a completion signal after the document is queued
      */
     public void indexPipeDoc(PipeDocUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
@@ -461,7 +451,6 @@ public class OpenSearchIndexingService {
      * Deletes an indexed PipeDoc document.
      *
      * @param storageId storage identifier used as the OpenSearch document id
-     * @return a completion signal for the delete request
      */
     public void deletePipeDoc(String storageId) {
         try {
@@ -478,7 +467,6 @@ public class OpenSearchIndexingService {
      * Indexes a document-upload event for admin and repository search.
      *
      * @param event uploaded-document event payload
-     * @return a completion signal after the document is queued
      */
     public void indexDocumentUpload(DocumentUploadedEvent event) {
         Map<String, Object> document = new HashMap<>();
@@ -511,7 +499,6 @@ public class OpenSearchIndexingService {
      *
      * @param accountId account identifier used in the composed document id
      * @param docId document identifier used in the composed document id
-     * @return a completion signal for the delete request
      */
     public void deleteDocumentUpload(String accountId, String docId) {
         String id = accountId + "/" + docId;
@@ -529,7 +516,6 @@ public class OpenSearchIndexingService {
      * Indexes a process-request notification.
      *
      * @param notification process request update payload
-     * @return a completion signal after the document is queued
      */
     public void indexProcessRequest(ProcessRequestUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
@@ -542,7 +528,6 @@ public class OpenSearchIndexingService {
      * Deletes an indexed process-request document.
      *
      * @param requestId request identifier used as the OpenSearch document id
-     * @return a completion signal for the delete request
      */
     public void deleteProcessRequest(String requestId) {
         try {
@@ -559,7 +544,6 @@ public class OpenSearchIndexingService {
      * Indexes a process-response notification.
      *
      * @param notification process response update payload
-     * @return a completion signal after the document is queued
      */
     public void indexProcessResponse(ProcessResponseUpdateNotification notification) {
         Map<String, Object> document = new HashMap<>();
@@ -572,7 +556,6 @@ public class OpenSearchIndexingService {
      * Deletes an indexed process-response document.
      *
      * @param responseId response identifier used as the OpenSearch document id
-     * @return a completion signal for the delete request
      */
     public void deleteProcessResponse(String responseId) {
         try {

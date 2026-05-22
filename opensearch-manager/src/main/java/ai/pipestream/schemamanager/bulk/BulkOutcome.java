@@ -33,6 +33,7 @@ public record BulkOutcome(
         int successCount,
         String summaryReason) {
 
+    /** Outcome classification based on per-item results. */
     public enum Classification {
         /** Every item succeeded. */
         SUCCESS,

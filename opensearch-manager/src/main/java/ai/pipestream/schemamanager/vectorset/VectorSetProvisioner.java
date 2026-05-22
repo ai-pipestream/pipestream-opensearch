@@ -44,13 +44,12 @@ public interface VectorSetProvisioner {
     /**
      * Ensures the given OpenSearch index has {@code knn_vector} fields for
      * every {@code NamedEmbedderConfig} referenced by the given directives.
-     * The no-op implementation returns {@code Uni.voidItem()} — the caller's
+     * The no-op implementation returns immediately &mdash; the caller's
      * downstream indexing code still handles field creation lazily.
      *
      * @param directives the {@link VectorSetDirectives} describing the
      *     vector sets that should exist for the doc about to be indexed
      * @param indexName the OpenSearch index that will receive the doc
-     * @return a Uni that completes (void) when the fields are ensured
      */
     void ensureFieldsForDirectives(VectorSetDirectives directives, String indexName);
 
@@ -59,7 +58,7 @@ public interface VectorSetProvisioner {
      *
      * <p>Called from {@code VectorSetServiceEngine.bindVectorSetToIndex}
      * (and its sibling {@code createIndexWithVectorSets}) <b>between</b> the
-     * read-only recipe lookup and the binding-row insert — i.e. with no
+     * read-only recipe lookup and the binding-row insert &mdash; i.e. with no
      * Hibernate Reactive session open. Running OpenSearch I/O outside a
      * session is what lets the worker-thread hop in
      * {@code IndexKnnProvisioner} not violate the reactive transaction
@@ -74,20 +73,20 @@ public interface VectorSetProvisioner {
      * sink path: it ensures the base index exists and the recipe's per-recipe
      * side index exists with the configured {@code knn_vector} field. The
      * other indexing strategies (CHUNK_COMBINED, NESTED) still create their
-     * fields on first write — that's a separate refactor.
+     * fields on first write &mdash; that's a separate refactor.
      *
      * <p>Scalar parameters (rather than passing the entity) are deliberate:
      * the entity is detached at this call site and we don't want callers
      * relying on lazy/eager behavior of relations.
      *
      * @param vectorSetId      logical id of the recipe (for logging only)
-     * @param chunkerConfigId  recipe's chunker config id — used to derive
+     * @param chunkerConfigId  recipe's chunker config id &mdash; used to derive
      *                         the SEPARATE_INDICES side-index name
-     * @param embeddingModelId recipe's embedding model id — used to derive
+     * @param embeddingModelId recipe's embedding model id &mdash; used to derive
      *                         the SEPARATE_INDICES side-index name
      * @param vectorDimensions dimension of the {@code knn_vector} field
      * @param indexName        base OpenSearch index name the recipe is being bound to
-     * @return Uni that completes (void) when provisioning is durable on the cluster
+     * @param strategy         indexing strategy
      */
     void ensureFieldsForVectorSet(
             String vectorSetId,

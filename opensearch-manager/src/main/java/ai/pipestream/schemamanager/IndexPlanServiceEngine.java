@@ -125,6 +125,12 @@ public class IndexPlanServiceEngine {
                 .build();
     }
 
+    /**
+     * Persist a new index plan row and its initial membership.
+     *
+     * @param req creation request
+     * @return persisted plan and its vector set scalars
+     */
     @Transactional
     protected PlanWithScalars persistNewPlan(CreateIndexPlanRequest req) {
         if (planRepo.findByName(req.getName()) != null) {
@@ -186,6 +192,12 @@ public class IndexPlanServiceEngine {
                 .build();
     }
 
+    /**
+     * Apply partial updates to an existing index plan.
+     *
+     * @param req update request
+     * @return update result with current state and scalars
+     */
     @Transactional
     protected PlanWithScalars applyUpdate(UpdateIndexPlanRequest req) {
         IndexPlanEntity plan = planRepo.findById(req.getId());
@@ -250,6 +262,11 @@ public class IndexPlanServiceEngine {
         return DeleteIndexPlanResponse.newBuilder().setDeleted(true).build();
     }
 
+    /**
+     * Delete the index plan row from the database.
+     *
+     * @param id plan id
+     */
     @Transactional
     protected void deletePlanRow(String id) {
         IndexPlanEntity p = planRepo.findById(id);
@@ -414,6 +431,12 @@ public class IndexPlanServiceEngine {
         return pws.plan.id;
     }
 
+    /**
+     * Flip plan status based on provisioning outcome.
+     *
+     * @param planId   plan id
+     * @param errorMsg error message if failed, null if success
+     */
     @Transactional
     protected void flipStatus(String planId, String errorMsg) {
         IndexPlanEntity plan = planRepo.findById(planId);

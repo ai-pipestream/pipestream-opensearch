@@ -94,6 +94,12 @@ public class VectorSetServiceEngine {
         return CreateVectorSetResponse.newBuilder().setVectorSet(proto).build();
     }
 
+    /**
+     * Persist a new vector set row.
+     *
+     * @param request creation request
+     * @return persisted entity
+     */
     @Transactional
     protected VectorSetEntity persistVectorSet(CreateVectorSetRequest request) {
         // Semantic path skips chunker config; standard path requires it.
@@ -192,6 +198,12 @@ public class VectorSetServiceEngine {
         return UpdateVectorSetResponse.newBuilder().setVectorSet(current).build();
     }
 
+    /**
+     * Apply updates to an existing vector set.
+     *
+     * @param request update request
+     * @return update result with previous and current state
+     */
     @Transactional
     protected VectorSetUpdate applyVectorSetUpdate(UpdateVectorSetRequest request) {
         VectorSetEntity e = vectorSetRepo.findById(request.getId());
@@ -255,6 +267,12 @@ public class VectorSetServiceEngine {
                 .build();
     }
 
+    /**
+     * Delete a vector set if not in use.
+     *
+     * @param request delete request
+     * @return outcome with success flag and optional message
+     */
     @Transactional
     protected DeleteOutcome applyVectorSetDelete(DeleteVectorSetRequest request) {
         VectorSetEntity e = vectorSetRepo.findById(request.getId());
@@ -487,11 +505,14 @@ public class VectorSetServiceEngine {
      * changed since the original bind (e.g. via a self-repair
      * UpdateChunkerConfig), the existing OpenSearch side index has a now-stale
      * name and the chunker module writes to a name nothing provisioned.
-     * Always re-provisioning forces the side-index naming to track the
+     * re-provisioning forces the side-index naming to track the
      * current chunker configId. The provisioner is idempotent (cache hit on
      * unchanged state = O(1) noop), so this is cheap.
+     *
+     * @param request bind request
+     * @return bind response
      */
-    public BindVectorSetToIndexResponse bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
+     public BindVectorSetToIndexResponse bindVectorSetToIndex(BindVectorSetToIndexRequest request) {
         if (request.getVectorSetId().isBlank()) {
             throw Status.INVALID_ARGUMENT.withDescription("vector_set_id is required").asRuntimeException();
         }
@@ -549,6 +570,13 @@ public class VectorSetServiceEngine {
         return response;
     }
 
+    /**
+     * Look up a vector set and its existing binding if any.
+     *
+     * @param vsId      vector set id
+     * @param indexName target index
+     * @return lookup result
+     */
     @Transactional
     protected BindLookupResult lookupBind(String vsId, String indexName) {
         VectorSetEntity vs = vectorSetRepo.findById(vsId);
@@ -569,6 +597,15 @@ public class VectorSetServiceEngine {
                 chunkerConfigId, embeddingModelId, dimensions);
     }
 
+    /**
+     * Persist a new vector set index binding.
+     *
+     * @param vsId         vector set id
+     * @param indexName    target index
+     * @param accountId    account id
+     * @param datasourceId datasource id
+     * @return persisted entity
+     */
     @Transactional
     protected VectorSetIndexBindingEntity persistBinding(
             String vsId, String indexName, String accountId, String datasourceId) {
@@ -605,6 +642,9 @@ public class VectorSetServiceEngine {
      * (OpenSearch does not support removing fields from a mapping anyway;
      * dropping a SEPARATE_INDICES side-index can be added later as an
      * opt-in flag on this RPC.)
+     *
+     * @param request unbind request
+     * @return unbind response
      */
     @Transactional
     public UnbindVectorSetFromIndexResponse unbindVectorSetFromIndex(UnbindVectorSetFromIndexRequest request) {
@@ -622,7 +662,12 @@ public class VectorSetServiceEngine {
         return response;
     }
 
-    /** Lists indices a single VectorSet is bound to, paginated. */
+    /**
+     * Lists indices a single VectorSet is bound to, paginated.
+     *
+     * @param request list request
+     * @return indices and pagination state
+     */
     public ListIndicesForVectorSetResponse listIndicesForVectorSet(ListIndicesForVectorSetRequest request) {
         if (request.getVectorSetId().isBlank()) {
             throw Status.INVALID_ARGUMENT.withDescription("vector_set_id is required").asRuntimeException();
@@ -641,7 +686,12 @@ public class VectorSetServiceEngine {
         return b.build();
     }
 
-    /** Lists VectorSets bound to a single index, paginated, with hydrated recipes. */
+    /**
+     * Lists VectorSets bound to a single index, paginated, with hydrated recipes.
+     *
+     * @param request list request
+     * @return vector sets and pagination state
+     */
     public ListVectorSetsForIndexResponse listVectorSetsForIndex(ListVectorSetsForIndexRequest request) {
         if (request.getIndexName().isBlank()) {
             throw Status.INVALID_ARGUMENT.withDescription("index_name is required").asRuntimeException();
@@ -664,15 +714,13 @@ public class VectorSetServiceEngine {
     }
 
     /**
-     * All-or-nothing: bind every requested VectorSet to the given index. If
-     * any bind fails (NOT_FOUND, dimension mismatch, etc.) the transaction
-     * rolls back so the index ends up with all the requested bindings or none.
-     */
-    /**
      * All-or-nothing: bind every requested VectorSet to the given index.
      * If any bind fails (NOT_FOUND, dimension mismatch, etc.) the
      * transaction rolls back so the index ends up with all the requested
      * bindings or none of them.
+     *
+     * @param request create request
+     * @return creation response
      */
     public CreateIndexWithVectorSetsResponse createIndexWithVectorSets(CreateIndexWithVectorSetsRequest request) {
         if (request.getIndexName().isBlank()) {
@@ -718,6 +766,13 @@ public class VectorSetServiceEngine {
         return response;
     }
 
+    /**
+     * Resolves a batch of vector sets and their existing bindings.
+     *
+     * @param vsIds     list of vector set ids
+     * @param indexName target index
+     * @return batch lookup result
+     */
     @Transactional
     protected BatchBindLookupResult resolveBatchLookup(List<String> vsIds, String indexName) {
         BatchBindLookupResult acc = new BatchBindLookupResult();
@@ -743,6 +798,15 @@ public class VectorSetServiceEngine {
         return acc;
     }
 
+    /**
+     * Persists a batch of vector set index bindings.
+     *
+     * @param toCreate     list of bindings to create
+     * @param indexName    target index
+     * @param accountId    account id
+     * @param datasourceId datasource id
+     * @return list of persisted entities
+     */
     @Transactional
     protected List<VectorSetIndexBindingEntity> persistBatch(
             List<BatchBindEntry> toCreate, String indexName, String accountId, String datasourceId) {

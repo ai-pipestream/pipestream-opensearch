@@ -19,6 +19,7 @@ public class SemanticConfigServiceImpl extends SemanticConfigServiceGrpc.Semanti
 
     private static final Logger LOG = Logger.getLogger(SemanticConfigServiceImpl.class);
 
+    /** Default constructor. */
     public SemanticConfigServiceImpl() {
     }
 

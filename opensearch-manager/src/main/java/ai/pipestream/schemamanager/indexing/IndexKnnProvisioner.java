@@ -102,6 +102,8 @@ public class IndexKnnProvisioner {
      * silently create indices that nothing else expects). Strict-mode here
      * fails fast: callers see "not provisioned at bind time" with a pointer to
      * the eager RPCs.
+     *
+     * @param indexName target OpenSearch index name
      */
     public void requireIndex(String indexName) {
         if (!indexExistsCache.contains(indexName)) {
@@ -116,6 +118,10 @@ public class IndexKnnProvisioner {
      * Strict-verify variant of {@link #ensureKnnField}: succeeds only if the
      * (index, field, dim) triple has already been provisioned (cache hit).
      * Throws otherwise. NEVER touches OpenSearch.
+     *
+     * @param indexName  target OpenSearch index name
+     * @param fieldName  KNN field name
+     * @param dimensions vector dimension for the field
      */
     public void requireKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
@@ -132,10 +138,9 @@ public class IndexKnnProvisioner {
      * standard settings. Idempotent. O(1) on a warm cache.
      *
      * <p><b>Eager paths only.</b> Hot paths must use {@link #requireIndex}
-     * — see its javadoc for why.
+     * &mdash; see its javadoc for why.
      *
      * @param indexName target OpenSearch index name
-     * @return completion when provisioning finishes (possibly no-op when cached)
      */
     public void ensureIndex(String indexName) {
         if (indexExistsCache.contains(indexName)) {
@@ -181,12 +186,11 @@ public class IndexKnnProvisioner {
      * Idempotent. O(1) on a warm cache.
      *
      * <p><b>Eager paths only.</b> Hot paths must use {@link #requireKnnField}
-     * — see its javadoc.
+     * &mdash; see its javadoc.
      *
      * @param indexName  target OpenSearch index name
      * @param fieldName  KNN field name (e.g. "vector" or an embedding id)
      * @param dimensions vector dimension for the field
-     * @return completion when provisioning finishes (possibly no-op when cached)
      */
     public void ensureKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;

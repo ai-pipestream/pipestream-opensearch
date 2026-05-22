@@ -14,6 +14,10 @@ import java.util.List;
 @ApplicationScoped
 public class IndexPlanRepository implements PanacheRepositoryBase<IndexPlanEntity, String> {
 
+    /** Default constructor. */
+    public IndexPlanRepository() {
+    }
+
     /**
      * Finds a plan by its unique display name.
      *

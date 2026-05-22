@@ -22,6 +22,10 @@ import java.util.List;
 @ApplicationScoped
 public class ChunkerConfigRepository implements PanacheRepositoryBase<ChunkerConfigEntity, String> {
 
+    /** Default constructor. */
+    public ChunkerConfigRepository() {
+    }
+
     /**
      * Finds a chunker config by its unique display name.
      *

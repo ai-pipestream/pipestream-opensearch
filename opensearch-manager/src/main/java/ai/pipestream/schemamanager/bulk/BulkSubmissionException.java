@@ -10,6 +10,12 @@ package ai.pipestream.schemamanager.bulk;
  */
 public class BulkSubmissionException extends RuntimeException {
 
+    /**
+     * Create a submission exception.
+     *
+     * @param message error message
+     * @param cause   underlying cause
+     */
     public BulkSubmissionException(String message, Throwable cause) {
         super(message, cause);
     }

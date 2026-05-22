@@ -58,6 +58,10 @@ import org.jboss.logging.Logger;
 @GlobalInterceptor
 public class HalfClosedRetryClientInterceptor implements ClientInterceptor {
 
+    /** Default constructor. */
+    public HalfClosedRetryClientInterceptor() {
+    }
+
     private static final Logger LOG = Logger.getLogger(HalfClosedRetryClientInterceptor.class);
 
     /**

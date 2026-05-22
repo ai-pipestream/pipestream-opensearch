@@ -46,12 +46,21 @@ public class IndexPlanVectorSetEntity extends PanacheEntityBase {
 
     /** Composite primary key for {@link IndexPlanVectorSetEntity}. */
     public static class PK implements Serializable {
+        /** Plan id (FK). */
         public String planId;
+        /** Vector set id (FK). */
         public String vectorSetId;
 
+        /** JPA persistence constructor. */
         public PK() {
         }
 
+        /**
+         * Create a composite key.
+         *
+         * @param planId      plan id
+         * @param vectorSetId vector set id
+         */
         public PK(String planId, String vectorSetId) {
             this.planId = planId;
             this.vectorSetId = vectorSetId;

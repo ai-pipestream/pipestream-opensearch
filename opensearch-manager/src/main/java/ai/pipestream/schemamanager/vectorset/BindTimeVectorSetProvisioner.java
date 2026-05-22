@@ -171,6 +171,10 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
      * Derives the CHUNK_COMBINED chunk-index name. Mirrors
      * {@code ChunkCombinedIndexingStrategy.deriveChunkIndexName}. Must stay
      * in sync.
+     *
+     * @param baseIndex     base OpenSearch index name
+     * @param chunkConfigId chunker configuration id
+     * @return derived chunk index name
      */
     public static String deriveChunkCombinedIndexName(String baseIndex, String chunkConfigId) {
         return baseIndex + "--chunk--"
@@ -189,6 +193,9 @@ public class BindTimeVectorSetProvisioner implements VectorSetProvisioner {
      * Using the wrong one yielded {@code em_paraphrase-minilm} (with hyphen)
      * eagerly provisioned vs {@code em_paraphrase_minilm} (with underscore)
      * the sink wrote, so strict-mode rejected every chunk.
+     *
+     * @param embeddingModelId embedding model identifier
+     * @return sanitized field name
      */
     public static String deriveCombinedFieldName(String embeddingModelId) {
         return "em_" + embeddingModelId.replaceAll("[^a-zA-Z0-9_]", "_");

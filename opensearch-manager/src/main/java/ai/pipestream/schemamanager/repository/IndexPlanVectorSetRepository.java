@@ -21,6 +21,10 @@ import java.util.List;
 @ApplicationScoped
 public class IndexPlanVectorSetRepository implements PanacheRepositoryBase<IndexPlanVectorSetEntity, IndexPlanVectorSetEntity.PK> {
 
+    /** Default constructor. */
+    public IndexPlanVectorSetRepository() {
+    }
+
     /**
      * Lists membership rows for a plan, ordered by {@code sort_order}.
      *

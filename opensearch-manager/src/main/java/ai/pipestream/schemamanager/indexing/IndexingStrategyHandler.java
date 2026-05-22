@@ -25,7 +25,11 @@ import java.util.List;
  */
 public interface IndexingStrategyHandler {
 
-    /** Wire enum value this handler backs; used for dispatch from the resolver. */
+    /**
+     * Wire enum value this handler backs; used for dispatch from the resolver.
+     *
+     * @return the strategy this handler implements.
+     */
     IndexingStrategy strategy();
 
     // ---------- Naming ----------

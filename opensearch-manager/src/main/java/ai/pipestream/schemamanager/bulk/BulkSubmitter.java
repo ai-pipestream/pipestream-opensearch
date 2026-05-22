@@ -43,6 +43,10 @@ import java.util.concurrent.CompletionException;
 @ApplicationScoped
 public class BulkSubmitter {
 
+    /** Default constructor. */
+    public BulkSubmitter() {
+    }
+
     private static final Logger LOG = Logger.getLogger(BulkSubmitter.class);
 
     @Inject
@@ -56,6 +60,12 @@ public class BulkSubmitter {
      * <p>Any exception thrown by the underlying flush completes the
      * future exceptionally; this method unwraps {@link CompletionException}
      * to surface the real cause directly to the caller.
+     *
+     * @param indexName target index
+     * @param docId     document identifier
+     * @param document  document payload
+     * @param routing   optional routing key
+     * @return item result
      */
     public BulkItemResult submitOne(String indexName, String docId,
                                     Map<String, Object> document, String routing) {
@@ -76,6 +86,9 @@ public class BulkSubmitter {
      * {@link BulkItemResult#success()}; an exceptional completion is a
      * different beast (bulk request failed wholesale, connection error,
      * etc.) and warrants a different recovery path upstream.
+     *
+     * @param items list of items to submit
+     * @return matching list of results
      */
     public List<BulkItemResult> submit(List<BulkIndexItem> items) {
         if (items.isEmpty()) {

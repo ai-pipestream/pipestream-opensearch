@@ -26,6 +26,10 @@ import java.util.UUID;
 @ApplicationScoped
 public class SemanticMetadataEventKeyExtractor implements UuidKeyExtractor<SemanticMetadataEvent> {
 
+    /** Default constructor. */
+    public SemanticMetadataEventKeyExtractor() {
+    }
+
     @Override
     public UUID extractKey(SemanticMetadataEvent event) {
         String entityId = event.getEntityId();

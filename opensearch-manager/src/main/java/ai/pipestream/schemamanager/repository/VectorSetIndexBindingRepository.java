@@ -13,6 +13,10 @@ import java.util.List;
 @ApplicationScoped
 public class VectorSetIndexBindingRepository implements PanacheRepositoryBase<VectorSetIndexBindingEntity, String> {
 
+    /** Default constructor. */
+    public VectorSetIndexBindingRepository() {
+    }
+
     /**
      * Finds the binding for a vector set and index.
      *

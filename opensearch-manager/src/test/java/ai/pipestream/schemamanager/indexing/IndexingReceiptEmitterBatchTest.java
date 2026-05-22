@@ -6,7 +6,6 @@ import ai.pipestream.opensearch.v1.OpenSearchDocument;
 import ai.pipestream.opensearch.v1.StreamIndexDocumentsRequest;
 import ai.pipestream.repository.v1.DocumentIndexedEvent;
 import ai.pipestream.repository.v1.IndexingOutcome;
-import ai.pipestream.schemamanager.indexing.redis.IndexingRequestDecoder;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -64,13 +63,13 @@ class IndexingReceiptEmitterBatchTest {
 
     @Test
     void appendReceiptPopulatesEveryCoreField() {
-        IndexingRequestDecoder.DecodedRequest dr = fakeDecoded("doc-1", "plan-1", "idx-1", "acct-1", "crawl-1");
+        StreamIndexDocumentsRequest req = fakeRequest("doc-1", "idx-1", "acct-1", "crawl-1");
         List<DocumentIndexedEvent> out = new ArrayList<>();
 
-        target.appendReceipt(dr, IndexingOutcome.INDEXING_OUTCOME_SUCCESS, "", 3, out);
+        target.appendReceipt(req, "plan-1", IndexingOutcome.INDEXING_OUTCOME_SUCCESS, "", 3, out);
 
         assertThat(out)
-                .as("one DecodedRequest produces exactly one DocumentIndexedEvent")
+                .as("one request produces exactly one DocumentIndexedEvent")
                 .singleElement()
                 .satisfies(receipt -> {
                     assertThat(receipt.getDocId()).isEqualTo("doc-1");
@@ -91,11 +90,11 @@ class IndexingReceiptEmitterBatchTest {
 
     @Test
     void appendReceiptMintsStrictlyMonotonicAttemptIds() {
-        IndexingRequestDecoder.DecodedRequest dr = fakeDecoded("doc-1", "plan-1", "idx-1", "acct-1", "");
+        StreamIndexDocumentsRequest req = fakeRequest("doc-1", "idx-1", "acct-1", "");
         List<DocumentIndexedEvent> out = new ArrayList<>();
 
         for (int i = 0; i < 5; i++) {
-            target.appendReceipt(dr, IndexingOutcome.INDEXING_OUTCOME_SUCCESS, "", 1, out);
+            target.appendReceipt(req, "plan-1", IndexingOutcome.INDEXING_OUTCOME_SUCCESS, "", 1, out);
         }
         List<String> attemptIds = out.stream().map(DocumentIndexedEvent::getAttemptId).toList();
 
@@ -147,7 +146,7 @@ class IndexingReceiptEmitterBatchTest {
                 DocumentIndexedEvent.newBuilder().setDocId("c").build());
 
         assertThatThrownBy(() -> target.emitAll(receipts))
-                .as("any send failure must surface so the caller does not XACK")
+                .as("any send failure must surface so the caller does not retry")
                 .isInstanceOf(RuntimeException.class)
                 .hasMessageContaining("Batch receipt send failed");
     }
@@ -157,17 +156,18 @@ class IndexingReceiptEmitterBatchTest {
         return (CompletionStage<T>) (CompletionStage<?>) f;
     }
 
-    private static IndexingRequestDecoder.DecodedRequest fakeDecoded(
-            String docId, String planId, String indexName, String accountId, String crawlId) {
-        StreamIndexDocumentsRequest request = StreamIndexDocumentsRequest.newBuilder()
+    private static StreamIndexDocumentsRequest fakeRequest(
+            String docId, String indexName, String accountId, String crawlId) {
+        return StreamIndexDocumentsRequest.newBuilder()
                 .setRequestId("req-" + docId)
                 .setIndexName(indexName)
                 .setDocumentId(docId)
+                .setAccountId(accountId)
                 .setIndexingStrategy(IndexingStrategy.INDEXING_STRATEGY_NESTED)
-                .setDocument(OpenSearchDocument.newBuilder().setOriginalDocId(docId).build())
+                .setDocument(OpenSearchDocument.newBuilder()
+                        .setOriginalDocId(docId)
+                        .setCrawlId(crawlId)
+                        .build())
                 .build();
-        return new IndexingRequestDecoder.DecodedRequest(
-                "1-0", docId, planId, indexName, accountId, crawlId,
-                IndexingStrategy.INDEXING_STRATEGY_NESTED, request, Map.of());
     }
 }

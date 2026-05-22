@@ -168,9 +168,14 @@ public class SemanticConfigServiceEngine {
      *
      * <p>Trade-off: if Phase 2 fails, the binding rows in Postgres are already
      * committed but the OpenSearch side indices are missing. Re-running the
-     * call is idempotent — it skips the existing binding (cache hit) and
+     * call is idempotent &mdash; it skips the existing binding (cache hit) and
      * retries the OpenSearch creation. The hot path's lazy fallback also
      * covers the gap.
+     *
+     * @param semanticConfigId semantic config identifier
+     * @param baseIndexName    base OpenSearch index name
+     * @param strategy         indexing strategy
+     * @return assignment result
      */
     public AssignmentResult assignToIndexDetailed(String semanticConfigId, String baseIndexName,
                                                   IndexingStrategy strategy) {
@@ -400,6 +405,12 @@ public class SemanticConfigServiceEngine {
                 .build();
     }
 
+    /**
+     * Persist a new semantic config and its children (vector sets).
+     *
+     * @param request creation request
+     * @return creation outcome
+     */
     @Transactional
     protected CreateOutcome persistSemanticConfigAndChildren(CreateSemanticConfigRequest request) {
         EmbeddingModelConfig emc = resolveEmbeddingModel(request.getEmbeddingModelId());

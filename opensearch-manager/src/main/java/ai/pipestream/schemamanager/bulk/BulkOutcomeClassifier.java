@@ -30,11 +30,17 @@ import java.util.List;
 @ApplicationScoped
 public class BulkOutcomeClassifier {
 
+    /** Default constructor. */
+    public BulkOutcomeClassifier() {
+    }
+
     /**
      * Classify a non-empty list of per-item results.
      *
+     * @param results list of results to classify
+     * @return classified outcome
      * @throws IllegalArgumentException if {@code results} is empty.
-     *         Empty input means "no items were submitted" — that's a
+     *         Empty input means "no items were submitted" &mdash; that's a
      *         {@code SKIPPED} situation the strategy should have
      *         decided before calling the submitter, not silently
      *         bucketed here.

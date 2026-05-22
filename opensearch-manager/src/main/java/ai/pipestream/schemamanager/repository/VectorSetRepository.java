@@ -14,6 +14,10 @@ import java.util.List;
 @ApplicationScoped
 public class VectorSetRepository implements PanacheRepositoryBase<VectorSetEntity, String> {
 
+    /** Default constructor. */
+    public VectorSetRepository() {
+    }
+
     /**
      * Finds a vector set by unique name.
      *

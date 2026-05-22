@@ -21,6 +21,10 @@ import java.util.concurrent.ExecutionException;
 @ApplicationScoped
 public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler {
 
+    /** Default constructor. */
+    public SeparateIndicesIndexingStrategy() {
+    }
+
     private static final Logger LOG = Logger.getLogger(SeparateIndicesIndexingStrategy.class);
 
     @Inject

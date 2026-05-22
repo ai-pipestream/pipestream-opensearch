@@ -98,6 +98,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Persist a new embedding model config row.
+     *
+     * @param request creation request
+     * @return persisted entity
+     */
     @Transactional
     protected EmbeddingModelConfig persistNewModel(CreateEmbeddingModelConfigRequest request) {
         String id = request.hasId() && !request.getId().isBlank()
@@ -157,6 +163,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Apply updates to an existing embedding model config.
+     *
+     * @param request update request
+     * @return update result with previous and current state
+     */
     @Transactional
     protected ModelUpdate applyModelUpdate(UpdateEmbeddingModelConfigRequest request) {
         EmbeddingModelConfig entity = modelRepo.findById(request.getId());
@@ -204,6 +216,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Delete an embedding model config if not in use.
+     *
+     * @param request delete request
+     * @return outcome with success flag and optional message
+     */
     @Transactional
     protected DeleteOutcome applyModelDelete(DeleteEmbeddingModelConfigRequest request) {
         EmbeddingModelConfig entity = modelRepo.findById(request.getId());
@@ -262,6 +280,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Persist a new index embedding binding row.
+     *
+     * @param request creation request
+     * @return persisted entity
+     */
     @Transactional
     protected IndexEmbeddingBinding persistNewBinding(CreateIndexEmbeddingBindingRequest request) {
         EmbeddingModelConfig emc = modelRepo.findById(request.getEmbeddingModelConfigId());
@@ -329,6 +353,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Apply updates to an existing index embedding binding.
+     *
+     * @param request update request
+     * @return update result with previous and current state
+     */
     @Transactional
     protected BindingUpdate applyBindingUpdate(UpdateIndexEmbeddingBindingRequest request) {
         IndexEmbeddingBinding entity = bindingRepo.findById(request.getId());
@@ -377,6 +407,12 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
         }
     }
 
+    /**
+     * Delete an index embedding binding.
+     *
+     * @param request delete request
+     * @return outcome with success flag and optional message
+     */
     @Transactional
     protected DeleteOutcome applyBindingDelete(DeleteIndexEmbeddingBindingRequest request) {
         IndexEmbeddingBinding entity = bindingRepo.findById(request.getId());

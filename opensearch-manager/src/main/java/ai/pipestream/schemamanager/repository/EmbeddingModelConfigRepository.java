@@ -13,6 +13,10 @@ import java.util.List;
 @ApplicationScoped
 public class EmbeddingModelConfigRepository implements PanacheRepositoryBase<EmbeddingModelConfig, String> {
 
+    /** Default constructor. */
+    public EmbeddingModelConfigRepository() {
+    }
+
     /**
      * Finds an embedding model config by its unique name.
      *
