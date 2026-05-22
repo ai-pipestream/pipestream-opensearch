@@ -26,7 +26,7 @@ def pipestreamBomVersion = findProperty('pipestreamBomVersion')
 // Proto toolchain configuration - uses git-proto-workspace mode for cross-module imports
 pipestreamProtos {
     sourceMode = 'git-proto-workspace'
-    gitRepo = "/work/worktrees/pipestream-protos-pr0"
+    gitRepo = "https://github.com/ai-pipestream/pipestream-protos.git"
     gitRef = "bom/engine-refactor-pr0"
 
     modules {
