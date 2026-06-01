@@ -120,6 +120,25 @@ public class VectorSetServiceEngine {
         }
         validateSourceCelConflictAndLength(request);
 
+        // Get-or-create: re-registering an existing recipe is a clean no-op
+        // return, not a doomed INSERT that trips unique_vector_set_name (or the
+        // recipe-tuple constraint) at commit — which would log a noisy
+        // ARJUNA/Hibernate stack and surface to the caller as gRPC UNKNOWN.
+        // Check by name first (the registrar uses deterministic names), then by
+        // the recipe tuple in case the same recipe was registered under another
+        // name.
+        VectorSetEntity existing = vectorSetRepo.findByName(request.getName());
+        if (existing == null) {
+            String recipeResultSet = normalizeResultSetName(
+                    request.hasResultSetName() ? request.getResultSetName() : null);
+            existing = vectorSetRepo.findByRecipe(
+                    request.getFieldName(), recipeResultSet,
+                    request.getChunkerConfigId(), request.getEmbeddingModelConfigId());
+        }
+        if (existing != null) {
+            return existing;
+        }
+
         String id = request.hasId() && !request.getId().isBlank()
                 ? request.getId()
                 : UUID.randomUUID().toString();

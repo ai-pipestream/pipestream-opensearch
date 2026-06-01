@@ -79,9 +79,13 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
             }
             EmbeddingModelConfig entity;
             try {
-                entity = persistNewModel(request);
+                entity = getOrCreateModel(request);
             } catch (ConstraintViolationException dup) {
-                LOG.infof("Embedding model config '%s' already exists — returning existing", request.getName());
+                // Backstop for the rare concurrent-create race only — the common
+                // "already exists" case returns the existing row from
+                // getOrCreateModel without attempting an INSERT, so it never
+                // trips the unique constraint or logs an ARJUNA/Hibernate stack.
+                LOG.infof("Embedding model config '%s' created concurrently — returning existing", request.getName());
                 entity = modelRepo.findByName(request.getName());
                 if (entity == null) {
                     throw Status.ALREADY_EXISTS
@@ -99,13 +103,21 @@ public class EmbeddingConfigServiceImpl extends EmbeddingConfigServiceGrpc.Embed
     }
 
     /**
-     * Persist a new embedding model config row.
+     * Get-or-create an embedding model config by name, in one transaction.
+     * Looks the row up by its unique name first so re-registering an existing
+     * fixture is a clean no-op return — we never issue an INSERT we know will
+     * violate the unique-name constraint at commit (which would log a noisy
+     * ARJUNA/Hibernate stack and surface as gRPC UNKNOWN).
      *
      * @param request creation request
-     * @return persisted entity
+     * @return the existing or newly-persisted entity
      */
     @Transactional
-    protected EmbeddingModelConfig persistNewModel(CreateEmbeddingModelConfigRequest request) {
+    protected EmbeddingModelConfig getOrCreateModel(CreateEmbeddingModelConfigRequest request) {
+        EmbeddingModelConfig existing = modelRepo.findByName(request.getName());
+        if (existing != null) {
+            return existing;
+        }
         String id = request.hasId() && !request.getId().isBlank()
                 ? request.getId()
                 : UUID.randomUUID().toString();

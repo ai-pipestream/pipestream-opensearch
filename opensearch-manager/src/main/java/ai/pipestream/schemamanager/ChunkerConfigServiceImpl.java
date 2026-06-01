@@ -73,9 +73,15 @@ public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerCo
         try {
             ChunkerConfigEntity entity;
             try {
-                entity = persistNew(request);
+                entity = getOrCreate(request);
             } catch (ConstraintViolationException dup) {
-                LOG.infof("Chunker config '%s' already exists — returning existing", request.getName());
+                // Backstop for the rare concurrent-create race: two callers both
+                // saw no row and both inserted, so one trips the unique
+                // constraint at commit. The common "already exists" case never
+                // reaches here — getOrCreate returns the existing row without
+                // attempting an INSERT, so there's no violation and no noisy
+                // ARJUNA/Hibernate stack in the log.
+                LOG.infof("Chunker config '%s' created concurrently — returning existing", request.getName());
                 entity = chunkerRepo.findByName(request.getName());
                 if (entity == null) {
                     throw Status.ALREADY_EXISTS
@@ -93,13 +99,21 @@ public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerCo
     }
 
     /**
-     * Persist a new chunker config row.
+     * Get-or-create a chunker config by name, in one transaction. Looks the row
+     * up by its unique name first so re-registering an existing fixture is a
+     * clean no-op return — we never issue an INSERT we know will violate
+     * {@code unique_chunker_config_name} at commit (which would log a noisy
+     * ARJUNA/Hibernate stack and surface to the caller as gRPC UNKNOWN).
      *
      * @param request creation request
-     * @return persisted entity
+     * @return the existing or newly-persisted entity
      */
     @Transactional
-    protected ChunkerConfigEntity persistNew(CreateChunkerConfigRequest request) {
+    protected ChunkerConfigEntity getOrCreate(CreateChunkerConfigRequest request) {
+        ChunkerConfigEntity existing = chunkerRepo.findByName(request.getName());
+        if (existing != null) {
+            return existing;
+        }
         String id = request.hasId() && !request.getId().isBlank()
                 ? request.getId()
                 : UUID.randomUUID().toString();
