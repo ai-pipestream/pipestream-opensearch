@@ -413,6 +413,22 @@ public class SemanticConfigServiceEngine {
      */
     @Transactional
     protected CreateOutcome persistSemanticConfigAndChildren(CreateSemanticConfigRequest request) {
+        // Get-or-create: the global semantic-<embedder> fixtures are re-registered
+        // every crawl, so look the config up by configId/name first and return it
+        // — no doomed INSERT that trips the unique constraint at commit (which
+        // would escape the catch below as a noisy UNKNOWN). vectorSetIds is empty
+        // on reuse; it only feeds the response's count log, and the binding path
+        // re-loads the child vector sets itself.
+        SemanticConfigEntity existing = null;
+        if (request.hasConfigId() && !request.getConfigId().isBlank()) {
+            existing = semanticRepo.findByConfigId(request.getConfigId());
+        }
+        if (existing == null && !request.getName().isBlank()) {
+            existing = semanticRepo.findByName(request.getName());
+        }
+        if (existing != null) {
+            return new CreateOutcome(existing, List.of());
+        }
         EmbeddingModelConfig emc = resolveEmbeddingModel(request.getEmbeddingModelId());
         String id = request.hasId() && !request.getId().isBlank()
                 ? request.getId()
