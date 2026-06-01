@@ -96,28 +96,38 @@ public class IndexKnnProvisioner {
      * silently creating an index would mask a missing bind-time provisioning
      * step and add latency to every first-doc-per-(JVM, index) write.
      *
-     * <p>Hot paths used to call {@link #ensureIndex} for safety. That made
-     * the first doc per (JVM, index) pay 2-4 cluster-state round trips, and
-     * worse, masked the case where bind-time provisioning never ran (sink would
-     * silently create indices that nothing else expects). Strict-mode here
-     * fails fast: callers see "not provisioned at bind time" with a pointer to
-     * the eager RPCs.
+     * <p>On a warm cache this never touches OpenSearch. On a cache MISS it does
+     * NOT assume "never provisioned" — the {@link #indexExistsCache} is per-JVM
+     * and is wiped by a manager restart, so treating a miss as a hard failure
+     * turned already-provisioned indices into write failures whenever the
+     * manager restarted mid-run. Instead it self-heals via the idempotent
+     * {@link #ensureIndex} (a no-op when the index already exists, a real create
+     * only if bind-time provisioning genuinely never ran), then the cache is
+     * warm again. Cost: one cluster-state round trip per index per JVM on the
+     * first miss, O(1) thereafter — the cache, not OpenSearch, remains the hot
+     * path.
      *
      * @param indexName target OpenSearch index name
      */
     public void requireIndex(String indexName) {
-        if (!indexExistsCache.contains(indexName)) {
-            throw new IllegalStateException(
-                    "Index '" + indexName + "' was not provisioned at bind time. "
-                            + "Call BindVectorSetToIndex / AssignSemanticConfigToIndex / ProvisionIndex "
-                            + "before indexing.");
+        if (indexExistsCache.contains(indexName)) {
+            return;
         }
+        LOG.debugf("requireIndex: cache miss for %s — rehydrating from OpenSearch (JVM restart?)", indexName);
+        ensureIndex(indexName);
     }
 
     /**
-     * Strict-verify variant of {@link #ensureKnnField}: succeeds only if the
-     * (index, field, dim) triple has already been provisioned (cache hit).
-     * Throws otherwise. NEVER touches OpenSearch.
+     * Verify variant of {@link #ensureKnnField}: O(1) on a warm cache, never
+     * touching OpenSearch. On a cache MISS it self-heals rather than failing —
+     * the {@link #ensured} set is per-JVM and is NOT rehydrated on startup, so a
+     * manager restart mid-run would otherwise reject writes to fields that
+     * already exist in the mapping ("not provisioned at bind time"). The fix
+     * re-runs the idempotent {@link #ensureKnnField}: a no-op {@code putMapping}
+     * when the field already exists (the restart case — the common one), or a
+     * real provision only if bind-time provisioning genuinely never ran. Cost:
+     * one round trip per (index, field) per JVM on the first miss, O(1) after —
+     * the cache stays the hot path, OpenSearch is not slammed per-doc.
      *
      * @param indexName  target OpenSearch index name
      * @param fieldName  KNN field name
@@ -125,12 +135,11 @@ public class IndexKnnProvisioner {
      */
     public void requireKnnField(String indexName, String fieldName, int dimensions) {
         String cacheKey = indexName + "|" + fieldName + "|" + dimensions;
-        if (!ensured.contains(cacheKey)) {
-            throw new IllegalStateException(
-                    "KNN field not provisioned at bind time: index=" + indexName
-                            + " field=" + fieldName + " dim=" + dimensions
-                            + ". Call BindVectorSetToIndex / AssignSemanticConfigToIndex first.");
+        if (ensured.contains(cacheKey)) {
+            return;
         }
+        LOG.debugf("requireKnnField: cache miss for %s — rehydrating from OpenSearch (JVM restart?)", cacheKey);
+        ensureKnnField(indexName, fieldName, dimensions);
     }
 
     /**
