@@ -149,7 +149,7 @@ public class OpenSearchIndexingService {
      * @param document document body to enqueue
      */
     public void queueForIndexing(String indexName, String docId, Map<String, Object> document) {
-        bulkQueueSet.submitFireAndForget(indexName, docId, document);
+        bulkQueueSet.submitMetadataFireAndForget(indexName, docId, document);
     }
 
     /**

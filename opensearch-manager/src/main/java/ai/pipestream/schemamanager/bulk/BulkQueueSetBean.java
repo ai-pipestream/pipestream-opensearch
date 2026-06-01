@@ -10,6 +10,7 @@ import jakarta.annotation.Priority;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.opensearch.client.opensearch.OpenSearchAsyncClient;
 import org.opensearch.client.opensearch.core.BulkRequest;
@@ -41,6 +42,26 @@ public class BulkQueueSetBean {
 
     private volatile BulkQueueSet queueSet;
 
+    /**
+     * Separate pool for repository/metadata events (pipedoc, repo-document,
+     * module, process-request/response, drive, upload notifications). These
+     * are high-frequency single-doc fire-and-forget writes; routing them
+     * through their OWN queues keeps them from filling the main document
+     * pool's queues and stalling chunk-index flushes. It hits the same
+     * OpenSearch cluster, so this isolates queue contention, not cluster
+     * capacity — which is exactly the interference we want gone.
+     */
+    private volatile BulkQueueSet metadataQueueSet;
+
+    @ConfigProperty(name = "bulk-indexing.metadata.queue-count", defaultValue = "4")
+    int metadataQueueCount;
+
+    @ConfigProperty(name = "bulk-indexing.metadata.capacity", defaultValue = "500")
+    int metadataCapacity;
+
+    @ConfigProperty(name = "bulk-indexing.metadata.flush-interval-ms", defaultValue = "1000")
+    int metadataFlushIntervalMs;
+
     /** CDI. */
     public BulkQueueSetBean() {
     }
@@ -58,6 +79,15 @@ public class BulkQueueSetBean {
                 config.queueCount(), config.capacity(), config.flushIntervalMs(),
                 this::handleFlush);
         queueSet.start();
+
+        // Dedicated metadata pool — same flush machinery (one cluster), separate
+        // queues so repo/metadata churn never competes with chunk-doc flushes.
+        metadataQueueSet = new BulkQueueSet(
+                metadataQueueCount, metadataCapacity, metadataFlushIntervalMs,
+                this::handleFlush);
+        metadataQueueSet.start();
+        meterRegistry.gauge("opensearch_bulk_metadata_queue_depth_total", this, b ->
+                b.metadataQueueSet == null ? 0 : b.metadataQueueSet.totalPending());
         // Gauge backed by BulkQueueSet#totalPending — Micrometer polls whenever the
         // registry is scraped. Gives live queue depth across every queue without
         // extra counters on the hot submit path.
@@ -91,6 +121,9 @@ public class BulkQueueSetBean {
     void onShutdown(@Observes ShutdownEvent event) {
         if (queueSet != null) {
             queueSet.shutdown();
+        }
+        if (metadataQueueSet != null) {
+            metadataQueueSet.shutdown();
         }
     }
 
@@ -129,6 +162,20 @@ public class BulkQueueSetBean {
      */
     public void submitFireAndForget(String indexName, String docId, Map<String, Object> document) {
         submit(BulkIndexItem.fireAndForget(indexName, docId, document));
+    }
+
+    /**
+     * Fire-and-forget submit onto the dedicated metadata pool. For
+     * repository/metadata event indexing (pipedoc, repo-document, module,
+     * process-request/response, drive, upload) so it does not contend with
+     * main document chunk indexing for queue capacity.
+     *
+     * @param indexName target index
+     * @param docId     document id
+     * @param document  document body
+     */
+    public void submitMetadataFireAndForget(String indexName, String docId, Map<String, Object> document) {
+        metadataQueueSet.submit(BulkIndexItem.fireAndForget(indexName, docId, document));
     }
 
     /**
@@ -199,10 +246,32 @@ public class BulkQueueSetBean {
             flushDurationTimer.record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
 
             if (response.errors()) {
-                long errorCount = response.items().stream()
+                List<BulkResponseItem> respItems = response.items();
+                long errorCount = respItems.stream()
                         .filter(item -> item.error() != null).count();
                 itemsFailedCounter.increment(errorCount);
-                LOG.warnf("Bulk flush had %d errors out of %d items", errorCount, batch.size());
+
+                // Trace EVERY failure mode — no error should be opaque. Group failed
+                // items by (index / error type) and surface one sample reason per
+                // flush, so a 429 write-queue rejection (es_rejected_execution_exception
+                // — needs backpressure/retry) is immediately distinguishable from a
+                // mapping/parse error (needs a schema/data fix) or a missing index.
+                Map<String, Long> breakdown = new java.util.TreeMap<>();
+                String sampleReason = null;
+                for (BulkResponseItem item : respItems) {
+                    var err = item.error();
+                    if (err == null) {
+                        continue;
+                    }
+                    String key = Objects.toString(item.index(), "?") + " / "
+                            + Objects.toString(err.type(), "unknown");
+                    breakdown.merge(key, 1L, Long::sum);
+                    if (sampleReason == null && err.reason() != null) {
+                        sampleReason = err.reason();
+                    }
+                }
+                LOG.warnf("Bulk flush had %d/%d item errors; breakdown[index/type]=%s; sampleReason=%.400s",
+                        errorCount, batch.size(), breakdown, sampleReason);
             } else {
                 LOG.debugf("Bulk flush succeeded: %d items", batch.size());
             }

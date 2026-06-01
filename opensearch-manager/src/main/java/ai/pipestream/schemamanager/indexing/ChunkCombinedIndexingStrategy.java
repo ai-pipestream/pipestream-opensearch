@@ -186,6 +186,22 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
             defaultValue = "false")
     boolean includeSentenceNlpInBaseDoc;
 
+    /**
+     * Number of documents dispatched into the bulk queue set before the batch
+     * path awaits their futures. The Kafka consumer hands {@link #indexDocumentsBatch}
+     * the whole poll batch (observed 110–187 docs); processing it doc-by-doc with a
+     * per-doc flush barrier starved the 20 round-robin bulk queues — {@code flush_items}
+     * sat at p50≈2 because only one doc's items were ever in flight. This window lets
+     * a slice of docs' items pile into the queues together (fat cross-index bulks),
+     * awaiting once per window. It is bounded rather than whole-batch to cap the
+     * transient heap held by in-flight serialized chunk docs (each carrying multiple
+     * 384-dim float vectors) — a 187-doc batch could otherwise pin tens of thousands
+     * of chunk maps at once.
+     */
+    @ConfigProperty(name = "pipestream.opensearch.dispatch-window-docs",
+            defaultValue = "50")
+    int dispatchWindowDocs;
+
     @Override
     public IndexDocumentResponse indexDocument(IndexDocumentRequest request) {
         if (!request.hasDocumentMap()) {
@@ -251,30 +267,168 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 .build();
     }
 
+    /**
+     * Hot Kafka path. Unlike the unary {@link #indexDocument}, this does NOT block
+     * per doc: it dispatches a window of docs' base + chunk items into the round-robin
+     * {@link ai.pipestream.schemamanager.bulk.BulkQueueSetBean} without awaiting, then
+     * blocks once per window on {@link CompletableFuture#allOf}. That lets items from
+     * many docs coalesce into fat cross-index bulks (the OpenSearch {@code _bulk} API
+     * is index-per-action by design) instead of the previous one-doc-at-a-time barrier
+     * that flushed ~2 items at a time. Window size is bounded by
+     * {@link #dispatchWindowDocs} to cap in-flight heap.
+     */
     @Override
     public List<StreamIndexDocumentsResponse> indexDocumentsBatch(List<StreamIndexDocumentsRequest> batch) {
         if (batch.isEmpty()) {
             return Collections.emptyList();
         }
         List<StreamIndexDocumentsResponse> responses = new ArrayList<>(batch.size());
-        for (StreamIndexDocumentsRequest req : batch) {
-            IndexDocumentRequest.Builder indexReq = IndexDocumentRequest.newBuilder()
-                    .setIndexName(req.getIndexName())
-                    .setDocument(req.getDocument())
-                    .setIndexingStrategy(req.getIndexingStrategy());
-            if (req.hasDocumentMap()) {
-                indexReq.setDocumentMap(req.getDocumentMap());
+        int window = Math.max(1, dispatchWindowDocs);
+        for (int start = 0; start < batch.size(); start += window) {
+            int end = Math.min(start + window, batch.size());
+            List<DocDispatch> dispatches = new ArrayList<>(end - start);
+            List<CompletableFuture<?>> all = new ArrayList<>();
+
+            // Phase 1 — submit every doc's items into the queue set, non-blocking.
+            for (int i = start; i < end; i++) {
+                DocDispatch d = dispatch(batch.get(i));
+                dispatches.add(d);
+                if (d.baseFuture != null) {
+                    all.add(d.baseFuture);
+                }
+                all.addAll(d.chunkFutures);
             }
-            indexReq.addAllChunkDocuments(req.getChunkDocumentsList());
-            IndexDocumentResponse resp = indexDocument(indexReq.build());
-            responses.add(StreamIndexDocumentsResponse.newBuilder()
-                    .setRequestId(req.getRequestId())
-                    .setDocumentId(resp.getDocumentId())
-                    .setSuccess(resp.getSuccess())
-                    .setMessage(resp.getMessage())
-                    .build());
+
+            // Phase 2 — single barrier for the whole window. Item-level failures are
+            // captured as completed (non-exceptional) BulkItemResults by the flush
+            // handler, so allOf only guards against a future left dangling; a throw
+            // here is logged and per-doc outcomes are still read from each future.
+            try {
+                CompletableFuture.allOf(all.toArray(new CompletableFuture[0])).get();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted awaiting window bulk submission", ie);
+            } catch (ExecutionException ee) {
+                LOG.warnf("Window bulk await raised %s; evaluating per-doc outcomes individually",
+                        ee.getMessage());
+            }
+
+            // Phase 3 — map completed futures back to per-doc responses.
+            for (DocDispatch d : dispatches) {
+                responses.add(d.toResponse());
+            }
         }
         return responses;
+    }
+
+    /**
+     * Submit one request's base document and all its chunk documents into the bulk
+     * queue set WITHOUT blocking, returning the futures grouped per doc. All OpenSearch
+     * I/O happens asynchronously inside the queue set's flush; the only synchronous work
+     * here is JSON serialization and the O(1) (warm-cache) {@code ensure*} guards.
+     */
+    private DocDispatch dispatch(StreamIndexDocumentsRequest req) {
+        String baseIndex = req.getIndexName();
+        if (!req.hasDocumentMap()) {
+            return DocDispatch.invalid(req, "", "CHUNK_COMBINED strategy requires document_map");
+        }
+        OpenSearchDocumentMap docMap = req.getDocumentMap();
+        String documentId = docMap.getOriginalDocId();
+
+        CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> baseFuture;
+        try {
+            ensureBaseIndex(baseIndex);
+            Map<String, Object> baseMap = prepareBaseDocMap(docMap);
+            baseFuture = bulkQueueSet.submitWithFuture(baseIndex, documentId, baseMap, null);
+        } catch (Exception e) {
+            LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", baseIndex, documentId);
+            return DocDispatch.invalid(req, documentId, "Failed to prepare base document: " + e.getMessage());
+        }
+
+        List<OpenSearchChunkDocument> chunkDocs = req.getChunkDocumentsList();
+        List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> chunkFutures = new ArrayList<>();
+        int indexGroups = 0;
+        if (!chunkDocs.isEmpty()) {
+            Map<String, List<OpenSearchChunkDocument>> grouped = groupChunksByIndex(baseIndex, chunkDocs);
+            indexGroups = grouped.size();
+            for (Map.Entry<String, List<OpenSearchChunkDocument>> entry : grouped.entrySet()) {
+                String chunkIndexName = entry.getKey();
+                List<OpenSearchChunkDocument> chunks = entry.getValue();
+                try {
+                    ensureChunkIndex(chunkIndexName, collectEmbeddingDimensions(chunks));
+                } catch (RuntimeException e) {
+                    LOG.errorf(e, "CHUNK_COMBINED: ensure failed for chunk index %s — failing its %d chunks",
+                            chunkIndexName, chunks.size());
+                    chunkFutures.add(CompletableFuture.completedFuture(
+                            ai.pipestream.schemamanager.bulk.BulkItemResult.failed(
+                                    "ensure failed for " + chunkIndexName + ": " + e.getMessage())));
+                    continue;
+                }
+                for (OpenSearchChunkDocument chunk : chunks) {
+                    Map<String, Object> chunkMap = serializeChunkDocument(chunk);
+                    String docId = generateChunkDocId(chunk);
+                    chunkFutures.add(bulkQueueSet.submitWithFuture(chunkIndexName, docId, chunkMap, null));
+                }
+            }
+        }
+        return new DocDispatch(req, documentId, baseFuture, chunkFutures, chunkDocs.size(), indexGroups, null);
+    }
+
+    /**
+     * Per-doc bundle of in-flight bulk futures. {@link #toResponse} is called only
+     * after the window's {@code allOf} barrier, so every {@link CompletableFuture#join}
+     * here returns immediately.
+     */
+    private record DocDispatch(
+            StreamIndexDocumentsRequest req,
+            String documentId,
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> baseFuture,
+            List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> chunkFutures,
+            int totalChunks,
+            int indexGroups,
+            String prepError) {
+
+        static DocDispatch invalid(StreamIndexDocumentsRequest req, String documentId, String error) {
+            return new DocDispatch(req, documentId, null, List.of(), 0, 0, error);
+        }
+
+        StreamIndexDocumentsResponse toResponse() {
+            boolean ok;
+            String msg;
+            if (prepError != null) {
+                ok = false;
+                msg = prepError;
+            } else {
+                ai.pipestream.schemamanager.bulk.BulkItemResult baseResult =
+                        baseFuture == null ? null : baseFuture.join();
+                boolean baseOk = baseResult == null || baseResult.success();
+                List<ai.pipestream.schemamanager.bulk.BulkItemResult> chunkResults =
+                        chunkFutures.stream().map(CompletableFuture::join).toList();
+                long chunkFails = chunkResults.stream().filter(r -> !r.success()).count();
+                ok = baseOk && chunkFails == 0;
+                if (ok) {
+                    msg = String.format("Indexed %d chunks across %d chunk indices", totalChunks, indexGroups);
+                } else {
+                    // Carry the actual failure reason into the receipt so a failed doc
+                    // is traceable without grepping the bulk handler — e.g. a 429
+                    // rejection vs a mapping error vs a missing index.
+                    String sample = (!baseOk && baseResult != null)
+                            ? baseResult.failureDetail()
+                            : chunkResults.stream().filter(r -> !r.success())
+                                    .map(ai.pipestream.schemamanager.bulk.BulkItemResult::failureDetail)
+                                    .filter(java.util.Objects::nonNull)
+                                    .findFirst().orElse("unknown");
+                    msg = String.format("%s%d/%d chunks failed; reason: %s",
+                            baseOk ? "" : "base doc failed; ", chunkFails, totalChunks, sample);
+                }
+            }
+            return StreamIndexDocumentsResponse.newBuilder()
+                    .setRequestId(req.getRequestId())
+                    .setDocumentId(documentId)
+                    .setSuccess(ok)
+                    .setMessage(msg)
+                    .build();
+        }
     }
 
     // ===== Base document indexing =====
@@ -283,16 +437,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
         Map<String, Object> docAsMap;
         try {
             ensureBaseIndex(indexName);
-            String jsonDoc = JsonFormat.printer()
-                    .preservingProtoFieldNames()
-                    .print(docMap);
-            @SuppressWarnings("unchecked")
-            Map<String, Object> typed = objectMapper.readValue(jsonDoc, Map.class);
-            sanitizePunctuationCounts(typed);
-            if (!includeSentenceNlpInBaseDoc) {
-                stripSentenceLevelNlp(typed);
-            }
-            docAsMap = typed;
+            docAsMap = prepareBaseDocMap(docMap);
         } catch (Exception e) {
             LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", indexName, documentId);
             return new IndexOutcome(false, "Failed to serialize base document");
@@ -303,6 +448,25 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
             return IndexOutcome.ok();
         }
         return new IndexOutcome(false, result.failureDetail());
+    }
+
+    /**
+     * Serialize an {@link OpenSearchDocumentMap} into the flat map indexed as the base
+     * document: proto→JSON (preserving field names), punctuation-count cleanup, and the
+     * optional drop of per-sentence NLP (denormalized onto chunks). Shared by the unary
+     * {@link #indexBaseDocument} and the batched {@link #dispatch} paths.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> prepareBaseDocMap(OpenSearchDocumentMap docMap) throws Exception {
+        String jsonDoc = JsonFormat.printer()
+                .preservingProtoFieldNames()
+                .print(docMap);
+        Map<String, Object> typed = objectMapper.readValue(jsonDoc, Map.class);
+        sanitizePunctuationCounts(typed);
+        if (!includeSentenceNlpInBaseDoc) {
+            stripSentenceLevelNlp(typed);
+        }
+        return typed;
     }
 
     private static ai.pipestream.schemamanager.bulk.BulkItemResult awaitBulk(

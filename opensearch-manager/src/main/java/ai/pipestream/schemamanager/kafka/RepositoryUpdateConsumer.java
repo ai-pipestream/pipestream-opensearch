@@ -56,7 +56,7 @@ public class RepositoryUpdateConsumer {
     public void consumeDriveUpdate(Record<UUID, DriveUpdateNotification> record) {
         UUID key = record.key();
         DriveUpdateNotification notification = record.value();
-        LOG.infof("Received drive update: type=%s, drive=%s, key=%s",
+        LOG.debugf("Received drive update: type=%s, drive=%s, key=%s",
                 notification.getUpdateType(), notification.getDrive().getName(), key);
         try {
             processUpdate(
@@ -81,7 +81,7 @@ public class RepositoryUpdateConsumer {
         UUID key = record.key();
         RepositoryEvent event = record.value();
         String op = event.hasCreated() ? "CREATED" : event.hasUpdated() ? "UPDATED" : event.hasDeleted() ? "DELETED" : "UNKNOWN";
-        LOG.infof("Received repository event: op=%s, documentId=%s, accountId=%s, key=%s",
+        LOG.debugf("Received repository event: op=%s, documentId=%s, accountId=%s, key=%s",
                 op, event.getDocumentId(), event.getAccountId(), key);
         try {
             indexingService.indexRepositoryEvent(event, key);
@@ -98,7 +98,7 @@ public class RepositoryUpdateConsumer {
     @Incoming("module-updates-in")
     @Blocking
     public void consumeModuleUpdate(ModuleUpdateNotification notification) {
-        LOG.infof("Received module update: type=%s, module=%s",
+        LOG.debugf("Received module update: type=%s, module=%s",
                 notification.getUpdateType(), notification.getModule().getModuleId());
         try {
             processUpdate(
@@ -120,7 +120,7 @@ public class RepositoryUpdateConsumer {
     @Incoming("pipedoc-updates-in")
     @Blocking
     public void consumePipeDocUpdate(PipeDocUpdateNotification notification) {
-        LOG.infof("Received pipedoc update: type=%s, docId=%s",
+        LOG.debugf("Received pipedoc update: type=%s, docId=%s",
                 notification.getUpdateType(), notification.getDocId());
         try {
             processUpdate(
@@ -142,7 +142,7 @@ public class RepositoryUpdateConsumer {
     @Incoming("process-request-updates-in")
     @Blocking
     public void consumeProcessRequestUpdate(ProcessRequestUpdateNotification notification) {
-        LOG.infof("Received process request update: type=%s, requestId=%s",
+        LOG.debugf("Received process request update: type=%s, requestId=%s",
                 notification.getUpdateType(), notification.getRequestId());
         try {
             processUpdate(
@@ -164,7 +164,7 @@ public class RepositoryUpdateConsumer {
     @Incoming("process-response-updates-in")
     @Blocking
     public void consumeProcessResponseUpdate(ProcessResponseUpdateNotification notification) {
-        LOG.infof("Received process response update: type=%s, responseId=%s",
+        LOG.debugf("Received process response update: type=%s, responseId=%s",
                 notification.getUpdateType(), notification.getResponseId());
         try {
             processUpdate(
@@ -186,7 +186,7 @@ public class RepositoryUpdateConsumer {
     @Incoming("document-uploaded-events-in")
     @Blocking
     public void consumeDocumentUploadedEvent(DocumentUploadedEvent event) {
-        LOG.infof("Received document upload event: docId=%s, filename=%s, mimeType=%s, connector=%s",
+        LOG.debugf("Received document upload event: docId=%s, filename=%s, mimeType=%s, connector=%s",
                 event.getDocId(), event.getFilename(), event.getMimeType(), event.getConnectorId());
         try {
             indexingService.indexDocumentUpload(event);
@@ -202,7 +202,7 @@ public class RepositoryUpdateConsumer {
      */
     @Incoming("graph-updates-in")
     public void consumeGraphUpdate(GraphUpdateEvent event) {
-        LOG.infof("Received graph update event: kind=%s, graphId=%s, clusterId=%s, version=%s",
+        LOG.debugf("Received graph update event: kind=%s, graphId=%s, clusterId=%s, version=%s",
                 event.getUpdateKind(), event.getGraphId(), event.getClusterId(), event.getVersion());
 
         if (event.getUpdateKind() == GraphUpdateEventKind.GRAPH_UPDATE_EVENT_KIND_DEACTIVATED) {
