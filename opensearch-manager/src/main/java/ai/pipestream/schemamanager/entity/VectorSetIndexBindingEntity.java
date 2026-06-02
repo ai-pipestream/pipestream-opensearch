@@ -35,6 +35,13 @@ public class VectorSetIndexBindingEntity extends PanacheEntityBase {
     @Column(name = "index_name", nullable = false)
     public String indexName;
 
+    /**
+     * Optional human-readable label for this binding (e.g.
+     * "data-science-title-binding"). Does not affect recipe identity.
+     */
+    @Column(name = "name")
+    public String name;
+
     /** Optional owning account id. */
     @Column(name = "account_id")
     public String accountId;

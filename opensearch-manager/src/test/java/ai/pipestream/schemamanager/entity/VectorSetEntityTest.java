@@ -108,16 +108,22 @@ class VectorSetEntityTest {
         assertThat(byName.updatedAt).as("@UpdateTimestamp populated").isNotNull();
 
         VectorSetEntity byRecipe = vectorSetRepo.findByRecipe(
-                "embeddings_384", "default", chunker.id, model.id);
+                "embeddings_384", "default", chunker.id, model.id, "body");
         assertThat(byRecipe).as("findByRecipe returns the row").isNotNull();
         assertThat(byRecipe.id)
                 .as("findByRecipe resolves to the same row")
                 .isEqualTo(entity.id);
 
         VectorSetEntity bogusRecipe = vectorSetRepo.findByRecipe(
-                "embeddings_384", "non-default", chunker.id, model.id);
+                "embeddings_384", "non-default", chunker.id, model.id, "body");
         assertThat(bogusRecipe)
                 .as("findByRecipe is exact-match on result_set_name, not a fuzzy lookup")
+                .isNull();
+
+        VectorSetEntity bySource = vectorSetRepo.findByRecipe(
+                "embeddings_384", "default", chunker.id, model.id, "title");
+        assertThat(bySource)
+                .as("source_cel is part of identity — a different source is a different recipe")
                 .isNull();
 
         List<VectorSetEntity> byChunker = vectorSetRepo.findByChunkerConfigId(chunker.id);

@@ -131,11 +131,21 @@ public class VectorSetServiceEngine {
         if (existing == null) {
             String recipeResultSet = normalizeResultSetName(
                     request.hasResultSetName() ? request.getResultSetName() : null);
+            // sourceCel is part of identity: same recipe + different source =
+            // different embeddings = a different vector set.
             existing = vectorSetRepo.findByRecipe(
                     request.getFieldName(), recipeResultSet,
-                    request.getChunkerConfigId(), request.getEmbeddingModelConfigId());
+                    request.getChunkerConfigId(), request.getEmbeddingModelConfigId(),
+                    effectiveSourceCel(request));
         }
         if (existing != null) {
+            // Idempotent get-or-create: the same identity returns the canonical
+            // row. Still honor a requested index binding so a second call that
+            // names a new index (or binding) isn't silently dropped.
+            String existingIndexName = request.getIndexName();
+            if (existingIndexName != null && !existingIndexName.isBlank()) {
+                ensureIndexBindingForCreate(existing, existingIndexName, bindingNameOrNull(request));
+            }
             return existing;
         }
 
@@ -179,9 +189,16 @@ public class VectorSetServiceEngine {
 
         String indexName = request.getIndexName();
         if (indexName != null && !indexName.isBlank()) {
-            ensureIndexBindingForCreate(entity, indexName);
+            ensureIndexBindingForCreate(entity, indexName, bindingNameOrNull(request));
         }
         return entity;
+    }
+
+    /** The label for an auto-created binding on create, or null when unset. */
+    private static String bindingNameOrNull(CreateVectorSetRequest request) {
+        return request.hasBindingName() && !request.getBindingName().isBlank()
+                ? request.getBindingName()
+                : null;
     }
 
     /**
@@ -485,7 +502,7 @@ public class VectorSetServiceEngine {
      * together. On constraint violation the binding already exists and we
      * simply log and continue.
      */
-    private void ensureIndexBindingForCreate(VectorSetEntity saved, String indexName) {
+    private void ensureIndexBindingForCreate(VectorSetEntity saved, String indexName, String bindingName) {
         VectorSetIndexBindingEntity existing = bindingRepo.findBinding(saved.id, indexName);
         if (existing != null) {
             LOG.infof("Vector set already bound to index: vectorSet=%s index=%s — binding exists, skipping create",
@@ -497,6 +514,7 @@ public class VectorSetServiceEngine {
             binding.id = UUID.randomUUID().toString();
             binding.vectorSet = saved;
             binding.indexName = indexName;
+            binding.name = bindingName;
             binding.status = "ACTIVE";
             bindingRepo.persist(binding);
         } catch (ConstraintViolationException dup) {
@@ -542,6 +560,7 @@ public class VectorSetServiceEngine {
         final String indexName = request.getIndexName();
         final String accountId = request.hasAccountId() ? request.getAccountId() : null;
         final String datasourceId = request.hasDatasourceId() ? request.getDatasourceId() : null;
+        final String bindingName = request.hasName() ? request.getName() : null;
         final IndexingStrategy strategy = request.getIndexingStrategy();
 
         // Phase 1: lookup recipe + existing binding (read-only, no transaction).
@@ -569,7 +588,7 @@ public class VectorSetServiceEngine {
             // Phase 3: insert binding row in a fresh transaction. Concurrent
             // insert races resolve to an existing-row read.
             try {
-                VectorSetIndexBindingEntity persisted = persistBinding(vsId, indexName, accountId, datasourceId);
+                VectorSetIndexBindingEntity persisted = persistBinding(vsId, indexName, accountId, datasourceId, bindingName);
                 response = BindVectorSetToIndexResponse.newBuilder()
                         .setBinding(toBindingProto(persisted))
                         .setCreated(true)
@@ -627,7 +646,7 @@ public class VectorSetServiceEngine {
      */
     @Transactional
     protected VectorSetIndexBindingEntity persistBinding(
-            String vsId, String indexName, String accountId, String datasourceId) {
+            String vsId, String indexName, String accountId, String datasourceId, String name) {
         VectorSetEntity vs = vectorSetRepo.findById(vsId);
         VectorSetIndexBindingEntity row = new VectorSetIndexBindingEntity();
         row.id = UUID.randomUUID().toString();
@@ -635,6 +654,7 @@ public class VectorSetServiceEngine {
         row.indexName = indexName;
         row.accountId = accountId;
         row.datasourceId = datasourceId;
+        row.name = name;
         row.status = "ACTIVE";
         bindingRepo.persist(row);
         return row;
@@ -893,6 +913,7 @@ public class VectorSetServiceEngine {
                 .setStatus(parseBindingStatus(row.status));
         if (row.accountId != null) b.setAccountId(row.accountId);
         if (row.datasourceId != null) b.setDatasourceId(row.datasourceId);
+        if (row.name != null) b.setName(row.name);
         if (row.createdAt != null) b.setCreatedAt(toTimestamp(row.createdAt));
         if (row.updatedAt != null) b.setUpdatedAt(toTimestamp(row.updatedAt));
         return b.build();

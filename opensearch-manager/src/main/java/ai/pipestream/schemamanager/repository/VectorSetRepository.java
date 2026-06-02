@@ -31,16 +31,21 @@ public class VectorSetRepository implements PanacheRepositoryBase<VectorSetEntit
     /**
      * Finds a vector set by the tuple that defines its recipe.
      *
+     * <p>{@code sourceCel} is part of the identity: the same field/result-set/
+     * chunker/embedding with a different source embeds different text, so it is
+     * a different vector set.
+     *
      * @param fieldName      nested field name
      * @param resultSetName  logical result set
      * @param chunkerId      chunker config id
      * @param embeddingId    embedding model config id
+     * @param sourceCel      effective source selector (CEL / source field)
      * @return entity or {@code null}
      */
     public VectorSetEntity findByRecipe(
-            String fieldName, String resultSetName, String chunkerId, String embeddingId) {
-        return find("fieldName = ?1 and resultSetName = ?2 and chunkerConfig.id = ?3 and embeddingModelConfig.id = ?4",
-                fieldName, resultSetName, chunkerId, embeddingId).firstResult();
+            String fieldName, String resultSetName, String chunkerId, String embeddingId, String sourceCel) {
+        return find("fieldName = ?1 and resultSetName = ?2 and chunkerConfig.id = ?3 and embeddingModelConfig.id = ?4 and sourceCel = ?5",
+                fieldName, resultSetName, chunkerId, embeddingId, sourceCel).firstResult();
     }
 
     /**

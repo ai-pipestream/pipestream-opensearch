@@ -129,13 +129,13 @@ class VectorSetServiceGrpcTest {
     }
 
     @Test
-    void createDuplicateIndexFieldResultSet_fails() {
+    void createSameRecipeAndSource_isIdempotent() {
         String uid = UUID.randomUUID().toString().substring(0, 8);
         String chunkerId = createChunkerConfig("dup-" + uid);
         String embeddingId = createEmbeddingConfig("dup-" + uid, 384);
         String indexName = "dup-index-" + uid;
 
-        vectorSetClient.createVectorSet(
+        var first = vectorSetClient.createVectorSet(
                 CreateVectorSetRequest.newBuilder()
                         .setName("vs-dup1-" + uid)
                         .setChunkerConfigId(chunkerId)
@@ -146,19 +146,88 @@ class VectorSetServiceGrpcTest {
                         .build()
         );
 
-        // Second with same (index, field, result_set) should fail
-        assertThrows(StatusRuntimeException.class, () ->
-                vectorSetClient.createVectorSet(
-                        CreateVectorSetRequest.newBuilder()
-                                .setName("vs-dup2-" + uid)
-                                .setChunkerConfigId(chunkerId)
-                                .setEmbeddingModelConfigId(embeddingId)
-                                .setIndexName(indexName)
-                                .setFieldName("embeddings")
-                                .setSourceField("body")
-                                .build()
-                )
+        // Same recipe + same source under a different name is the SAME vector
+        // set: get-or-create returns the canonical row idempotently (no throw).
+        // Names live on the binding, not the recipe.
+        var second = vectorSetClient.createVectorSet(
+                CreateVectorSetRequest.newBuilder()
+                        .setName("vs-dup2-" + uid)
+                        .setChunkerConfigId(chunkerId)
+                        .setEmbeddingModelConfigId(embeddingId)
+                        .setIndexName(indexName)
+                        .setFieldName("embeddings")
+                        .setSourceField("body")
+                        .build()
         );
+
+        assertThat(second.getVectorSet().getId(), equalTo(first.getVectorSet().getId()));
+    }
+
+    @Test
+    void createSameRecipeDifferentSource_makesDistinctVectorSet() {
+        String uid = UUID.randomUUID().toString().substring(0, 8);
+        String chunkerId = createChunkerConfig("src-" + uid);
+        String embeddingId = createEmbeddingConfig("src-" + uid, 384);
+        String indexName = "src-index-" + uid;
+
+        var body = vectorSetClient.createVectorSet(
+                CreateVectorSetRequest.newBuilder()
+                        .setName("vs-src-body-" + uid)
+                        .setChunkerConfigId(chunkerId)
+                        .setEmbeddingModelConfigId(embeddingId)
+                        .setIndexName(indexName)
+                        .setFieldName("embeddings")
+                        .setSourceField("body")
+                        .build()
+        );
+
+        // Identical recipe but a DIFFERENT source embeds different text, so it
+        // must be a distinct vector set — never silently merged with the first.
+        var title = vectorSetClient.createVectorSet(
+                CreateVectorSetRequest.newBuilder()
+                        .setName("vs-src-title-" + uid)
+                        .setChunkerConfigId(chunkerId)
+                        .setEmbeddingModelConfigId(embeddingId)
+                        .setIndexName(indexName)
+                        .setFieldName("embeddings")
+                        .setSourceField("title")
+                        .build()
+        );
+
+        assertThat(title.getVectorSet().getId(),
+                not(equalTo(body.getVectorSet().getId())));
+    }
+
+    @Test
+    void bindingNameIsPersisted_onCreateWithIndex() {
+        String uid = UUID.randomUUID().toString().substring(0, 8);
+        String chunkerId = createChunkerConfig("bn-" + uid);
+        String embeddingId = createEmbeddingConfig("bn-" + uid, 384);
+        String indexName = "bn-index-" + uid;
+
+        var created = vectorSetClient.createVectorSet(
+                CreateVectorSetRequest.newBuilder()
+                        .setName("vs-bn-" + uid)
+                        .setChunkerConfigId(chunkerId)
+                        .setEmbeddingModelConfigId(embeddingId)
+                        .setIndexName(indexName)
+                        .setFieldName("embeddings")
+                        .setSourceField("body")
+                        .setBindingName("data-science-title-binding")
+                        .build()
+        );
+
+        var bindings = vectorSetClient.listIndicesForVectorSet(
+                ListIndicesForVectorSetRequest.newBuilder()
+                        .setVectorSetId(created.getVectorSet().getId())
+                        .build()
+        ).getBindingsList();
+
+        var binding = bindings.stream()
+                .filter(b -> indexName.equals(b.getIndexName()))
+                .findFirst()
+                .orElseThrow();
+        assertThat(binding.getName(), equalTo("data-science-title-binding"));
     }
 
     @Test
