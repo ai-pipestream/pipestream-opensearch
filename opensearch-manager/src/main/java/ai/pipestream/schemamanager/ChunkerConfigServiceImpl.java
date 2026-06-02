@@ -4,15 +4,18 @@ import ai.pipestream.opensearch.v1.*;
 import ai.pipestream.schemamanager.entity.ChunkerConfigEntity;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.kafka.SemanticMetadataEventProducer;
+import ai.pipestream.schemamanager.repository.ChunkerConfigRepository;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
 import com.google.protobuf.util.JsonFormat;
 import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
-import io.quarkus.hibernate.reactive.panache.Panache;
-import io.quarkus.hibernate.reactive.panache.common.WithSession;
-import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
-import io.smallrye.mutiny.Uni;
+import io.smallrye.common.annotation.RunOnVirtualThread;
+import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
+import org.hibernate.exception.ConstraintViolationException;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
@@ -22,29 +25,36 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Fully reactive gRPC implementation for ChunkerConfigService.
- * Uses Hibernate Reactive Panache with Mutiny; no blocking calls.
+ * gRPC implementation for ChunkerConfigService. Runs on virtual threads with
+ * blocking Hibernate ORM (classic) via the {@link ChunkerConfigRepository}
+ * surface; no Mutiny on the wire or in the data layer.
  */
 @GrpcService
-public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.ChunkerConfigServiceImplBase {
+public class ChunkerConfigServiceImpl extends ChunkerConfigServiceGrpc.ChunkerConfigServiceImplBase {
 
     private static final Logger LOG = Logger.getLogger(ChunkerConfigServiceImpl.class);
 
     private final SemanticMetadataEventProducer eventProducer;
+
+    @Inject
+    ChunkerConfigRepository chunkerRepo;
+
+    @Inject
+    VectorSetRepository vectorSetRepo;
 
     /**
      * Creates the gRPC service with its Kafka side-effect producer.
      *
      * @param eventProducer Kafka metadata event producer for semantic config updates
      */
+    @Inject
     public ChunkerConfigServiceImpl(SemanticMetadataEventProducer eventProducer) {
         this.eventProducer = eventProducer;
     }
 
     /**
      * Derives config_id from config_json using module-chunker's format:
-     * {algorithm}-{sourceField}-{chunkSize}-{chunkOverlap}
-     * Example: token-body-512-50
+     * {algorithm}-{sourceField}-{chunkSize}-{chunkOverlap}.
      */
     private String deriveConfigId(Struct configJson) {
         if (configJson == null || configJson.getFieldsCount() == 0) return null;
@@ -57,136 +67,198 @@ public class ChunkerConfigServiceImpl extends MutinyChunkerConfigServiceGrpc.Chu
     }
 
     @Override
-    @WithTransaction
-    public Uni<CreateChunkerConfigResponse> createChunkerConfig(CreateChunkerConfigRequest request) {
-        return Panache.withTransaction(() -> {
-            String id = request.hasId() && !request.getId().isBlank()
-                    ? request.getId()
-                    : UUID.randomUUID().toString();
-            Struct configStruct = request.hasConfigJson() ? request.getConfigJson() : Struct.getDefaultInstance();
-            String configId = request.hasConfigId() && !request.getConfigId().isBlank()
-                    ? request.getConfigId()
-                    : deriveConfigId(configStruct);
-            if (configId == null) configId = "unknown-config";
-            ChunkerConfigEntity entity = new ChunkerConfigEntity();
-            entity.id = id;
-            entity.name = request.getName();
-            entity.configId = configId;
-            entity.configJson = structToJson(configStruct);
-            entity.schemaRef = request.hasSchemaRef() ? request.getSchemaRef() : null;
-            entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
-            return entity.persist()
-                    .replaceWith(entity);
-        })
-                // If a config with the same name/configId already exists, return the existing one.
-                // Recovery needs its own session — the original session is corrupted after constraint violation.
-                .onFailure().recoverWithUni(err -> {
-                    if (isConstraintViolation(err)) {
-                        LOG.infof("Chunker config '%s' already exists — returning existing", request.getName());
-                        return Panache.withSession(() -> ChunkerConfigEntity.findByName(request.getName()));
-                    }
-                    return Uni.createFrom().failure(err);
-                })
-                .onItem().transform(this::toChunkerConfigProto)
-                .call(config -> eventProducer.publishChunkerConfigCreated(config))
-                .map(config -> CreateChunkerConfigResponse.newBuilder().setConfig(config).build());
-    }
-
-    @Override
-    @WithSession
-    public Uni<GetChunkerConfigResponse> getChunkerConfig(GetChunkerConfigRequest request) {
-        Uni<ChunkerConfigEntity> lookup = request.getByName()
-                ? ChunkerConfigEntity.findByName(request.getId())
-                : ChunkerConfigEntity.findById(request.getId());
-        return Panache.withSession(() -> lookup)
-                .onItem().transformToUni(e -> e != null
-                        ? Uni.createFrom().item(GetChunkerConfigResponse.newBuilder()
-                                .setConfig(toChunkerConfigProto((ChunkerConfigEntity) e)).build())
-                        : Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Chunker config not found: " + request.getId())
-                                .asRuntimeException()));
-    }
-
-    @Override
-    @WithTransaction
-    public Uni<UpdateChunkerConfigResponse> updateChunkerConfig(UpdateChunkerConfigRequest request) {
-        return Panache.withTransaction(() -> ChunkerConfigEntity.findById(request.getId())
-                .onItem().transformToUni(e -> {
-                    if (e == null) {
-                        return Uni.createFrom().failure(Status.NOT_FOUND
-                                .withDescription("Chunker config not found: " + request.getId())
-                                .asRuntimeException());
-                    }
-                    ChunkerConfigEntity entity = (ChunkerConfigEntity) e;
-                    ChunkerConfig previous = toChunkerConfigProto(entity);
-                    if (request.hasName()) entity.name = request.getName();
-                    if (request.hasConfigId()) entity.configId = request.getConfigId();
-                    if (request.hasConfigJson()) entity.configJson = structToJson(request.getConfigJson());
-                    if (request.hasSchemaRef()) entity.schemaRef = request.getSchemaRef();
-                    if (request.hasMetadata()) entity.metadata = structToJson(request.getMetadata());
-                    return entity.persist().replaceWith(Uni.createFrom().item(new Object[] { previous, entity }));
-                }))
-                .onItem().transformToUni(pair -> {
-                    var previous = (ChunkerConfig) ((Object[]) pair)[0];
-                    var entity = (ChunkerConfigEntity) ((Object[]) pair)[1];
-                    var current = toChunkerConfigProto(entity);
-                    return eventProducer.publishChunkerConfigUpdated(previous, current)
-                            .replaceWith(UpdateChunkerConfigResponse.newBuilder().setConfig(current).build());
-                });
-    }
-
-    @Override
-    @WithTransaction
-    public Uni<DeleteChunkerConfigResponse> deleteChunkerConfig(DeleteChunkerConfigRequest request) {
-        return Panache.withTransaction(() ->
-                ChunkerConfigEntity.findById(request.getId())
-                        .onItem().transformToUni(e -> {
-                            if (e == null) {
-                                return Uni.createFrom().item(DeleteChunkerConfigResponse.newBuilder()
-                                        .setSuccess(false)
-                                        .setMessage("Not found: " + request.getId()).build());
-                            }
-                            // Check VectorSet references before deleting
-                            return VectorSetEntity.findByChunkerConfigId(request.getId())
-                                    .onItem().transformToUni(refs -> {
-                                        if (!refs.isEmpty()) {
-                                            return Uni.createFrom().<DeleteChunkerConfigResponse>failure(
-                                                    Status.FAILED_PRECONDITION
-                                                            .withDescription(String.format(
-                                                                    "Cannot delete chunker config '%s': referenced by %d VectorSet(s)",
-                                                                    request.getId(), refs.size()))
-                                                            .asRuntimeException());
-                                        }
-                                        return ((ChunkerConfigEntity) e).delete()
-                                                .replaceWith(DeleteChunkerConfigResponse.newBuilder()
-                                                        .setSuccess(true)
-                                                        .setMessage("Deleted").build())
-                                                .call(() -> eventProducer.publishChunkerConfigDeleted(request.getId()));
-                                    });
-                        }));
-    }
-
-    @Override
-    @WithSession
-    public Uni<ListChunkerConfigsResponse> listChunkerConfigs(ListChunkerConfigsRequest request) {
-        int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
-        int page = parsePageToken(request.getPageToken());
-        return Panache.withSession(() -> ChunkerConfigEntity.listOrderedByCreatedDesc(page, pageSize))
-                .onItem().transform(entities -> ListChunkerConfigsResponse.newBuilder()
-                        .addAllConfigs(entities.stream().map(this::toChunkerConfigProto).toList())
-                        .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
-                        .build());
-    }
-
-    private static boolean isConstraintViolation(Throwable t) {
-        while (t != null) {
-            String msg = t.getMessage();
-            if (msg != null && (msg.contains("23505") || msg.contains("unique constraint") || msg.contains("duplicate key"))) {
-                return true;
+    @RunOnVirtualThread
+    public void createChunkerConfig(CreateChunkerConfigRequest request,
+                                    StreamObserver<CreateChunkerConfigResponse> obs) {
+        try {
+            ChunkerConfigEntity entity;
+            try {
+                entity = getOrCreate(request);
+            } catch (ConstraintViolationException dup) {
+                // Backstop for the rare concurrent-create race: two callers both
+                // saw no row and both inserted, so one trips the unique
+                // constraint at commit. The common "already exists" case never
+                // reaches here — getOrCreate returns the existing row without
+                // attempting an INSERT, so there's no violation and no noisy
+                // ARJUNA/Hibernate stack in the log.
+                LOG.infof("Chunker config '%s' created concurrently — returning existing", request.getName());
+                entity = chunkerRepo.findByName(request.getName());
+                if (entity == null) {
+                    throw Status.ALREADY_EXISTS
+                            .withDescription("Constraint violation but row not found by name: " + request.getName())
+                            .asRuntimeException();
+                }
             }
-            t = t.getCause();
+            ChunkerConfig proto = toChunkerConfigProto(entity);
+            eventProducer.publishChunkerConfigCreated(proto);
+            obs.onNext(CreateChunkerConfigResponse.newBuilder().setConfig(proto).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
         }
-        return false;
+    }
+
+    /**
+     * Get-or-create a chunker config by name, in one transaction. Looks the row
+     * up by its unique name first so re-registering an existing fixture is a
+     * clean no-op return — we never issue an INSERT we know will violate
+     * {@code unique_chunker_config_name} at commit (which would log a noisy
+     * ARJUNA/Hibernate stack and surface to the caller as gRPC UNKNOWN).
+     *
+     * @param request creation request
+     * @return the existing or newly-persisted entity
+     */
+    @Transactional
+    protected ChunkerConfigEntity getOrCreate(CreateChunkerConfigRequest request) {
+        ChunkerConfigEntity existing = chunkerRepo.findByName(request.getName());
+        if (existing != null) {
+            return existing;
+        }
+        String id = request.hasId() && !request.getId().isBlank()
+                ? request.getId()
+                : UUID.randomUUID().toString();
+        Struct configStruct = request.hasConfigJson() ? request.getConfigJson() : Struct.getDefaultInstance();
+        String configId = request.hasConfigId() && !request.getConfigId().isBlank()
+                ? request.getConfigId()
+                : deriveConfigId(configStruct);
+        if (configId == null) configId = "unknown-config";
+        ChunkerConfigEntity entity = new ChunkerConfigEntity();
+        entity.id = id;
+        entity.name = request.getName();
+        entity.configId = configId;
+        entity.configJson = structToJson(configStruct);
+        entity.schemaRef = request.hasSchemaRef() ? request.getSchemaRef() : null;
+        entity.metadata = request.hasMetadata() ? structToJson(request.getMetadata()) : null;
+        chunkerRepo.persist(entity);
+        return entity;
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void getChunkerConfig(GetChunkerConfigRequest request,
+                                 StreamObserver<GetChunkerConfigResponse> obs) {
+        try {
+            ChunkerConfigEntity e = request.getByName()
+                    ? chunkerRepo.findByName(request.getId())
+                    : chunkerRepo.findById(request.getId());
+            if (e == null) {
+                obs.onError(Status.NOT_FOUND
+                        .withDescription("Chunker config not found: " + request.getId())
+                        .asRuntimeException());
+                return;
+            }
+            obs.onNext(GetChunkerConfigResponse.newBuilder()
+                    .setConfig(toChunkerConfigProto(e)).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void updateChunkerConfig(UpdateChunkerConfigRequest request,
+                                    StreamObserver<UpdateChunkerConfigResponse> obs) {
+        try {
+            UpdateResult result = applyUpdate(request);
+            ChunkerConfig current = toChunkerConfigProto(result.entity);
+            eventProducer.publishChunkerConfigUpdated(result.previous, current);
+            obs.onNext(UpdateChunkerConfigResponse.newBuilder().setConfig(current).build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    /**
+     * Apply updates to an existing chunker config.
+     *
+     * @param request update request
+     * @return update result with previous and current state
+     */
+    @Transactional
+    protected UpdateResult applyUpdate(UpdateChunkerConfigRequest request) {
+        ChunkerConfigEntity entity = chunkerRepo.findById(request.getId());
+        if (entity == null) {
+            throw Status.NOT_FOUND
+                    .withDescription("Chunker config not found: " + request.getId())
+                    .asRuntimeException();
+        }
+        ChunkerConfig previous = toChunkerConfigProto(entity);
+        if (request.hasName()) entity.name = request.getName();
+        if (request.hasConfigId()) entity.configId = request.getConfigId();
+        if (request.hasConfigJson()) entity.configJson = structToJson(request.getConfigJson());
+        if (request.hasSchemaRef()) entity.schemaRef = request.getSchemaRef();
+        if (request.hasMetadata()) entity.metadata = structToJson(request.getMetadata());
+        chunkerRepo.persist(entity);
+        return new UpdateResult(previous, entity);
+    }
+
+    private record UpdateResult(ChunkerConfig previous, ChunkerConfigEntity entity) {
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void deleteChunkerConfig(DeleteChunkerConfigRequest request,
+                                    StreamObserver<DeleteChunkerConfigResponse> obs) {
+        try {
+            DeleteOutcome outcome = applyDelete(request);
+            if (outcome.deleted) {
+                eventProducer.publishChunkerConfigDeleted(request.getId());
+            }
+            obs.onNext(DeleteChunkerConfigResponse.newBuilder()
+                    .setSuccess(outcome.deleted)
+                    .setMessage(outcome.message)
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
+    }
+
+    /**
+     * Delete a chunker config if not in use.
+     *
+     * @param request delete request
+     * @return outcome with success flag and optional message
+     */
+    @Transactional
+    protected DeleteOutcome applyDelete(DeleteChunkerConfigRequest request) {
+        ChunkerConfigEntity entity = chunkerRepo.findById(request.getId());
+        if (entity == null) {
+            return new DeleteOutcome(false, "Not found: " + request.getId());
+        }
+        List<VectorSetEntity> refs = vectorSetRepo.findByChunkerConfigId(request.getId());
+        if (!refs.isEmpty()) {
+            throw Status.FAILED_PRECONDITION
+                    .withDescription(String.format(
+                            "Cannot delete chunker config '%s': referenced by %d VectorSet(s)",
+                            request.getId(), refs.size()))
+                    .asRuntimeException();
+        }
+        chunkerRepo.delete(entity);
+        return new DeleteOutcome(true, "Deleted");
+    }
+
+    private record DeleteOutcome(boolean deleted, String message) {
+    }
+
+    @Override
+    @RunOnVirtualThread
+    public void listChunkerConfigs(ListChunkerConfigsRequest request,
+                                   StreamObserver<ListChunkerConfigsResponse> obs) {
+        try {
+            int pageSize = request.getPageSize() > 0 ? Math.min(request.getPageSize(), 100) : 20;
+            int page = parsePageToken(request.getPageToken());
+            List<ChunkerConfigEntity> entities = chunkerRepo.listOrderedByCreatedDesc(page, pageSize);
+            obs.onNext(ListChunkerConfigsResponse.newBuilder()
+                    .addAllConfigs(entities.stream().map(this::toChunkerConfigProto).toList())
+                    .setNextPageToken(entities.size() == pageSize ? String.valueOf(page + 1) : "")
+                    .build());
+            obs.onCompleted();
+        } catch (Throwable t) {
+            obs.onError(t);
+        }
     }
 
     // --- Proto conversion helpers ---

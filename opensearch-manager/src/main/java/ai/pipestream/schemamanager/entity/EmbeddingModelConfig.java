@@ -1,7 +1,6 @@
 package ai.pipestream.schemamanager.entity;
 
-import io.quarkus.hibernate.reactive.panache.PanacheEntityBase;
-import io.smallrye.mutiny.Uni;
+import io.quarkus.hibernate.orm.panache.PanacheEntityBase;
 import jakarta.persistence.*;
 import org.hibernate.annotations.CreationTimestamp;
 import org.hibernate.annotations.JdbcTypeCode;
@@ -81,23 +80,4 @@ public class EmbeddingModelConfig extends PanacheEntityBase {
     /** Provider id (for example DJL serving). */
     @Column(name = "provider", nullable = false)
     public String provider = "djl-serving";
-
-    /**
-     * Finds an embedding model configuration by unique name.
-     *
-     * @param name unique model name
-     * @return matching entity or {@code null}
-     */
-    public static Uni<EmbeddingModelConfig> findByName(String name) {
-        return find("name", name).firstResult();
-    }
-
-    /**
-     * Lists all embedding models that are currently enabled.
-     *
-     * @return all models marked {@link #enabled}
-     */
-    public static Uni<java.util.List<EmbeddingModelConfig>> findAllEnabled() {
-        return find("enabled", true).list();
-    }
 }

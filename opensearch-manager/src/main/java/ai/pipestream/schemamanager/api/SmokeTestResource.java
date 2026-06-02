@@ -5,13 +5,15 @@ import ai.pipestream.schemamanager.OpenSearchIndexingService;
 import ai.pipestream.schemamanager.entity.VectorSetEntity;
 import ai.pipestream.schemamanager.entity.VectorSetIndexBindingEntity;
 import ai.pipestream.schemamanager.opensearch.OpenSearchSchemaService;
+import ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository;
+import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import ai.pipestream.schemamanager.util.AnyDocumentMapper;
 import ai.pipestream.schemamanager.v1.VectorFieldDefinition;
 import com.google.protobuf.Any;
 import com.google.protobuf.util.JsonFormat;
-import io.quarkus.hibernate.reactive.panache.common.WithTransaction;
-import io.smallrye.mutiny.Uni;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
 import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
@@ -22,6 +24,7 @@ import java.util.*;
 /**
  * Production-safe smoke test endpoints for verifying the semantic indexing pipeline.
  * These endpoints exercise the real OpenSearch, DB, and mapping layers end-to-end.
+ * Blocking on virtual threads.
  */
 @Path("/api/v1/smoke")
 @Produces(MediaType.APPLICATION_JSON)
@@ -30,9 +33,7 @@ public class SmokeTestResource {
 
     private static final Logger LOG = Logger.getLogger(SmokeTestResource.class);
 
-    /**
-     * Creates the smoke test resource.
-     */
+    /** Creates the smoke test resource. */
     public SmokeTestResource() {
     }
 
@@ -48,6 +49,12 @@ public class SmokeTestResource {
     @Inject
     org.opensearch.client.opensearch.OpenSearchClient openSearchClient;
 
+    @Inject
+    VectorSetIndexBindingRepository bindingRepo;
+
+    @Inject
+    VectorSetRepository vectorSetRepo;
+
     /**
      * Check OpenSearch connectivity by testing index existence on a known-missing index.
      *
@@ -55,23 +62,25 @@ public class SmokeTestResource {
      */
     @GET
     @Path("/opensearch")
-    public Uni<Response> checkOpenSearch() {
+    @RunOnVirtualThread
+    public Response checkOpenSearch() {
         String probeIndex = "smoke-probe-" + UUID.randomUUID();
-        return schemaService.nestedMappingExists(probeIndex, "embeddings")
-                .map(exists -> Response.ok(Map.of(
-                        "status", "ok",
-                        "opensearchReachable", true,
-                        "probeIndex", probeIndex,
-                        "probeResult", exists
-                )).build())
-                .onFailure().recoverWithItem(err -> {
-                    LOG.errorf(err, "OpenSearch connectivity check failed");
-                    return Response.status(503).entity(Map.of(
-                            "status", "error",
-                            "opensearchReachable", false,
-                            "error", err.getMessage()
-                    )).build();
-                });
+        try {
+            boolean exists = schemaService.nestedMappingExists(probeIndex, "embeddings");
+            return Response.ok(Map.of(
+                    "status", "ok",
+                    "opensearchReachable", true,
+                    "probeIndex", probeIndex,
+                    "probeResult", exists
+            )).build();
+        } catch (Exception err) {
+            LOG.errorf(err, "OpenSearch connectivity check failed");
+            return Response.status(503).entity(Map.of(
+                    "status", "error",
+                    "opensearchReachable", false,
+                    "error", String.valueOf(err.getMessage())
+            )).build();
+        }
     }
 
     /**
@@ -84,37 +93,35 @@ public class SmokeTestResource {
      */
     @POST
     @Path("/create-index")
-    public Uni<Response> createIndex(
+    @RunOnVirtualThread
+    public Response createIndex(
             @QueryParam("index") String indexName,
             @QueryParam("dimensions") @DefaultValue("0") int dimensions,
             @QueryParam("field") @DefaultValue("embeddings") String fieldName) {
 
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'index' query param")).build());
+            return Response.status(400).entity(Map.of("error", "Missing 'index' query param")).build();
         }
         if (dimensions <= 0) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'dimensions' query param — must be specified explicitly")).build());
+            return Response.status(400)
+                    .entity(Map.of("error", "Missing 'dimensions' query param — must be specified explicitly")).build();
         }
 
         VectorFieldDefinition vfd = VectorFieldDefinition.newBuilder()
                 .setDimension(dimensions)
                 .build();
-
-        return schemaService.createIndexWithNestedMapping(indexName, fieldName, vfd)
-                .map(success -> Response.ok(Map.of(
-                        "success", success,
-                        "indexName", indexName,
-                        "fieldName", fieldName,
-                        "dimensions", dimensions
-                )).build())
-                .onFailure().recoverWithItem(err -> {
-                    LOG.errorf(err, "Failed to create index %s", indexName);
-                    return Response.status(500).entity(Map.of(
-                            "error", err.getMessage()
-                    )).build();
-                });
+        try {
+            boolean success = schemaService.createIndexWithNestedMapping(indexName, fieldName, vfd);
+            return Response.ok(Map.of(
+                    "success", success,
+                    "indexName", indexName,
+                    "fieldName", fieldName,
+                    "dimensions", dimensions
+            )).build();
+        } catch (Exception err) {
+            LOG.errorf(err, "Failed to create index %s", indexName);
+            return Response.status(500).entity(Map.of("error", String.valueOf(err.getMessage()))).build();
+        }
     }
 
     /**
@@ -128,8 +135,9 @@ public class SmokeTestResource {
      */
     @POST
     @Path("/index-document")
-    @WithTransaction
-    public Uni<Response> indexDocument(Map<String, Object> payload) {
+    @Transactional
+    @RunOnVirtualThread
+    public Response indexDocument(Map<String, Object> payload) {
         String indexName = stringOrDefault(payload, "indexName", null);
         String accountId = stringOrDefault(payload, "accountId", null);
         String datasourceId = stringOrDefault(payload, "datasourceId", null);
@@ -140,17 +148,16 @@ public class SmokeTestResource {
         String title = stringOrDefault(payload, "title", "Smoke Test Document");
         int dimensions = intOrDefault(payload, "dimensions", 0);
         if (dimensions <= 0) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'dimensions' — must be specified explicitly")).build());
+            return Response.status(400)
+                    .entity(Map.of("error", "Missing 'dimensions' — must be specified explicitly")).build();
         }
-
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'indexName' in request body")).build());
+            return Response.status(400)
+                    .entity(Map.of("error", "Missing 'indexName' in request body")).build();
         }
         if (chunkConfigId == null || embeddingId == null) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Both 'chunkConfigId' and 'embeddingId' are required")).build());
+            return Response.status(400)
+                    .entity(Map.of("error", "Both 'chunkConfigId' and 'embeddingId' are required")).build();
         }
 
         String docId = UUID.randomUUID().toString();
@@ -186,25 +193,21 @@ public class SmokeTestResource {
                 .setAccountId(accountId != null ? accountId : "")
                 .setDatasourceId(datasourceId != null ? datasourceId : "")
                 .build();
-
-        return indexingService.indexDocument(request)
-                .map(resp -> {
-                    Map<String, Object> result = new LinkedHashMap<>();
-                    result.put("success", resp.getSuccess());
-                    result.put("documentId", resp.getDocumentId());
-                    result.put("message", resp.getMessage());
-                    result.put("indexName", indexName);
-                    result.put("chunkConfigId", chunkConfigId);
-                    result.put("embeddingId", embeddingId);
-                    result.put("dimensions", dimensions);
-                    return Response.ok(result).build();
-                })
-                .onFailure().recoverWithItem(err -> {
-                    LOG.errorf(err, "Smoke test index-document failed");
-                    return Response.status(500).entity(Map.of(
-                            "error", err.getMessage()
-                    )).build();
-                });
+        try {
+            IndexDocumentResponse resp = indexingService.indexDocument(request);
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("success", resp.getSuccess());
+            result.put("documentId", resp.getDocumentId());
+            result.put("message", resp.getMessage());
+            result.put("indexName", indexName);
+            result.put("chunkConfigId", chunkConfigId);
+            result.put("embeddingId", embeddingId);
+            result.put("dimensions", dimensions);
+            return Response.ok(result).build();
+        } catch (Exception err) {
+            LOG.errorf(err, "Smoke test index-document failed");
+            return Response.status(500).entity(Map.of("error", String.valueOf(err.getMessage()))).build();
+        }
     }
 
     /**
@@ -215,58 +218,52 @@ public class SmokeTestResource {
      */
     @GET
     @Path("/verify")
-    public Uni<Response> verify(@QueryParam("index") String indexName) {
+    @Transactional
+    @RunOnVirtualThread
+    public Response verify(@QueryParam("index") String indexName) {
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'index' query param")).build());
+            return Response.status(400).entity(Map.of("error", "Missing 'index' query param")).build();
         }
+        try {
+            List<VectorSetIndexBindingEntity> bindings = bindingRepo.list("indexName", indexName);
+            List<Map<String, Object>> bindingsList = bindings.stream().map(b -> {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("bindingId", b.id);
+                m.put("indexName", b.indexName);
+                m.put("vectorSetId", b.vectorSet != null ? b.vectorSet.id : null);
+                m.put("vectorSetName", b.vectorSet != null ? b.vectorSet.name : null);
+                m.put("fieldName", b.vectorSet != null ? b.vectorSet.fieldName : null);
+                m.put("dimensions", b.vectorSet != null ? b.vectorSet.vectorDimensions : 0);
+                m.put("accountId", b.accountId);
+                m.put("datasourceId", b.datasourceId);
+                m.put("status", b.status);
+                return m;
+            }).toList();
 
-        // DB query first (stays on event loop), then OpenSearch on worker thread
-        return io.quarkus.hibernate.reactive.panache.Panache.withSession(() ->
-                VectorSetIndexBindingEntity.<VectorSetIndexBindingEntity>list("indexName", indexName)
-                        .map(bindings -> bindings.stream().map(b -> {
-                            Map<String, Object> m = new LinkedHashMap<>();
-                            m.put("bindingId", b.id);
-                            m.put("indexName", b.indexName);
-                            m.put("vectorSetId", b.vectorSet != null ? b.vectorSet.id : null);
-                            m.put("vectorSetName", b.vectorSet != null ? b.vectorSet.name : null);
-                            m.put("fieldName", b.vectorSet != null ? b.vectorSet.fieldName : null);
-                            m.put("dimensions", b.vectorSet != null ? b.vectorSet.vectorDimensions : 0);
-                            m.put("accountId", b.accountId);
-                            m.put("datasourceId", b.datasourceId);
-                            m.put("status", b.status);
-                            return m;
-                        }).toList())
-        ).flatMap(bindingsList -> {
-            // Now query OpenSearch on a worker thread
-            return Uni.createFrom().item(() -> {
-                try {
-                    var mapping = openSearchClient.indices().getMapping(b -> b.index(indexName));
-                    Map<String, Object> fields = new LinkedHashMap<>();
-                    mapping.result().forEach((idx, indexMapping) -> {
-                        Map<String, String> props = new LinkedHashMap<>();
-                        indexMapping.mappings().properties().forEach((name, prop) ->
-                                props.put(name, prop._kind().jsonValue()));
-                        fields.put(idx, props);
-                    });
-                    return Map.<String, Object>of("exists", true, "mappings", fields);
-                } catch (Exception e) {
-                    return Map.<String, Object>of("exists", false, "error", e.getMessage());
-                }
-            }).runSubscriptionOn(io.smallrye.mutiny.infrastructure.Infrastructure.getDefaultWorkerPool())
-              .map(opensearchResult -> {
-                  Map<String, Object> result = new LinkedHashMap<>();
-                  result.put("indexName", indexName);
-                  result.put("opensearch", opensearchResult);
-                  result.put("bindings", bindingsList);
-                  return Response.ok(result).build();
-              });
-        }).onFailure().recoverWithItem(err -> {
+            Map<String, Object> opensearchResult;
+            try {
+                var mapping = openSearchClient.indices().getMapping(b -> b.index(indexName));
+                Map<String, Object> fields = new LinkedHashMap<>();
+                mapping.result().forEach((idx, indexMapping) -> {
+                    Map<String, String> props = new LinkedHashMap<>();
+                    indexMapping.mappings().properties().forEach((name, prop) ->
+                            props.put(name, prop._kind().jsonValue()));
+                    fields.put(idx, props);
+                });
+                opensearchResult = Map.of("exists", true, "mappings", fields);
+            } catch (Exception e) {
+                opensearchResult = Map.of("exists", false, "error", e.getMessage());
+            }
+
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("indexName", indexName);
+            result.put("opensearch", opensearchResult);
+            result.put("bindings", bindingsList);
+            return Response.ok(result).build();
+        } catch (Exception err) {
             LOG.errorf(err, "Verify failed for index %s", indexName);
-            return Response.status(500).entity(Map.of(
-                    "error", err.getMessage()
-            )).build();
-        });
+            return Response.status(500).entity(Map.of("error", String.valueOf(err.getMessage()))).build();
+        }
     }
 
     /**
@@ -277,87 +274,73 @@ public class SmokeTestResource {
      */
     @POST
     @Path("/map-any")
-    public Uni<Response> mapAny(Map<String, Object> payload) {
-        return Uni.createFrom().item(() -> {
-            try {
-                String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(payload);
+    @RunOnVirtualThread
+    public Response mapAny(Map<String, Object> payload) {
+        try {
+            String json = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(payload);
 
-                ai.pipestream.data.v1.SearchMetadata.Builder builder =
-                        ai.pipestream.data.v1.SearchMetadata.newBuilder();
-                JsonFormat.parser().ignoringUnknownFields().merge(json, builder);
+            ai.pipestream.data.v1.SearchMetadata.Builder builder =
+                    ai.pipestream.data.v1.SearchMetadata.newBuilder();
+            JsonFormat.parser().ignoringUnknownFields().merge(json, builder);
 
-                Any any = Any.pack(builder.build());
-                OpenSearchDocument mapped = anyDocumentMapper.mapToOpenSearchDocument(any, "smoke-test-doc");
+            Any any = Any.pack(builder.build());
+            OpenSearchDocument mapped = anyDocumentMapper.mapToOpenSearchDocument(any, "smoke-test-doc");
 
-                return Response.ok(JsonFormat.printer().print(mapped)).build();
-            } catch (Exception e) {
-                LOG.error("Map-any smoke test failed", e);
-                return Response.status(400).entity(Map.of("error", e.getMessage())).build();
-            }
-        });
+            return Response.ok(JsonFormat.printer().print(mapped)).build();
+        } catch (Exception e) {
+            LOG.error("Map-any smoke test failed", e);
+            return Response.status(400).entity(Map.of("error", e.getMessage())).build();
+        }
     }
 
     /**
-     * Delete test data: removes OpenSearch index, VectorSetIndexBindings, and orphaned VectorSets for the given index.
+     * Delete test data: removes OpenSearch index, VectorSetIndexBindings, and
+     * orphaned VectorSets for the given index.
      *
      * @param indexName index name whose smoke-test resources should be removed
      * @return cleanup result for OpenSearch and database state
      */
     @DELETE
     @Path("/cleanup")
-    public Uni<Response> cleanup(@QueryParam("index") String indexName) {
+    @Transactional
+    @RunOnVirtualThread
+    public Response cleanup(@QueryParam("index") String indexName) {
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'index' query param")).build());
+            return Response.status(400).entity(Map.of("error", "Missing 'index' query param")).build();
         }
+        try {
+            // 1. DB cleanup
+            List<VectorSetIndexBindingEntity> bindings = bindingRepo.list("indexName", indexName);
+            List<String> vectorSetIds = bindings.stream()
+                    .filter(b -> b.vectorSet != null)
+                    .map(b -> b.vectorSet.id)
+                    .toList();
+            int bindingCount = bindings.size();
+            long deletedBindings = bindingRepo.delete("indexName", indexName);
+            long deletedVectorSets = vectorSetIds.isEmpty()
+                    ? 0
+                    : vectorSetRepo.delete("id in ?1", vectorSetIds);
 
-        // 1. DB cleanup in a transaction (event loop)
-        return io.quarkus.hibernate.reactive.panache.Panache.withTransaction(() ->
-                VectorSetIndexBindingEntity.<VectorSetIndexBindingEntity>list("indexName", indexName)
-                        .flatMap(bindings -> {
-                            List<String> vectorSetIds = bindings.stream()
-                                    .filter(b -> b.vectorSet != null)
-                                    .map(b -> b.vectorSet.id)
-                                    .toList();
-                            int bindingCount = bindings.size();
+            // 2. Delete OpenSearch index (idempotent)
+            boolean indexDeleted;
+            try {
+                var deleteResp = openSearchClient.indices().delete(b -> b.index(indexName));
+                indexDeleted = deleteResp.acknowledged();
+            } catch (Exception e) {
+                LOG.warnf("OpenSearch index delete failed (may not exist): %s", e.getMessage());
+                indexDeleted = false;
+            }
 
-                            // Delete bindings first (FK constraint)
-                            return VectorSetIndexBindingEntity.delete("indexName", indexName)
-                                    .flatMap(deletedBindings -> {
-                                        if (vectorSetIds.isEmpty()) {
-                                            return Uni.createFrom().item(Map.of(
-                                                    "deletedBindings", bindingCount,
-                                                    "deletedVectorSets", 0));
-                                        }
-                                        // Delete VectorSets that have no remaining bindings
-                                        return VectorSetEntity.delete("id in ?1", vectorSetIds)
-                                                .map(deletedVs -> Map.<String, Object>of(
-                                                        "deletedBindings", bindingCount,
-                                                        "deletedVectorSets", deletedVs.intValue()));
-                                    });
-                        })
-        ).flatMap(dbResult -> {
-            // 2. Delete OpenSearch index on worker thread
-            return Uni.createFrom().item(() -> {
-                try {
-                    var deleteResp = openSearchClient.indices().delete(b -> b.index(indexName));
-                    return deleteResp.acknowledged();
-                } catch (Exception e) {
-                    LOG.warnf("OpenSearch index delete failed (may not exist): %s", e.getMessage());
-                    return false;
-                }
-            }).runSubscriptionOn(io.smallrye.mutiny.infrastructure.Infrastructure.getDefaultWorkerPool())
-              .map(indexDeleted -> {
-                  Map<String, Object> result = new LinkedHashMap<>();
-                  result.put("indexName", indexName);
-                  result.put("indexDeleted", indexDeleted);
-                  result.putAll(dbResult);
-                  return Response.ok(result).build();
-              });
-        }).onFailure().recoverWithItem(err -> {
+            Map<String, Object> result = new LinkedHashMap<>();
+            result.put("indexName", indexName);
+            result.put("indexDeleted", indexDeleted);
+            result.put("deletedBindings", (int) deletedBindings);
+            result.put("deletedVectorSets", (int) deletedVectorSets);
+            return Response.ok(result).build();
+        } catch (Exception err) {
             LOG.errorf(err, "Cleanup failed for index %s", indexName);
-            return Response.status(500).entity(Map.of("error", err.getMessage())).build();
-        });
+            return Response.status(500).entity(Map.of("error", String.valueOf(err.getMessage()))).build();
+        }
     }
 
     /**
@@ -369,33 +352,28 @@ public class SmokeTestResource {
      */
     @POST
     @Path("/index-raw")
-    public Uni<Response> indexRaw(@QueryParam("index") String indexName, String documentJson) {
+    @RunOnVirtualThread
+    public Response indexRaw(@QueryParam("index") String indexName, String documentJson) {
         if (indexName == null || indexName.isBlank()) {
-            return Uni.createFrom().item(Response.status(400)
-                    .entity(Map.of("error", "Missing 'index' query param")).build());
+            return Response.status(400).entity(Map.of("error", "Missing 'index' query param")).build();
         }
-
-        return Uni.createFrom().item(() -> {
-            try {
-                OpenSearchDocument.Builder builder = OpenSearchDocument.newBuilder();
-                JsonFormat.parser().merge(documentJson, builder);
-                return IndexDocumentRequest.newBuilder()
-                        .setIndexName(indexName)
-                        .setDocument(builder.build())
-                        .build();
-            } catch (Exception e) {
-                throw new RuntimeException("Invalid document JSON", e);
-            }
-        }).flatMap(indexingService::indexDocument)
-          .map(resp -> Response.ok(Map.of(
-                  "success", resp.getSuccess(),
-                  "documentId", resp.getDocumentId(),
-                  "message", resp.getMessage()
-          )).build())
-          .onFailure().recoverWithItem(err -> {
-              LOG.errorf(err, "Smoke test index-raw failed");
-              return Response.status(500).entity(Map.of("error", err.getMessage())).build();
-          });
+        try {
+            OpenSearchDocument.Builder builder = OpenSearchDocument.newBuilder();
+            JsonFormat.parser().merge(documentJson, builder);
+            IndexDocumentRequest req = IndexDocumentRequest.newBuilder()
+                    .setIndexName(indexName)
+                    .setDocument(builder.build())
+                    .build();
+            IndexDocumentResponse resp = indexingService.indexDocument(req);
+            return Response.ok(Map.of(
+                    "success", resp.getSuccess(),
+                    "documentId", resp.getDocumentId(),
+                    "message", resp.getMessage()
+            )).build();
+        } catch (Exception err) {
+            LOG.errorf(err, "Smoke test index-raw failed");
+            return Response.status(500).entity(Map.of("error", String.valueOf(err.getMessage()))).build();
+        }
     }
 
     private static String stringOrDefault(Map<String, Object> map, String key, String defaultValue) {

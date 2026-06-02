@@ -1,8 +1,6 @@
 package ai.pipestream.schemamanager.api;
 
 import ai.pipestream.server.security.PipestreamSecurityContext;
-import io.smallrye.mutiny.Uni;
-import io.smallrye.mutiny.infrastructure.Infrastructure;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -14,13 +12,13 @@ import org.opensearch.client.opensearch._types.query_dsl.Query;
 import org.opensearch.client.opensearch.core.SearchRequest;
 import org.opensearch.client.opensearch.core.SearchResponse;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
  * Generic OpenSearch search service with security-context-based account scoping.
  * Non-admin callers automatically get an {@code account_id} filter applied.
+ * Blocking-on-VT.
  */
 @ApplicationScoped
 public class AdminSearchService {
@@ -47,66 +45,65 @@ public class AdminSearchService {
      * @param termFilters exact-match term filters (field → value)
      * @return raw SearchResponse
      */
-    public Uni<SearchResponse<Map>> search(String indexName,
-                                           String queryText,
-                                           List<String> searchFields,
-                                           int from,
-                                           int size,
-                                           String sortField,
-                                           String sortOrder,
-                                           Map<String, String> termFilters) {
-        return Uni.createFrom().item(() -> {
-            try {
-                BoolQuery.Builder boolBuilder = new BoolQuery.Builder();
+    public SearchResponse<Map> search(String indexName,
+                                      String queryText,
+                                      List<String> searchFields,
+                                      int from,
+                                      int size,
+                                      String sortField,
+                                      String sortOrder,
+                                      Map<String, String> termFilters) {
+        try {
+            BoolQuery.Builder boolBuilder = new BoolQuery.Builder();
 
-                // Free-text query
-                if (queryText != null && !queryText.isBlank()) {
-                    boolBuilder.must(q -> q.multiMatch(mm -> mm
-                            .query(queryText)
-                            .fields(searchFields)
-                            .fuzziness("AUTO")));
-                } else {
-                    boolBuilder.must(q -> q.matchAll(m -> m));
-                }
+            // Free-text query
+            if (queryText != null && !queryText.isBlank()) {
+                boolBuilder.must(q -> q.multiMatch(mm -> mm
+                        .query(queryText)
+                        .fields(searchFields)
+                        .fuzziness("AUTO")));
+            } else {
+                boolBuilder.must(q -> q.matchAll(m -> m));
+            }
 
-                // Term filters from request
-                if (termFilters != null) {
-                    for (var entry : termFilters.entrySet()) {
-                        if (entry.getValue() != null && !entry.getValue().isBlank()) {
-                            boolBuilder.filter(q -> q.term(t -> t
-                                    .field(entry.getKey())
-                                    .value(FieldValue.of(entry.getValue()))));
-                        }
+            // Term filters from request
+            if (termFilters != null) {
+                for (var entry : termFilters.entrySet()) {
+                    if (entry.getValue() != null && !entry.getValue().isBlank()) {
+                        boolBuilder.filter(q -> q.term(t -> t
+                                .field(entry.getKey())
+                                .value(FieldValue.of(entry.getValue()))));
                     }
                 }
-
-                // Account scoping: non-admin callers get filtered to their own data
-                if (!isAdmin() && isAuthenticated()) {
-                    String accountId = accountId();
-                    LOG.debugf("Applying account_id filter: %s", accountId);
-                    boolBuilder.filter(q -> q.term(t -> t
-                            .field("account_id")
-                            .value(FieldValue.of(accountId))));
-                }
-
-                SearchRequest.Builder searchBuilder = new SearchRequest.Builder()
-                        .index(indexName)
-                        .query(new Query.Builder().bool(boolBuilder.build()).build())
-                        .from(from)
-                        .size(size)
-                        .trackTotalHits(t -> t.enabled(true));
-
-                // Sorting
-                if (sortField != null && !sortField.isBlank()) {
-                    SortOrder order = "asc".equalsIgnoreCase(sortOrder) ? SortOrder.Asc : SortOrder.Desc;
-                    searchBuilder.sort(s -> s.field(f -> f.field(sortField).order(order)));
-                }
-
-                return openSearchAsyncClient.search(searchBuilder.build(), Map.class).get();
-            } catch (Exception e) {
-                throw new RuntimeException("Search failed on index " + indexName + ": " + e.getMessage(), e);
             }
-        }).runSubscriptionOn(Infrastructure.getDefaultWorkerPool());
+
+            // Account scoping: non-admin callers get filtered to their own data
+            if (!isAdmin() && isAuthenticated()) {
+                String accountId = accountId();
+                LOG.debugf("Applying account_id filter: %s", accountId);
+                boolBuilder.filter(q -> q.term(t -> t
+                        .field("account_id")
+                        .value(FieldValue.of(accountId))));
+            }
+
+            SearchRequest.Builder searchBuilder = new SearchRequest.Builder()
+                    .index(indexName)
+                    .query(new Query.Builder().bool(boolBuilder.build()).build())
+                    .from(from)
+                    .size(size)
+                    .trackTotalHits(t -> t.enabled(true));
+
+            // Sorting
+            if (sortField != null && !sortField.isBlank()) {
+                SortOrder order = "asc".equalsIgnoreCase(sortOrder) ? SortOrder.Asc : SortOrder.Desc;
+                searchBuilder.sort(s -> s.field(f -> f.field(sortField).order(order)));
+            }
+
+            return openSearchAsyncClient.search(searchBuilder.build(), Map.class).get();
+        } catch (Exception e) {
+            // TODO(named-exception, task #70): OpenSearchSubmitException
+            throw new RuntimeException("Search failed on index " + indexName + ": " + e.getMessage(), e);
+        }
     }
 
     private String accountId() {

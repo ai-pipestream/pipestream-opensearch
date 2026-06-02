@@ -10,30 +10,11 @@ import io.smallrye.config.WithDefault;
 public interface OpenSearchManagerRuntimeConfig {
 
     /**
-     * Kafka semantic-metadata publishing behavior.
-     *
-     * @return nested config
-     */
-    SemanticMetadata semanticMetadata();
-
-    /**
      * Index statistics read behavior.
      *
      * @return nested config
      */
     IndexStats indexStats();
-
-    /** Semantic metadata event publishing settings. */
-    interface SemanticMetadata {
-        /**
-         * When true, a failed Kafka send for semantic-metadata-events is logged but does not fail
-         * chunker / embedding CRUD (avoids gRPC UNKNOWN when the broker is down locally).
-         *
-         * @return whether publish failures are treated as non-fatal
-         */
-        @WithDefault("false")
-        boolean failOpenPublish();
-    }
 
     /** Controls optional refresh when reading index statistics. */
     interface IndexStats {

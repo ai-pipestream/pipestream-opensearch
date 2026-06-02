@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class IndexAdminServiceTest {
 
     @GrpcClient
-    MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub managerService;
+    OpenSearchManagerServiceGrpc.OpenSearchManagerServiceBlockingStub managerService;
 
     private final String testIndexName = "test-pipeline-admin-" + UUID.randomUUID().toString().substring(0, 8);
 
@@ -37,7 +37,7 @@ class IndexAdminServiceTest {
                         .build())
                 .build();
 
-        var response = managerService.createIndex(request).await().indefinitely();
+        var response = managerService.createIndex(request);
 
         assertTrue(response.getSuccess(), "Index creation should succeed");
         assertThat(response.getMessage(), containsString("successfully"));
@@ -48,7 +48,7 @@ class IndexAdminServiceTest {
     void indexExists_returnsTrueForExistingIndex() {
         var response = managerService.indexExists(
                 IndexExistsRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getExists(), "Index should exist after creation");
     }
@@ -58,7 +58,7 @@ class IndexAdminServiceTest {
     void indexExists_returnsFalseForMissingIndex() {
         var response = managerService.indexExists(
                 IndexExistsRequest.newBuilder().setIndexName("nonexistent-index-" + UUID.randomUUID()).build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getExists(), "Nonexistent index should not exist");
     }
@@ -68,7 +68,7 @@ class IndexAdminServiceTest {
     void listIndices_includesCreatedIndex() {
         var response = managerService.listIndices(
                 ListIndicesRequest.newBuilder().setPrefixFilter("test-pipeline-admin").build()
-        ).await().indefinitely();
+        );
 
         assertThat(response.getIndicesCount(), greaterThanOrEqualTo(1));
         boolean found = response.getIndicesList().stream()
@@ -81,7 +81,7 @@ class IndexAdminServiceTest {
     void getIndexStats_returnsStatsForEmptyIndex() {
         var response = managerService.getIndexStats(
                 GetIndexStatsRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(), "Stats retrieval should succeed");
         assertThat(response.getDocumentCount(), is(0L));
@@ -104,8 +104,13 @@ class IndexAdminServiceTest {
                         .setIndexName(testIndexName)
                         .setDocument(doc)
                         .setDocumentId("admin-test-doc-001")
+                        // Explicit NESTED — this test exercises nested-on-parent
+                        // storage. Was relying on UNSPECIFIED→nested before; the
+                        // server-side default is now CHUNK_COMBINED, so callers
+                        // that genuinely want nested must say so.
+                        .setIndexingStrategy(ai.pipestream.opensearch.v1.IndexingStrategy.INDEXING_STRATEGY_NESTED)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(indexResponse.getSuccess(), "Indexing should succeed: " + indexResponse.getMessage());
 
@@ -118,7 +123,7 @@ class IndexAdminServiceTest {
                         .setIndexName(testIndexName)
                         .setDocumentId("admin-test-doc-001")
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(getResponse.getFound(), "Document should be found");
         assertThat(getResponse.getDocument().getTitle(), is("Admin Test Document"));
@@ -133,7 +138,7 @@ class IndexAdminServiceTest {
 
         var response = managerService.getIndexStats(
                 GetIndexStatsRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess());
         assertThat("Should have at least 1 document", response.getDocumentCount(), greaterThanOrEqualTo(1L));
@@ -147,7 +152,7 @@ class IndexAdminServiceTest {
                         .setIndexName(testIndexName)
                         .setDocumentId("nonexistent-doc-" + UUID.randomUUID())
                         .build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getFound(), "Missing document should not be found");
     }
@@ -160,7 +165,7 @@ class IndexAdminServiceTest {
                         .setIndexName(testIndexName)
                         .setDocumentId("admin-test-doc-001")
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(), "Document deletion should succeed");
         assertThat(response.getMessage(), containsString("deleted"));
@@ -171,7 +176,7 @@ class IndexAdminServiceTest {
     void deleteIndex_removesIndex() {
         var response = managerService.deleteIndex(
                 DeleteIndexRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(), "Index deletion should succeed");
         assertThat(response.getMessage(), containsString("deleted successfully"));
@@ -182,7 +187,7 @@ class IndexAdminServiceTest {
     void indexExists_returnsFalseAfterDeletion() {
         var response = managerService.indexExists(
                 IndexExistsRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getExists(), "Deleted index should not exist");
     }
@@ -192,7 +197,7 @@ class IndexAdminServiceTest {
     void getIndexStats_failsForDeletedIndex() {
         var response = managerService.getIndexStats(
                 GetIndexStatsRequest.newBuilder().setIndexName(testIndexName).build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getSuccess(), "Stats should fail for deleted index");
     }
@@ -202,11 +207,11 @@ class IndexAdminServiceTest {
     void listIndices_withPrefixFilter() {
         var allResponse = managerService.listIndices(
                 ListIndicesRequest.newBuilder().build()
-        ).await().indefinitely();
+        );
 
         var filteredResponse = managerService.listIndices(
                 ListIndicesRequest.newBuilder().setPrefixFilter("repository").build()
-        ).await().indefinitely();
+        );
 
         assertThat("Filtered list should be smaller or equal",
                 filteredResponse.getIndicesCount(), lessThanOrEqualTo(allResponse.getIndicesCount()));
@@ -224,7 +229,7 @@ class IndexAdminServiceTest {
                 DeleteIndexRequest.newBuilder()
                         .setIndexName("nonexistent-index-" + UUID.randomUUID())
                         .build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getSuccess(), "Deleting nonexistent index should report failure");
     }

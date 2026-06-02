@@ -3,10 +3,10 @@ package ai.pipestream.schemamanager;
 import ai.pipestream.opensearch.v1.CreateChunkerConfigRequest;
 import ai.pipestream.opensearch.v1.CreateEmbeddingModelConfigRequest;
 import ai.pipestream.opensearch.v1.CreateSemanticConfigRequest;
-import ai.pipestream.opensearch.v1.MutinyChunkerConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyEmbeddingConfigServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinyOpenSearchManagerServiceGrpc;
-import ai.pipestream.opensearch.v1.MutinySemanticConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.ChunkerConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.EmbeddingConfigServiceGrpc;
+import ai.pipestream.opensearch.v1.OpenSearchManagerServiceGrpc;
+import ai.pipestream.opensearch.v1.SemanticConfigServiceGrpc;
 import ai.pipestream.opensearch.v1.ProvisionIndexRequest;
 import ai.pipestream.opensearch.v1.ProvisionIndexResponse;
 import io.grpc.StatusRuntimeException;
@@ -31,6 +31,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -60,16 +61,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class ProvisionIndexTest {
 
     @GrpcClient
-    MutinyOpenSearchManagerServiceGrpc.MutinyOpenSearchManagerServiceStub managerService;
+    OpenSearchManagerServiceGrpc.OpenSearchManagerServiceBlockingStub managerService;
 
     @GrpcClient
-    MutinyChunkerConfigServiceGrpc.MutinyChunkerConfigServiceStub chunkerConfigService;
+    ChunkerConfigServiceGrpc.ChunkerConfigServiceBlockingStub chunkerConfigService;
 
     @GrpcClient
-    MutinyEmbeddingConfigServiceGrpc.MutinyEmbeddingConfigServiceStub embeddingConfigService;
+    EmbeddingConfigServiceGrpc.EmbeddingConfigServiceBlockingStub embeddingConfigService;
 
     @GrpcClient
-    MutinySemanticConfigServiceGrpc.MutinySemanticConfigServiceStub semanticConfigService;
+    SemanticConfigServiceGrpc.SemanticConfigServiceBlockingStub semanticConfigService;
 
     @Inject
     OpenSearchClient openSearchClient;
@@ -95,14 +96,14 @@ class ProvisionIndexTest {
                         .setId(chunkerId).setName(chunkerId).setConfigId(chunkerId)
                         .setConfigJson(com.google.protobuf.Struct.newBuilder().build())
                         .build()
-        ).await().indefinitely();
+        );
 
         embeddingConfigService.createEmbeddingModelConfig(
                 CreateEmbeddingModelConfigRequest.newBuilder()
                         .setId(embeddingId).setName(embeddingId)
                         .setModelIdentifier("ALL_MINILM_L6_V2").setDimensions(384)
                         .build()
-        ).await().indefinitely();
+        );
 
         // SemanticConfig with storeSentenceVectors=false + computeCentroids=false
         // produces exactly ONE child VectorSet (GRANULARITY_SEMANTIC_CHUNK).
@@ -117,7 +118,7 @@ class ProvisionIndexTest {
                         .setComputeCentroids(false)
                         .setSourceCel("document.body")
                         .build()
-        ).await().indefinitely();
+        );
     }
 
     @AfterAll
@@ -139,7 +140,7 @@ class ProvisionIndexTest {
                 ProvisionIndexRequest.newBuilder()
                         .setIndexName(parentOnlyIndex)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(),
                 "Parent-only provisioning should succeed: " + response.getMessage());
@@ -159,27 +160,39 @@ class ProvisionIndexTest {
                         .setIndexName(withSemanticIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(response.getSuccess(),
                 "Semantic-config provisioning should succeed: " + response.getMessage());
 
         // SemanticConfig with the defaults above has exactly one child VectorSet,
-        // so we expect exactly one binding row and exactly two side indices
-        // (one for CHUNK_COMBINED naming, one for SEPARATE_INDICES naming).
+        // and the binding materializes ONLY the chosen indexing strategy's
+        // shape (no more dual --chunk-- + --vs-- creation). ProvisionIndex
+        // is called without an explicit strategy here, so the binding lands
+        // on the manager's server-side default — currently CHUNK_COMBINED.
+        // That gives us:
+        //   - 1 binding row
+        //   - 1 CHUNK_COMBINED side index (--chunk--semantic) provisioned
+        //   - NO --vs-- side index (would only exist under SEPARATE_INDICES)
         assertEquals(1, response.getBindingsProvisioned(),
                 "Single VectorSet → 1 binding row");
 
-        String expectedCombined = withSemanticIndex + "--chunk--" + sanitize(semanticConfigId);
-        String expectedSeparate = withSemanticIndex + "--vs--" + sanitize(semanticConfigId)
-                + "--" + sanitize(embeddingId);
+        // The default SemanticConfig (storeSentenceVectors=false, computeCentroids=false)
+        // emits exactly one child VectorSet at GRANULARITY_SEMANTIC_CHUNK.
+        // SemanticConfigServiceEngine.chunkConfigIdForGranularity maps that
+        // granularity to the canonical literal "semantic" — the same value
+        // module-semantic-graph stamps on emitted chunks.
+        String expectedCombined = withSemanticIndex + "--chunk--semantic";
+        String unexpectedSeparate = withSemanticIndex + "--vs--semantic--" + sanitize(embeddingId);
 
         assertThat("indices_created must include the parent index",
                 response.getIndicesCreatedList(), hasItem(withSemanticIndex));
-        assertThat("indices_created must include the CHUNK_COMBINED side index",
+        assertThat("indices_created must include the CHUNK_COMBINED side index "
+                        + "(server-side default for UNSPECIFIED strategy)",
                 response.getIndicesCreatedList(), hasItem(expectedCombined));
-        assertThat("indices_created must include the SEPARATE_INDICES side index",
-                response.getIndicesCreatedList(), hasItem(expectedSeparate));
+        assertThat("indices_created must NOT include the SEPARATE_INDICES side index "
+                        + "(only created when the binding's strategy is SEPARATE_INDICES)",
+                response.getIndicesCreatedList(), not(hasItem(unexpectedSeparate)));
 
         // Every name returned in the response must actually exist in OpenSearch.
         // The whole point of the RPC is to make this true — anything less and
@@ -199,7 +212,7 @@ class ProvisionIndexTest {
                         .setIndexName(idempotentIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
         assertTrue(first.getSuccess(), "First call should succeed: " + first.getMessage());
 
         // Second call: must succeed and return the SAME logical result. The
@@ -211,7 +224,7 @@ class ProvisionIndexTest {
                         .setIndexName(idempotentIndex)
                         .addSemanticConfigIds(semanticConfigId)
                         .build()
-        ).await().indefinitely();
+        );
 
         assertTrue(second.getSuccess(),
                 "Second (idempotent) call should succeed: " + second.getMessage());
@@ -228,7 +241,7 @@ class ProvisionIndexTest {
         StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
                 managerService.provisionIndex(
                         ProvisionIndexRequest.newBuilder().setIndexName("").build()
-                ).await().indefinitely());
+                ));
         assertThat(ex.getMessage(), containsString("INVALID_ARGUMENT"));
         assertThat(ex.getMessage(), containsString("index_name"));
     }
@@ -239,7 +252,7 @@ class ProvisionIndexTest {
         StatusRuntimeException ex = assertThrows(StatusRuntimeException.class, () ->
                 managerService.provisionIndex(
                         ProvisionIndexRequest.newBuilder().setIndexName("BadIndexName").build()
-                ).await().indefinitely());
+                ));
         assertThat(ex.getMessage(), containsString("INVALID_ARGUMENT"));
         assertThat(ex.getMessage(), containsString("lowercase"));
         assertFalse(indexExists("BadIndexName"),
@@ -260,7 +273,7 @@ class ProvisionIndexTest {
                         .setIndexName(name)
                         .addSemanticConfigIds("definitely-does-not-exist-" + UUID.randomUUID())
                         .build()
-        ).await().indefinitely();
+        );
 
         assertFalse(response.getSuccess(),
                 "Unknown semantic config should NOT be reported as success");
