@@ -3,7 +3,6 @@ package ai.pipestream.quarkus.opensearch.deployment;
 import ai.pipestream.quarkus.opensearch.client.OpenSearchClientProducer;
 import ai.pipestream.quarkus.opensearch.client.ReactiveOpenSearchClient;
 import ai.pipestream.quarkus.opensearch.config.OpenSearchBuildTimeConfig;
-import ai.pipestream.quarkus.opensearch.grpc.OpenSearchGrpcClientProducer;
 import ai.pipestream.quarkus.opensearch.grpc.OpenSearchManagerClientProducer;
 import ai.pipestream.quarkus.opensearch.health.OpenSearchHealthCheck;
 import ai.pipestream.quarkus.opensearch.init.IndexTemplateInitializer;
@@ -59,12 +58,6 @@ public class OpenSearchProcessor {
         // Register the opensearch-manager gRPC client producer
         additionalBeans.produce(AdditionalBeanBuildItem.builder()
                 .addBeanClass(OpenSearchManagerClientProducer.class)
-                .setUnremovable()
-                .build());
-
-        // Register the OpenSearch native gRPC client producer (DocumentService, SearchService)
-        additionalBeans.produce(AdditionalBeanBuildItem.builder()
-                .addBeanClass(OpenSearchGrpcClientProducer.class)
                 .setUnremovable()
                 .build());
     }

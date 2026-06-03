@@ -11,9 +11,6 @@ dependencies {
     // Runtime module dependency
     implementation project(':pipestream-opensearch-client')
 
-    // Dynamic gRPC deployment (published from pipestream-platform)
-    implementation "ai.pipestream:quarkus-dynamic-grpc-deployment:${pipestreamBomVersion}"
-
     // Quarkus deployment dependencies
     implementation 'io.quarkus:quarkus-arc-deployment'
     implementation 'io.quarkus:quarkus-core-deployment'
