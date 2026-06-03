@@ -88,7 +88,6 @@ dependencies {
 
     // Pipestream platform libraries (managed via BOM/catalog)
     implementation 'ai.pipestream:pipestream-quarkus-devservices'
-    implementation 'ai.pipestream:quarkus-dynamic-grpc'
     implementation 'ai.pipestream:pipestream-service-registration'
     implementation 'ai.pipestream:pipestream-server'
     // OpenSearch client extension — resolved via composite build (includeBuild)

@@ -51,8 +51,7 @@ public class OpenSearchDevServicesProcessor {
     private static final String OPENSEARCH_PROTOCOL_CONFIG = "opensearch.protocol";
     private static final int OPENSEARCH_PORT = 9200;
     private static final int OPENSEARCH_GRPC_PORT = 9400;
-    private static final String OPENSEARCH_GRPC_ADDRESS_CONFIG = "quarkus.dynamic-grpc.service.opensearch-grpc.address";
-    
+
     // Image patterns to match in compose-devservices
     private static final List<String> COMPOSE_IMAGE_PATTERNS = List.of(
             "opensearchproject/opensearch",
@@ -232,9 +231,6 @@ public class OpenSearchDevServicesProcessor {
         Map<String, String> configMap = new HashMap<>();
         configMap.put(OPENSEARCH_HOSTS_CONFIG, hosts);
         configMap.put(OPENSEARCH_PROTOCOL_CONFIG, "http");
-        if (grpcHost != null && grpcPort > 0) {
-            configMap.put(OPENSEARCH_GRPC_ADDRESS_CONFIG, grpcHost + ":" + grpcPort);
-        }
         return configMap;
     }
 

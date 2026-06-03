@@ -51,9 +51,6 @@ dependencies {
     implementation libs.grpc.protobuf
     implementation libs.protobuf.java
 
-    // Dynamic gRPC for OpenSearch gRPC client (published from pipestream-platform)
-    api "ai.pipestream:quarkus-dynamic-grpc:${pipestreamBomVersion}"
-
     // Annotation processor for extension metadata
     annotationProcessor 'io.quarkus:quarkus-extension-processor'
 
