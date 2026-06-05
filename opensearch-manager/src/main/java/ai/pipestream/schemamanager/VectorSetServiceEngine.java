@@ -14,6 +14,7 @@ import ai.pipestream.schemamanager.repository.EmbeddingModelConfigRepository;
 import ai.pipestream.schemamanager.repository.SemanticConfigRepository;
 import ai.pipestream.schemamanager.repository.VectorSetIndexBindingRepository;
 import ai.pipestream.schemamanager.repository.VectorSetRepository;
+import ai.pipestream.schemamanager.vectorset.ParallelProvisioner;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Struct;
@@ -782,13 +783,15 @@ public class VectorSetServiceEngine {
         // already-bound entries is the architectural rule: the eager provisioner
         // is idempotent on unchanged state and is the only path that catches
         // configId-drift in pre-existing rows.
+        List<Runnable> provisioningTasks = new ArrayList<>(batch.allEntries().size());
         for (BatchBindEntry e : batch.allEntries()) {
-            vectorSetProvisioner.ensureFieldsForVectorSet(
-                            e.vsId, e.chunkerConfigId, e.embeddingModelId,
-                            e.dimensions, indexName,
-                            IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED)
-                    ;
+            provisioningTasks.add(() -> vectorSetProvisioner.ensureFieldsForVectorSet(
+                    e.vsId, e.chunkerConfigId, e.embeddingModelId,
+                    e.dimensions, indexName,
+                    IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED));
         }
+        // Concurrent, behind a barrier: returns only once every field is settled.
+        ParallelProvisioner.runAll(provisioningTasks);
 
         List<VectorSetIndexBinding> newProtos;
         if (batch.toCreate.isEmpty()) {
