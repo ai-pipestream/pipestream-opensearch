@@ -87,6 +87,15 @@ public class PipelineEventConsumer {
         document.put("module_id", step.getModuleId());
         document.put("hop_number", step.getHopNumber());
         document.put("status", step.getStatus());
+        // Node Outcome Model disposition (doc 17) — typed outcome
+        // (PROCESSED/NO_OP/REJECT) + reason, so the audit/board can break out
+        // per-step reject/no-op counts. Empty for legacy/processed-implied rows.
+        if (!step.getDisposition().isEmpty()) {
+            document.put("disposition", step.getDisposition());
+        }
+        if (!step.getDispositionReason().isEmpty()) {
+            document.put("disposition_reason", step.getDispositionReason());
+        }
         document.put("duration_ms", durationMs);
         document.put("service_instance_id", step.getServiceInstanceId());
         document.put("event_timestamp", eventTimestamp);
