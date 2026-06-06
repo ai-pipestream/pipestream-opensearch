@@ -82,6 +82,7 @@ public class PipelineEventConsumer {
         document.put("document_id", step.getDocumentId());
         document.put("account_id", step.getAccountId());
         document.put("stream_id", step.getStreamId());
+        document.put("crawl_id", step.getCrawlId());
         document.put("graph_id", step.getGraphId());
         document.put("node_id", step.getNodeId());
         document.put("module_id", step.getModuleId());
