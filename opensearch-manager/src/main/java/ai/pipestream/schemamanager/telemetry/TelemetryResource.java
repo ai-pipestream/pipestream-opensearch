@@ -67,17 +67,11 @@ public class TelemetryResource {
     @ConfigProperty(name = "opensearch.password", defaultValue = "")
     Optional<String> opensearchPassword;
 
-    @ConfigProperty(name = "quarkus.dynamic-grpc.consul.host", defaultValue = "localhost")
-    String dynamicGrpcConsulHost;
+    @ConfigProperty(name = "consul.host", defaultValue = "localhost")
+    String consulHost;
 
-    @ConfigProperty(name = "quarkus.dynamic-grpc.consul.port", defaultValue = "8500")
-    String dynamicGrpcConsulPort;
-
-    @ConfigProperty(name = "quarkus.dynamic-grpc.consul.refresh-period", defaultValue = "10s")
-    String dynamicGrpcConsulRefreshPeriod;
-
-    @ConfigProperty(name = "quarkus.dynamic-grpc.consul.use-health-checks", defaultValue = "false")
-    boolean dynamicGrpcConsulUseHealthChecks;
+    @ConfigProperty(name = "consul.port", defaultValue = "8500")
+    String consulPort;
 
     /**
      * Returns combined stack telemetry for the service and its dependencies.
@@ -160,10 +154,10 @@ public class TelemetryResource {
         return resolveServiceStatuses(DEFAULT_DISCOVERY_SERVICES)
                 .map(statuses -> new DynamicGrpcTelemetry(
                         true,
-                        dynamicGrpcConsulHost,
-                        dynamicGrpcConsulPort,
-                        dynamicGrpcConsulRefreshPeriod,
-                        dynamicGrpcConsulUseHealthChecks,
+                        consulHost,
+                        consulPort,
+                        "10s",
+                        false,
                         statuses
                 ));
     }
