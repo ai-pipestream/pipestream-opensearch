@@ -13,7 +13,7 @@ import ai.pipestream.schemamanager.indexing.IndexingStrategyHandler;
 import ai.pipestream.schemamanager.indexing.RepoClient;
 import com.google.protobuf.Any;
 import com.google.protobuf.InvalidProtocolBufferException;
-import io.smallrye.common.annotation.Blocking;
+import io.smallrye.common.annotation.RunOnVirtualThread;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
@@ -125,7 +125,7 @@ public class KafkaIndexingConsumer {
      */
     @Incoming("indexing-requests-in")
     @Acknowledgment(Acknowledgment.Strategy.POST_PROCESSING)
-    @Blocking
+    @RunOnVirtualThread
     public void consumeBatch(List<IndexingRequestEvent> batch) {
         if (batch == null || batch.isEmpty()) {
             return;

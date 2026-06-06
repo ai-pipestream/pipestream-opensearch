@@ -23,6 +23,7 @@ import ai.pipestream.schemamanager.repository.IndexPlanRepository;
 import ai.pipestream.schemamanager.repository.IndexPlanVectorSetRepository;
 import ai.pipestream.schemamanager.repository.VectorSetRepository;
 import ai.pipestream.schemamanager.validation.PlanProducibilityValidator;
+import ai.pipestream.schemamanager.vectorset.ParallelProvisioner;
 import ai.pipestream.schemamanager.vectorset.VectorSetProvisioner;
 import com.google.protobuf.Timestamp;
 import io.grpc.Status;
@@ -407,24 +408,29 @@ public class IndexPlanServiceEngine {
                         : err.getClass().getSimpleName();
             }
         } else {
+            // Provision every VectorSet's KNN field CONCURRENTLY, behind a
+            // barrier. The status is flipped to READY only after runAll returns
+            // (all fields settled) — so READY can never mean "provisioning was
+            // started"; it means "every KNN field exists". Each ensure blocks on
+            // OpenSearch metadata round trips, which park virtual threads.
+            List<Runnable> tasks = new ArrayList<>(pws.scalars.size());
             for (VsScalars vs : pws.scalars) {
-                try {
-                    vectorSetProvisioner.ensureFieldsForVectorSet(
-                                    vs.vsId,
-                                    vs.chunkerConfigId,
-                                    vs.embeddingModelId,
-                                    vs.vectorDimensions,
-                                    indexName,
-                                    strategy)
-                            ;
-                } catch (Throwable err) {
-                    LOG.warnf("IndexPlan %s provisioning failed for vs=%s: %s",
-                            pws.plan.id, vs.vsId, err.getMessage());
-                    errorMsg = err.getMessage() != null
-                            ? err.getMessage()
-                            : err.getClass().getSimpleName();
-                    break;
-                }
+                tasks.add(() -> vectorSetProvisioner.ensureFieldsForVectorSet(
+                        vs.vsId,
+                        vs.chunkerConfigId,
+                        vs.embeddingModelId,
+                        vs.vectorDimensions,
+                        indexName,
+                        strategy));
+            }
+            try {
+                ParallelProvisioner.runAll(tasks);
+            } catch (Throwable err) {
+                LOG.warnf("IndexPlan %s provisioning failed: %s",
+                        pws.plan.id, err.getMessage());
+                errorMsg = err.getMessage() != null
+                        ? err.getMessage()
+                        : err.getClass().getSimpleName();
             }
         }
         flipStatus(pws.plan.id, errorMsg);

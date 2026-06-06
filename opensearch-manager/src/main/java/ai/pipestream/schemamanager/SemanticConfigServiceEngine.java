@@ -22,6 +22,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
+import ai.pipestream.schemamanager.vectorset.ParallelProvisioner;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
@@ -346,22 +347,25 @@ public class SemanticConfigServiceEngine {
             return new AssignmentResult(0, List.of());
         }
         List<String> touched = new ArrayList<>(specs.size());
+        List<Runnable> tasks = new ArrayList<>(specs.size());
+        ai.pipestream.schemamanager.indexing.IndexingStrategyHandler handler = handlerFor(strategy);
         for (SideIndexSpec s : specs) {
             // Delegate to the strategy-aware provisioner: ONE shape per
             // (vector set × chosen strategy) materializes, not both at once.
             // The provisioner's handlerFor maps the strategy enum to the
             // IndexingStrategyHandler whose provisionKnnField owns the
-            // shape's index naming + KNN field setup.
-            vectorSetProvisioner.ensureFieldsForVectorSet(
-                            s.vectorSetId(), s.chunkConfigId(), s.embeddingId(),
-                            s.dimensions(), baseIndexName, strategy)
-                    ;
-            // Track the resolved index name so callers (e.g. ProvisionIndex) can
-            // list what was touched. Resolve via the same handler the
-            // provisioner used so the displayed name matches what was created.
-            ai.pipestream.schemamanager.indexing.IndexingStrategyHandler handler = handlerFor(strategy);
+            // shape's index naming + KNN field setup. Each ensure is an
+            // independent OpenSearch round trip — run them concurrently.
+            tasks.add(() -> vectorSetProvisioner.ensureFieldsForVectorSet(
+                    s.vectorSetId(), s.chunkConfigId(), s.embeddingId(),
+                    s.dimensions(), baseIndexName, strategy));
+            // resolveIndexName is pure/cheap (no OpenSearch call) — compute the
+            // touched list directly so callers (e.g. ProvisionIndex) can list
+            // what was touched. Order is informational only.
             touched.add(handler.resolveIndexName(baseIndexName, s.chunkConfigId(), s.embeddingId()));
         }
+        // Barrier: all side-index KNN fields are provisioned before we return.
+        ParallelProvisioner.runAll(tasks);
         bindingCache.invalidate(baseIndexName);
         return new AssignmentResult(specs.size(), List.copyOf(touched));
     }
