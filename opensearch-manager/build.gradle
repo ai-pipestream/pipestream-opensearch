@@ -1,7 +1,7 @@
 import org.gradle.plugins.signing.Sign
 
 plugins {
-    id 'pl.allegro.tech.build.axion-release' version '1.21.1'
+    id 'pl.allegro.tech.build.axion-release' version '1.21.2'
     alias(libs.plugins.java)
     alias(libs.plugins.quarkus)
     alias(libs.plugins.maven.publish)
