@@ -36,9 +36,7 @@ import org.opensearch.client.opensearch.OpenSearchClient;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -254,11 +252,7 @@ public class IndexPlanServiceEngine {
             deletePlanRow(id);
             return DeleteIndexPlanResponse.newBuilder().setDeleted(true).build();
         }
-        String indexName = plan.indexName;
-        String strategyName = plan.indexingStrategy;
-        List<String> vsIds = loadMembership(id);
-        List<VsScalars> scalars = resolveVsScalars(vsIds);
-        dropOsIndices(indexName, strategyName, scalars);
+        dropOsIndices(plan.indexName);
         deletePlanRow(id);
         return DeleteIndexPlanResponse.newBuilder().setDeleted(true).build();
     }
@@ -589,38 +583,26 @@ public class IndexPlanServiceEngine {
     }
 
     /**
-     * Drops OpenSearch indices governed by a plan. Derives index names from
-     * the strategy + VS scalars. Errors are logged but do not fail the delete.
+     * Drops every OpenSearch index governed by a plan: the base index plus all
+     * derived siblings ({@code <base>--vs--…}, {@code <base>--chunk--…}).
+     * Derived names are resolved live from OS rather than recomputed from the
+     * plan's vector-set membership, because writers create result-set indices
+     * dynamically for whatever the documents carry — membership alone misses
+     * those (and never covered the base index). Errors are logged but do not
+     * fail the delete.
      */
-    private void dropOsIndices(String indexName, String strategyName, List<VsScalars> scalars) {
+    private void dropOsIndices(String indexName) {
+        deleteOsIndexQuietly(indexName);
         try {
-            IndexingStrategy strategy = safeParseStrategy(strategyName);
-            if (strategy == IndexingStrategy.INDEXING_STRATEGY_NESTED
-                    || strategy == IndexingStrategy.INDEXING_STRATEGY_UNSPECIFIED) {
-                deleteOsIndexQuietly(indexName);
-            } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_CHUNK_COMBINED) {
-                Set<String> seen = new HashSet<>();
-                for (VsScalars vs : scalars) {
-                    if (vs.chunkerConfigId != null) {
-                        String idx = indexName + "--chunk--"
-                                + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId);
-                        if (seen.add(idx)) deleteOsIndexQuietly(idx);
-                    }
-                }
-            } else if (strategy == IndexingStrategy.INDEXING_STRATEGY_SEPARATE_INDICES) {
-                for (VsScalars vs : scalars) {
-                    if (vs.chunkerConfigId != null && vs.embeddingModelId != null) {
-                        String idx = indexName + "--vs--"
-                                + IndexKnnProvisioner.sanitizeForIndexName(vs.chunkerConfigId)
-                                + "--"
-                                + IndexKnnProvisioner.sanitizeForIndexName(vs.embeddingModelId);
-                        deleteOsIndexQuietly(idx);
-                    }
-                }
+            var derived = openSearchClient.indices()
+                    .get(g -> g.index(indexName + "--*").ignoreUnavailable(true))
+                    .result().keySet();
+            for (String idx : derived) {
+                deleteOsIndexQuietly(idx);
             }
         } catch (Exception e) {
-            LOG.warnf("dropOsIndices: unexpected error for plan index=%s strategy=%s: %s",
-                    indexName, strategyName, e.getMessage());
+            LOG.warnf("dropOsIndices: failed to resolve derived indices of %s: %s",
+                    indexName, e.getMessage());
         }
     }
 
