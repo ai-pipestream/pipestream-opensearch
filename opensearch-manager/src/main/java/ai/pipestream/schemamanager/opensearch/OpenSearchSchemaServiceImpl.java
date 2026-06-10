@@ -91,6 +91,12 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
                 var createRequest = new org.opensearch.client.opensearch.indices.CreateIndexRequest.Builder()
                         .index(indexName)
                         .settings(settings)
+                        // Pre-map the NLP analysis fields base documents carry so
+                        // OpenSearch never auto-maps text fields (e.g. as dates).
+                        // This is THE eager creation point for parent indices —
+                        // the indexing hot path verifies existence only and never
+                        // creates or maps anything (no just-in-case fallbacks).
+                        .mappings(m -> buildNlpAnalysisMappings(m))
                         .build();
                 return client.indices().create(createRequest).acknowledged();
             } catch (org.opensearch.client.opensearch._types.OpenSearchException e) {
@@ -278,4 +284,55 @@ public class OpenSearchSchemaServiceImpl implements OpenSearchSchemaService {
         }
         return root instanceof IOException || root instanceof HttpHostConnectException;
     }
+
+    /**
+     * Base-document NLP/analytics field mappings, applied at parent-index
+     * creation (moved here from the indexing hot path's deleted
+     * create-on-miss fallback — eager paths own ALL provisioning).
+     */
+    private org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder buildNlpAnalysisMappings(
+            org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder m) {
+        return m
+            .properties("nlp_analysis", nlp -> nlp
+                .object(obj -> obj
+                    .properties("sentences", sent -> sent
+                        .object(sentObj -> sentObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("tokens", tok -> tok
+                        .object(tokObj -> tokObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("lemma", l -> l.text(tt -> tt))
+                            .properties("pos", p -> p.keyword(kk -> kk))
+                            .properties("tag", tg -> tg.keyword(kk -> kk))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("entities", ent -> ent
+                        .object(entObj -> entObj
+                            .properties("text", t -> t.text(tt -> tt))
+                            .properties("type", tp -> tp.keyword(kk -> kk))
+                            .properties("start_offset", so -> so.integer(ii -> ii))
+                            .properties("end_offset", eo -> eo.integer(ii -> ii))
+                        )
+                    )
+                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
+                    .properties("token_count", tc -> tc.integer(ii -> ii))
+                    .properties("word_count", wc -> wc.integer(ii -> ii))
+                    .properties("character_count", cc -> cc.integer(ii -> ii))
+                )
+            )
+            .properties("chunk_analytics", ca -> ca
+                .object(obj -> obj
+                    .properties("word_count", wc -> wc.integer(ii -> ii))
+                    .properties("character_count", cc -> cc.integer(ii -> ii))
+                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
+                )
+            );
+    }
+
 }

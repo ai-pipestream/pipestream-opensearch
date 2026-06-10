@@ -252,9 +252,13 @@ public class NestedIndexingStrategy implements IndexingStrategyHandler {
             }
         }
 
+        // Stage 1.5: demand flush — without it the barrier below waits a full
+        // flush-interval timer tick per batch for no reason.
+        bulkQueueSet.flushNow();
+
         // Stage 2: block once on every submitted future. One flush window
         // services the entire batch; the wall-time cost is bounded by the
-        // bulk-queue's flush interval, not by N &times; flush interval.
+        // bulk round-trip itself after the demand flush above.
         boolean batchInterrupted = false;
         if (!pending.isEmpty()) {
             CompletableFuture<?>[] all = new CompletableFuture<?>[pending.size()];

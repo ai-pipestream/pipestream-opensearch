@@ -218,6 +218,23 @@ public class BulkQueueSetBean {
     public int totalPending() { return queueSet.totalPending(); }
 
     /**
+     * Demand flush: drain every document queue NOW instead of waiting for the
+     * periodic timer. Strategy handlers call this between submitting a window
+     * of items and awaiting its futures — without it, every consumer batch
+     * pays one or more {@code flush-interval-ms} timer ticks of pure wait
+     * (the measured 8-10 events/s drain ceiling was exactly this, not
+     * OpenSearch: the bulk round trip itself is p50≈27ms). Concurrent calls
+     * just race to drain the same queues; the flush handler is per-batch safe
+     * and the timer remains as the backstop for fire-and-forget submitters.
+     */
+    public void flushNow() {
+        BulkQueueSet qs = queueSet;
+        if (qs != null) {
+            qs.flushAll();
+        }
+    }
+
+    /**
      * Flush handler: builds a BulkRequest, sends to OpenSearch, completes per-item futures.
      * Uses blocking {@code .get()} so completion runs before {@code flush()} returns — required so
      * per-item {@link CompletableFuture}s are finished on the bulk scheduler thread (not the HTTP

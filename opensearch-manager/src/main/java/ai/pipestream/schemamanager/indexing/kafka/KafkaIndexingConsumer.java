@@ -146,23 +146,38 @@ public class KafkaIndexingConsumer {
     private void safeProcess(List<IndexingRequestEvent> batch) {
         LOG.infof("Indexing batch arrived: size=%d", batch.size());
 
-        // Step 1 — dereference S3 payloads. Failures here are per-event;
-        // one bad ref doesn't block the others.
+        // Step 1 — dereference S3 payloads CONCURRENTLY (one virtual thread
+        // per claim-check; inline events resolve without I/O). The previous
+        // serial loop paid one repo round trip per event back-to-back, and a
+        // single slow dereference stalled the whole batch — combined with the
+        // (now added) per-call deadline in RepoClient, a wedged repo can no
+        // longer freeze the partition. Failures stay per-event.
         List<Resolved> resolved = new ArrayList<>(batch.size());
         List<DocumentIndexedEvent> receipts = new ArrayList<>(batch.size());
 
-        for (IndexingRequestEvent event : batch) {
-            StreamIndexDocumentsRequest request;
-            try {
-                request = fetchAndUnpack(event);
-            } catch (RuntimeException e) {
-                LOG.errorf(e, "Dereference failed for event=%s docId=%s — emitting FAILED_TERMINAL receipt",
-                        event.getEventId(),
-                        event.hasDocumentRef() ? event.getDocumentRef().getDocId() : "(no-ref)");
-                appendDereferenceFailureReceipt(event, e, receipts);
-                continue;
+        record Deref(IndexingRequestEvent event, StreamIndexDocumentsRequest request, RuntimeException error) {}
+        List<java.util.concurrent.CompletableFuture<Deref>> derefs = new ArrayList<>(batch.size());
+        try (var pool = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            for (IndexingRequestEvent event : batch) {
+                derefs.add(java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                    try {
+                        return new Deref(event, fetchAndUnpack(event), null);
+                    } catch (RuntimeException e) {
+                        return new Deref(event, null, e);
+                    }
+                }, pool));
             }
-            resolved.add(new Resolved(event, request));
+            for (var f : derefs) {
+                Deref d = f.join();
+                if (d.error() != null) {
+                    LOG.errorf(d.error(), "Dereference failed for event=%s docId=%s — emitting FAILED_TERMINAL receipt",
+                            d.event().getEventId(),
+                            d.event().hasDocumentRef() ? d.event().getDocumentRef().getDocId() : "(no-ref)");
+                    appendDereferenceFailureReceipt(d.event(), d.error(), receipts);
+                } else {
+                    resolved.add(new Resolved(d.event(), d.request()));
+                }
+            }
         }
 
         // Step 2 — group resolved requests by strategy. Each strategy
