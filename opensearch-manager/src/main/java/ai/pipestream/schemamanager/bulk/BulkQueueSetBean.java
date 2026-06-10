@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -77,6 +78,19 @@ public class BulkQueueSetBean {
     @ConfigProperty(name = "bulk-indexing.retry-backoff-ms", defaultValue = "250")
     int retryBackoffMs;
 
+    /**
+     * Hard cap on simultaneous in-flight _bulk requests to the cluster.
+     * Bounded bulk SIZE alone didn't stop the rejection storms: 20 queues
+     * demand-flushed by 5 concurrent consumers can fire ~20 parallel 500-doc
+     * bulks (~10k docs in flight) — far past a small cluster's write
+     * thread-pool queue. Pacing at the client beats flooding + retrying:
+     * excess flush threads simply wait their turn here.
+     */
+    @ConfigProperty(name = "bulk-indexing.max-concurrent-flushes", defaultValue = "4")
+    int maxConcurrentFlushes;
+
+    private volatile Semaphore flushPermits;
+
     /** CDI. */
     public BulkQueueSetBean() {
     }
@@ -90,6 +104,7 @@ public class BulkQueueSetBean {
     private Timer flushDurationTimer;
 
     void onStartup(@Observes @Priority(Integer.MAX_VALUE) StartupEvent event) {
+        flushPermits = new Semaphore(Math.max(1, maxConcurrentFlushes));
         queueSet = new BulkQueueSet(
                 config.queueCount(), config.capacity(), config.flushIntervalMs(),
                 this::handleFlush);
@@ -259,6 +274,22 @@ public class BulkQueueSetBean {
     private void handleFlush(List<BulkIndexItem> batch) {
         flushTotalCounter.increment();
         flushItemsSummary.record(batch.size());
+        Semaphore permits = flushPermits;
+        boolean permitted = false;
+        if (permits != null) {
+            try {
+                permits.acquire();
+                permitted = true;
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                for (BulkIndexItem item : batch) {
+                    if (item.resultFuture() != null) {
+                        item.resultFuture().complete(BulkItemResult.failed("interrupted awaiting flush permit"));
+                    }
+                }
+                return;
+            }
+        }
         long startNanos = System.nanoTime();
         try {
             BulkRequest.Builder br = new BulkRequest.Builder();
@@ -379,6 +410,10 @@ public class BulkQueueSetBean {
                 if (item.resultFuture() != null) {
                     item.resultFuture().complete(BulkItemResult.failed("Bulk flush error: " + e.getMessage()));
                 }
+            }
+        } finally {
+            if (permitted) {
+                permits.release();
             }
         }
     }
