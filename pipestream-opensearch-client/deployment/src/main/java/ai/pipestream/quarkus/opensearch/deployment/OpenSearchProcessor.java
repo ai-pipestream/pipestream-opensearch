@@ -49,6 +49,14 @@ public class OpenSearchProcessor {
                 .addBeanClass(ReactiveOpenSearchClient.class)
                 .setUnremovable()
                 .build());
+
+        // Startup banner: eagerly connects and prints the LIVE cluster
+        // identity (name/version/health) so there is never confusion about
+        // which OpenSearch instance a service is wired to.
+        additionalBeans.produce(AdditionalBeanBuildItem.builder()
+                .addBeanClass(ai.pipestream.quarkus.opensearch.client.OpenSearchConnectionBanner.class)
+                .setUnremovable()
+                .build());
     }
 
     @BuildStep

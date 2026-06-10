@@ -103,20 +103,28 @@ public class BulkIndexingQueue {
      * instruments, and the thread-safe OpenSearch async client).
      */
     public void flush() {
-        List<BulkIndexItem> batch = new ArrayList<>();
-        queue.drainTo(batch);
-        if (batch.isEmpty()) {
-            return;
-        }
-        LOG.debugf("BulkIndexingQueue[%d] flushing %d items", queueId, batch.size());
-        try {
-            flushHandler.accept(batch);
-        } catch (Exception e) {
-            LOG.errorf(e, "BulkIndexingQueue[%d] flush handler failed for %d items", queueId, batch.size());
-            for (BulkIndexItem item : batch) {
-                if (item.resultFuture() != null) {
-                    item.resultFuture().complete(
-                            BulkItemResult.failed("Flush handler error: " + e.getMessage()));
+        // Drain in capacity-sized chunks: one OpenSearch _bulk per chunk.
+        // An unbounded drain produced single 6000+ doc bulks under load,
+        // overflowing the cluster's write thread-pool queue
+        // (rejected_execution_exception storms). Capacity (default 500)
+        // doubles as the per-request bulk ceiling — the 100-1000 doc sweet
+        // spot for /_bulk.
+        while (true) {
+            List<BulkIndexItem> batch = new ArrayList<>(capacity);
+            queue.drainTo(batch, capacity);
+            if (batch.isEmpty()) {
+                return;
+            }
+            LOG.debugf("BulkIndexingQueue[%d] flushing %d items", queueId, batch.size());
+            try {
+                flushHandler.accept(batch);
+            } catch (Exception e) {
+                LOG.errorf(e, "BulkIndexingQueue[%d] flush handler failed for %d items", queueId, batch.size());
+                for (BulkIndexItem item : batch) {
+                    if (item.resultFuture() != null) {
+                        item.resultFuture().complete(
+                                BulkItemResult.failed("Flush handler error: " + e.getMessage()));
+                    }
                 }
             }
         }

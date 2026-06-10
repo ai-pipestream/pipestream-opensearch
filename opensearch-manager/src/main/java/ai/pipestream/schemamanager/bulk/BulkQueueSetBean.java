@@ -17,10 +17,12 @@ import org.opensearch.client.opensearch.core.BulkRequest;
 import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -62,6 +64,33 @@ public class BulkQueueSetBean {
     @ConfigProperty(name = "bulk-indexing.metadata.flush-interval-ms", defaultValue = "1000")
     int metadataFlushIntervalMs;
 
+    /**
+     * Backpressure retries for 429-class bulk item rejections
+     * (es_rejected_execution_exception = the cluster's write thread-pool
+     * queue is full — a "slow down", NOT a data error). Rejected items
+     * re-enqueue after {@code attempts * retry-backoff-ms} until
+     * {@code max-retry-attempts}, then fail terminally. Everything else
+     * (index_not_found, mapper errors) stays terminal on first failure.
+     */
+    @ConfigProperty(name = "bulk-indexing.max-retry-attempts", defaultValue = "6")
+    int maxRetryAttempts;
+
+    @ConfigProperty(name = "bulk-indexing.retry-backoff-ms", defaultValue = "250")
+    int retryBackoffMs;
+
+    /**
+     * Hard cap on simultaneous in-flight _bulk requests to the cluster.
+     * Bounded bulk SIZE alone didn't stop the rejection storms: 20 queues
+     * demand-flushed by 5 concurrent consumers can fire ~20 parallel 500-doc
+     * bulks (~10k docs in flight) — far past a small cluster's write
+     * thread-pool queue. Pacing at the client beats flooding + retrying:
+     * excess flush threads simply wait their turn here.
+     */
+    @ConfigProperty(name = "bulk-indexing.max-concurrent-flushes", defaultValue = "4")
+    int maxConcurrentFlushes;
+
+    private volatile Semaphore flushPermits;
+
     /** CDI. */
     public BulkQueueSetBean() {
     }
@@ -75,6 +104,7 @@ public class BulkQueueSetBean {
     private Timer flushDurationTimer;
 
     void onStartup(@Observes @Priority(Integer.MAX_VALUE) StartupEvent event) {
+        flushPermits = new Semaphore(Math.max(1, maxConcurrentFlushes));
         queueSet = new BulkQueueSet(
                 config.queueCount(), config.capacity(), config.flushIntervalMs(),
                 this::handleFlush);
@@ -244,6 +274,22 @@ public class BulkQueueSetBean {
     private void handleFlush(List<BulkIndexItem> batch) {
         flushTotalCounter.increment();
         flushItemsSummary.record(batch.size());
+        Semaphore permits = flushPermits;
+        boolean permitted = false;
+        if (permits != null) {
+            try {
+                permits.acquire();
+                permitted = true;
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                for (BulkIndexItem item : batch) {
+                    if (item.resultFuture() != null) {
+                        item.resultFuture().complete(BulkItemResult.failed("interrupted awaiting flush permit"));
+                    }
+                }
+                return;
+            }
+        }
         long startNanos = System.nanoTime();
         try {
             BulkRequest.Builder br = new BulkRequest.Builder();
@@ -295,18 +341,56 @@ public class BulkQueueSetBean {
 
             List<BulkResponseItem> items = response.items();
             int n = Math.min(items.size(), batch.size());
+            List<BulkIndexItem> toRetry = new ArrayList<>();
             for (int i = 0; i < n; i++) {
                 BulkResponseItem responseItem = items.get(i);
-                CompletableFuture<BulkItemResult> future = batch.get(i).resultFuture();
+                BulkIndexItem submitted = batch.get(i);
+                CompletableFuture<BulkItemResult> future = submitted.resultFuture();
                 var opError = responseItem.error();
-                if (future != null) {
-                    if (opError != null) {
-                        future.complete(BulkItemResult.failed(
-                                Objects.toString(opError.reason(), "bulk item error")));
-                    } else {
+                if (opError == null) {
+                    if (future != null) {
                         future.complete(BulkItemResult.ok());
                     }
+                    continue;
                 }
+                String type = Objects.toString(opError.type(), "");
+                boolean rejected = type.contains("rejected_execution");
+                if (rejected && submitted.attempts() < maxRetryAttempts) {
+                    // 429-class: the cluster asked us to slow down. Re-enqueue
+                    // with linear backoff; the item keeps its future, so the
+                    // submitting barrier simply waits out the backpressure.
+                    toRetry.add(submitted.nextAttempt());
+                    continue;
+                }
+                if (future != null) {
+                    future.complete(BulkItemResult.failed(rejected
+                            ? "write queue rejection persisted through " + submitted.attempts()
+                                    + " retries: " + Objects.toString(opError.reason(), "")
+                            : Objects.toString(opError.reason(), "bulk item error")));
+                }
+            }
+            if (!toRetry.isEmpty()) {
+                long delayMs = (long) retryBackoffMs * toRetry.get(0).attempts();
+                LOG.infof("Bulk backpressure: re-enqueueing %d rejected item(s) after %dms (attempt %d/%d)",
+                        toRetry.size(), delayMs, toRetry.get(0).attempts(), maxRetryAttempts);
+                // Resubmit ONLY — submit() is a non-blocking offer, safe on
+                // the common-pool callback thread. The capacity trigger and the
+                // flush timer take it from there on the queue set's own
+                // scheduler. (Calling flushAll() here ran BLOCKING OpenSearch
+                // round-trips on the ForkJoinPool common pool and exhausted it:
+                // "Thread limit exceeded replacing blocked worker".)
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS).execute(() -> {
+                    BulkQueueSet qs = queueSet;
+                    if (qs == null) {
+                        toRetry.forEach(it -> {
+                            if (it.resultFuture() != null) {
+                                it.resultFuture().complete(BulkItemResult.failed("shutdown during backpressure retry"));
+                            }
+                        });
+                        return;
+                    }
+                    toRetry.forEach(qs::submit);
+                });
             }
             if (items.size() != batch.size()) {
                 LOG.errorf("Bulk response size mismatch: ops=%d batch=%d — completing missing futures as failed",
@@ -326,6 +410,10 @@ public class BulkQueueSetBean {
                 if (item.resultFuture() != null) {
                     item.resultFuture().complete(BulkItemResult.failed("Bulk flush error: " + e.getMessage()));
                 }
+            }
+        } finally {
+            if (permitted) {
+                permits.release();
             }
         }
     }
