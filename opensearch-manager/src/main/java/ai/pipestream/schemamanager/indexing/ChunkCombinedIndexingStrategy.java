@@ -64,7 +64,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
      * <ol>
      *   <li>Mark {@code baseIndex} as ensured in {@link #ensuredBaseIndices} after
      *       confirming OpenSearch carries it. The hot path's
-     *       {@code ensureBaseIndex} guard then short-circuits without a
+     *       {@code verifyBaseIndexExists} probe then short-circuits without a
      *       cluster-state round trip on the first doc.</li>
      *   <li>For every {@code (vector_set, index)} binding row whose
      *       {@code indexName} equals {@code baseIndex}: derive the canonical
@@ -299,6 +299,11 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
                 all.addAll(d.chunkFutures);
             }
 
+            // Phase 1.5 — demand flush: the futures above only complete when
+            // the queues flush; waiting for the periodic timer taxes every
+            // window ~one flush-interval of dead time. Flush now.
+            bulkQueueSet.flushNow();
+
             // Phase 2 — single barrier for the whole window. Item-level failures are
             // captured as completed (non-exceptional) BulkItemResults by the flush
             // handler, so allOf only guards against a future left dangling; a throw
@@ -337,7 +342,9 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
         CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> baseFuture;
         try {
-            ensureBaseIndex(baseIndex);
+            // STRICT: the plan/prewarm created the base index; the hot path
+            // only verifies (read-only probe, cached per JVM) and fails loud.
+            verifyBaseIndexExists(baseIndex);
             Map<String, Object> baseMap = prepareBaseDocMap(docMap);
             baseFuture = bulkQueueSet.submitWithFuture(baseIndex, documentId, baseMap, null);
         } catch (Exception e) {
@@ -436,7 +443,7 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
     private IndexOutcome indexBaseDocument(String indexName, String documentId, OpenSearchDocumentMap docMap) {
         Map<String, Object> docAsMap;
         try {
-            ensureBaseIndex(indexName);
+            verifyBaseIndexExists(indexName);
             docAsMap = prepareBaseDocMap(docMap);
         } catch (Exception e) {
             LOG.errorf(e, "CHUNK_COMBINED: failed to prepare base document %s/%s", indexName, documentId);
@@ -488,82 +495,6 @@ public class ChunkCombinedIndexingStrategy implements IndexingStrategyHandler {
 
     /** Cache of base indices already ensured to avoid repeated existence checks. */
     private final Set<String> ensuredBaseIndices = ConcurrentHashMap.newKeySet();
-
-    /**
-     * Ensures the base document index exists with pre-mapped NLP analysis fields,
-     * preventing OpenSearch from auto-mapping text fields as dates.
-     */
-    private void ensureBaseIndex(String indexName) throws Exception {
-        if (ensuredBaseIndices.contains(indexName)) return;
-        try {
-            var exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get();
-            if (!exists.value()) {
-                LOG.infof("CHUNK_COMBINED: creating base index %s (shards=%d, replicas=%d, refresh=%s)",
-                        indexName, knnConfig.numberOfShards(), knnConfig.numberOfReplicas(), knnConfig.refreshInterval());
-                openSearchAsyncClient.indices().create(c -> c
-                        .index(indexName)
-                        .settings(s -> s
-                                .numberOfShards(knnConfig.numberOfShards())
-                                .numberOfReplicas(knnConfig.numberOfReplicas())
-                                .refreshInterval(ri -> ri.time(knnConfig.refreshInterval()))
-                        )
-                        .mappings(m -> buildNlpAnalysisMappings(m))
-                ).get();
-            }
-        } catch (Exception e) {
-            if (e.getMessage() != null && e.getMessage().contains("resource_already_exists_exception")) {
-                // Race condition — another thread created it.
-            } else {
-                throw e;
-            }
-        }
-        ensuredBaseIndices.add(indexName);
-    }
-
-    private org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder buildNlpAnalysisMappings(
-            org.opensearch.client.opensearch._types.mapping.TypeMapping.Builder m) {
-        return m
-            .properties("nlp_analysis", nlp -> nlp
-                .object(obj -> obj
-                    .properties("sentences", sent -> sent
-                        .object(sentObj -> sentObj
-                            .properties("text", t -> t.text(tt -> tt))
-                            .properties("start_offset", so -> so.integer(ii -> ii))
-                            .properties("end_offset", eo -> eo.integer(ii -> ii))
-                        )
-                    )
-                    .properties("tokens", tok -> tok
-                        .object(tokObj -> tokObj
-                            .properties("text", t -> t.text(tt -> tt))
-                            .properties("lemma", l -> l.text(tt -> tt))
-                            .properties("pos", p -> p.keyword(kk -> kk))
-                            .properties("tag", tg -> tg.keyword(kk -> kk))
-                            .properties("start_offset", so -> so.integer(ii -> ii))
-                            .properties("end_offset", eo -> eo.integer(ii -> ii))
-                        )
-                    )
-                    .properties("entities", ent -> ent
-                        .object(entObj -> entObj
-                            .properties("text", t -> t.text(tt -> tt))
-                            .properties("type", tp -> tp.keyword(kk -> kk))
-                            .properties("start_offset", so -> so.integer(ii -> ii))
-                            .properties("end_offset", eo -> eo.integer(ii -> ii))
-                        )
-                    )
-                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
-                    .properties("token_count", tc -> tc.integer(ii -> ii))
-                    .properties("word_count", wc -> wc.integer(ii -> ii))
-                    .properties("character_count", cc -> cc.integer(ii -> ii))
-                )
-            )
-            .properties("chunk_analytics", ca -> ca
-                .object(obj -> obj
-                    .properties("word_count", wc -> wc.integer(ii -> ii))
-                    .properties("character_count", cc -> cc.integer(ii -> ii))
-                    .properties("sentence_count", sc -> sc.integer(ii -> ii))
-                )
-            );
-    }
 
     // ===== Chunk grouping =====
 

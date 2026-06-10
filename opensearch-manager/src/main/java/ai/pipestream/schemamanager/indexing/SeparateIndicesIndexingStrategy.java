@@ -175,134 +175,146 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
         return enqueueDocuments(batch);
     }
 
+    /**
+     * Two-phase windowed enqueue (same shape as CHUNK_COMBINED): Phase 1
+     * submits EVERY doc's base + chunk items into the bulk queues without
+     * awaiting anything per doc, then a demand flush drains the queues, then
+     * a single barrier per batch awaits all futures. The previous shape
+     * awaited per BASE DOC and per chunk group — every doc paid at least one
+     * flush-interval timer tick, which capped this strategy at ~2 events/s
+     * regardless of OpenSearch capacity.
+     */
     private List<StreamIndexDocumentsResponse> enqueueDocuments(List<StreamIndexDocumentsRequest> batch) {
-        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(batch.size());
+        record DocSubmission(String requestId, String docId,
+                             CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> baseFuture,
+                             List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> chunkFutures,
+                             String submitError) {}
 
+        // Phase 1 — submit everything, collect futures per doc.
+        List<DocSubmission> submissions = new ArrayList<>(batch.size());
+        List<CompletableFuture<?>> all = new ArrayList<>();
         for (var req : batch) {
             final String requestId = req.getRequestId();
-            final String baseIndex = req.getIndexName();
-
             if (!req.hasDocumentMap()) {
-                responses.add(StreamIndexDocumentsResponse.newBuilder()
-                        .setRequestId(requestId)
-                        .setSuccess(false)
-                        .setMessage("Protocol error: Missing document_map for SEPARATE_INDICES strategy")
-                        .build());
+                submissions.add(new DocSubmission(requestId, "", null, List.of(),
+                        "Protocol error: Missing document_map for SEPARATE_INDICES strategy"));
                 continue;
             }
-
+            final String baseIndex = req.getIndexName();
             final OpenSearchDocumentMap docMap = req.getDocumentMap();
             final String docId = docMap.getOriginalDocId();
 
-            StreamIndexDocumentsResponse baseResp = enqueueBaseDoc(baseIndex, docId, docMap, requestId);
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> baseFuture;
+            try {
+                String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(docMap);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> map = objectMapper.readValue(jsonDoc, Map.class);
+                sanitizePunctuationCounts(map);
+                baseFuture = bulkQueueSet.submitWithFuture(baseIndex, docId, map, null);
+            } catch (Exception e) {
+                submissions.add(new DocSubmission(requestId, docId, null, List.of(),
+                        "Conversion error: " + e.getMessage()));
+                continue;
+            }
+            all.add(baseFuture);
 
-            boolean allChunksOk = true;
+            List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> chunkFutures =
+                    new ArrayList<>();
             if (req.getChunkDocumentsCount() > 0) {
-                Map<String, List<VsChunkEntry>> groupedChunks = groupChunksByVsIndex(baseIndex, req.getChunkDocumentsList());
-                for (var entry : groupedChunks.entrySet()) {
-                    if (!enqueueChunkGroup(entry.getKey(), entry.getValue())) {
-                        allChunksOk = false;
-                    }
+                Map<String, List<VsChunkEntry>> grouped =
+                        groupChunksByVsIndex(baseIndex, req.getChunkDocumentsList());
+                for (var entry : grouped.entrySet()) {
+                    submitChunkGroup(entry.getKey(), entry.getValue(), chunkFutures);
                 }
             }
+            all.addAll(chunkFutures);
+            submissions.add(new DocSubmission(requestId, docId, baseFuture, chunkFutures, null));
+        }
 
-            if (!allChunksOk) {
-                baseResp = StreamIndexDocumentsResponse.newBuilder(baseResp)
+        // Phase 1.5 — demand flush so the barrier isn't timer-paced.
+        bulkQueueSet.flushNow();
+
+        // Phase 2 — single barrier for the whole batch.
+        try {
+            CompletableFuture.allOf(all.toArray(new CompletableFuture[0])).get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted awaiting batch bulk submission", ie);
+        } catch (ExecutionException ee) {
+            LOG.warnf("Batch bulk await raised %s; evaluating per-doc outcomes individually",
+                    ee.getMessage());
+        }
+
+        // Phase 3 — map per-doc outcomes.
+        List<StreamIndexDocumentsResponse> responses = new ArrayList<>(submissions.size());
+        for (DocSubmission sub : submissions) {
+            if (sub.submitError() != null) {
+                responses.add(StreamIndexDocumentsResponse.newBuilder()
+                        .setRequestId(sub.requestId())
+                        .setDocumentId(sub.docId())
                         .setSuccess(false)
-                        .setMessage(baseResp.getMessage() + " (some chunks failed indexing)")
-                        .build();
+                        .setMessage(sub.submitError())
+                        .build());
+                continue;
             }
-            responses.add(baseResp);
+            var baseResult = readResult(sub.baseFuture());
+            boolean baseOk = baseResult != null && baseResult.success();
+            boolean allChunksOk = true;
+            for (var f : sub.chunkFutures()) {
+                var r = readResult(f);
+                if (r == null || !r.success()) {
+                    allChunksOk = false;
+                }
+            }
+            String message = !baseOk
+                    ? "Base doc failure: " + (baseResult == null ? "bulk submit error" : baseResult.failureDetail())
+                    : (allChunksOk ? "Successfully enqueued" : "Successfully enqueued (some chunks failed indexing)");
+            responses.add(StreamIndexDocumentsResponse.newBuilder()
+                    .setRequestId(sub.requestId())
+                    .setDocumentId(sub.docId())
+                    .setSuccess(baseOk && allChunksOk)
+                    .setMessage(message)
+                    .build());
         }
         return responses;
     }
 
-    private StreamIndexDocumentsResponse enqueueBaseDoc(
-            String indexName, String docId, OpenSearchDocumentMap docMap, String requestId) {
+    /** Future result, or null on interrupt/submit failure. */
+    private static ai.pipestream.schemamanager.bulk.BulkItemResult readResult(
+            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> f) {
         try {
-            String jsonDoc = JsonFormat.printer().preservingProtoFieldNames().print(docMap);
-            @SuppressWarnings("unchecked")
-            Map<String, Object> map = objectMapper.readValue(jsonDoc, Map.class);
-            sanitizePunctuationCounts(map);
-            try {
-                var result = awaitBulk(bulkQueueSet.submitWithFuture(indexName, docId, map, null));
-                return StreamIndexDocumentsResponse.newBuilder()
-                        .setRequestId(requestId)
-                        .setDocumentId(docId)
-                        .setSuccess(result.success())
-                        .setMessage(result.success() ? "Successfully enqueued" : result.failureDetail())
-                        .build();
-            } catch (RuntimeException t) {
-                return StreamIndexDocumentsResponse.newBuilder()
-                        .setRequestId(requestId)
-                        .setDocumentId(docId)
-                        .setSuccess(false)
-                        .setMessage("Base doc queue failure: " + t.getMessage())
-                        .build();
-            }
-        } catch (IOException e) {
-            return StreamIndexDocumentsResponse.newBuilder()
-                    .setRequestId(requestId)
-                    .setDocumentId(docId)
-                    .setSuccess(false)
-                    .setMessage("Conversion error: " + e.getMessage())
-                    .build();
+            return f.get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (ExecutionException ee) {
+            return null;
         }
     }
 
-    private boolean enqueueChunkGroup(String vsIndexName, List<VsChunkEntry> entries) {
+    /**
+     * Submit one (vs index, chunk group) — verification is strict (the
+     * bind-time path provisioned the side index + field; fail loud if not),
+     * and NOTHING is awaited here: futures accumulate into the caller's
+     * barrier list.
+     */
+    private void submitChunkGroup(String vsIndexName, List<VsChunkEntry> entries,
+                                  List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> out) {
         VsChunkEntry first = entries.get(0);
         int dimension = first.chunk().getEmbeddingsMap().get(first.embeddingModelId()).getValuesCount();
-
-        // STRICT: verify the per-recipe side index + knn field were eagerly
-        // provisioned by the bind-time path. No create-on-missing here.
         indexKnnProvisioner.requireKnnField(vsIndexName, "vector", dimension);
 
-        List<CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult>> futures = new ArrayList<>(entries.size());
         for (VsChunkEntry entry : entries) {
             try {
                 Map<String, Object> docMap = serializeChunkForModel(entry.chunk(), entry.embeddingModelId());
                 String docId = generateChunkDocId(entry.chunk(), entry.embeddingModelId());
-                futures.add(bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null));
+                out.add(bulkQueueSet.submitWithFuture(vsIndexName, docId, docMap, null));
             } catch (Exception e) {
                 LOG.errorf(e, "Failed to enqueue chunk %s", entry.chunk().getDocId());
                 CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> failed = new CompletableFuture<>();
                 failed.completeExceptionally(e);
-                futures.add(failed);
+                out.add(failed);
             }
-        }
-        if (futures.isEmpty()) {
-            return true;
-        }
-        boolean allOk = true;
-        for (CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> f : futures) {
-            try {
-                if (!f.get().success()) {
-                    allOk = false;
-                }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                allOk = false;
-            } catch (ExecutionException ee) {
-                LOG.warnf(ee.getCause(), "Bulk submit failed for %s", vsIndexName);
-                allOk = false;
-            }
-        }
-        return allOk;
-    }
-
-    private static ai.pipestream.schemamanager.bulk.BulkItemResult awaitBulk(
-            CompletableFuture<ai.pipestream.schemamanager.bulk.BulkItemResult> future) {
-        try {
-            return future.get();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Interrupted awaiting bulk submission", ie);
-        } catch (ExecutionException ee) {
-            Throwable cause = ee.getCause();
-            throw cause instanceof RuntimeException re
-                    ? re
-                    : new RuntimeException("Bulk submit failed", cause);
         }
     }
 

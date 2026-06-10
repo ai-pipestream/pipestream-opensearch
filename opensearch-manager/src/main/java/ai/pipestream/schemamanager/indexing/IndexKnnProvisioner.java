@@ -113,8 +113,24 @@ public class IndexKnnProvisioner {
         if (indexExistsCache.contains(indexName)) {
             return;
         }
-        LOG.debugf("requireIndex: cache miss for %s — rehydrating from OpenSearch (JVM restart?)", indexName);
-        ensureIndex(indexName);
+        // Cache miss (JVM restart): VERIFY with a read-only probe and fail
+        // loud if absent. The hot path NEVER creates — eager paths (plan
+        // provisioning / prewarm / AssignSemanticConfigToIndex) own creation;
+        // a missing index here is a configuration error, not a gap to patch.
+        LOG.debugf("requireIndex: cache miss for %s — verifying against OpenSearch (JVM restart?)", indexName);
+        boolean exists;
+        try {
+            exists = openSearchAsyncClient.indices().exists(e -> e.index(indexName)).get().value();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to verify index exists: " + indexName, e);
+        }
+        if (!exists) {
+            throw new IllegalStateException("Index '" + indexName
+                    + "' was never provisioned — eager provisioning (plan READY / prewarm / "
+                    + "AssignSemanticConfigToIndex) must run before documents arrive; "
+                    + "the indexing hot path does not create indices.");
+        }
+        indexExistsCache.add(indexName);
     }
 
     /**
@@ -138,8 +154,29 @@ public class IndexKnnProvisioner {
         if (ensured.contains(cacheKey)) {
             return;
         }
-        LOG.debugf("requireKnnField: cache miss for %s — rehydrating from OpenSearch (JVM restart?)", cacheKey);
-        ensureKnnField(indexName, fieldName, dimensions);
+        // Cache miss (JVM restart): VERIFY the field exists in the live
+        // mapping — read-only — and fail loud if it doesn't. Bind-time
+        // provisioning owns creation; the hot path never putMappings.
+        LOG.debugf("requireKnnField: cache miss for %s — verifying mapping (JVM restart?)", cacheKey);
+        boolean present;
+        try {
+            var mapping = openSearchAsyncClient.indices()
+                    .getMapping(g -> g.index(indexName)).get()
+                    .get(indexName);
+            present = mapping != null
+                    && mapping.mappings() != null
+                    && mapping.mappings().properties().containsKey(fieldName);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to verify KNN field " + indexName + "." + fieldName, e);
+        }
+        if (!present) {
+            throw new IllegalStateException("KNN field '" + fieldName + "' on index '" + indexName
+                    + "' was never provisioned — bind-time provisioning "
+                    + "(plan READY / AssignSemanticConfigToIndex) must run first; "
+                    + "the indexing hot path does not create mappings.");
+        }
+        ensured.add(cacheKey);
+        indexExistsCache.add(indexName);
     }
 
     /**
