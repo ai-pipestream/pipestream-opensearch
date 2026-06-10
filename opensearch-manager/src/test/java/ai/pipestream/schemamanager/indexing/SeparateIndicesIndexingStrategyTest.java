@@ -254,6 +254,33 @@ class SeparateIndicesIndexingStrategyTest {
     }
 
     @Test
+    void serializeChunkForModel_stampsCrawlIdWhenPresent() throws Exception {
+        OpenSearchChunkDocument chunk = baseChunkBuilder()
+                .setCrawlId("crawl-abc123")
+                .putEmbeddings("model-a", FloatVector.newBuilder().addValues(0.1f).build())
+                .build();
+
+        Map<String, Object> doc = strategy.serializeChunkForModel(chunk, "model-a");
+
+        assertThat(doc.get("crawl_id"))
+                .as("--vs-- docs must carry crawl_id so GetCrawlIndexStats can filter the family")
+                .isEqualTo("crawl-abc123");
+    }
+
+    @Test
+    void serializeChunkForModel_omitsCrawlIdWhenAbsent() throws Exception {
+        OpenSearchChunkDocument chunk = baseChunkBuilder()
+                .putEmbeddings("model-a", FloatVector.newBuilder().addValues(0.1f).build())
+                .build();
+
+        Map<String, Object> doc = strategy.serializeChunkForModel(chunk, "model-a");
+
+        assertThat(doc)
+                .as("no crawl context (module tests, direct indexing) should not emit an empty crawl_id")
+                .doesNotContainKey("crawl_id");
+    }
+
+    @Test
     void serializeChunkForModel_missingEmbeddingOmitsVectorField() throws Exception {
         OpenSearchChunkDocument chunk = baseChunkBuilder()
                 .putEmbeddings("model-a", FloatVector.newBuilder().addValues(0.1f).build())

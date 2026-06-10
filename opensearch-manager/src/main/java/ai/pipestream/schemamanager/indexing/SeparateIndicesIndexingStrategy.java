@@ -352,6 +352,11 @@ public class SeparateIndicesIndexingStrategy implements IndexingStrategyHandler 
         doc.put("source_field", chunk.getSourceField());
         doc.put("chunk_config_id", chunk.getChunkConfigId());
         doc.put("embedding_model_id", embeddingModelId);
+        // GetCrawlIndexStats filters every family member by crawl_id — the
+        // --vs-- docs must carry it like the base and --chunk-- docs do.
+        if (chunk.hasCrawlId() && !chunk.getCrawlId().isEmpty()) {
+            doc.put("crawl_id", chunk.getCrawlId());
+        }
         doc.put("chunk_index", chunk.getChunkIndex());
         doc.put("source_text", chunk.getSourceText());
         doc.put("is_primary", chunk.getIsPrimary());
