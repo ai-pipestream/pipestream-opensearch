@@ -1,0 +1,139 @@
+# OpenSearch single-node stack for a DEDICATED fast box (the "krick-1"
+# profile): modern many-core CPU, 64 GB RAM, NVMe (gen5) storage, reached
+# directly over the LAN (10 GbE) — no proxy hop, no NAS duties competing
+# for cores.
+#
+# Sibling of dev-tools/dev-assets/docker/opensearch-nas (the NAS-hosted
+# stack behind Traefik). This profile differs deliberately:
+#   - Heap 24g (NOT 32g): vector workloads want native memory more than
+#     heap — HNSW graphs live OFF-heap, governed by the k-NN circuit
+#     breaker. 24g heap + ~60% of the remaining ~40g for k-NN graphs +
+#     the rest as Lucene mmap page cache is the right split for 64 GB.
+#   - No Traefik labels: dev machines talk to it DIRECT over the LAN
+#     (http://<host>:9200) — the 10 GbE link is the whole point. If you
+#     want a browser-friendly HTTPS name, add a route on the NAS Traefik
+#     pointing at this host instead of fronting it here.
+#   - Same one-shot init-templates sidecar as the NAS stack (idempotent
+#     PUT _index_template on every stack start).
+#
+# Deploy (on the OS host):
+#   cd deploy/opensearch-krick
+#   cp .env.example .env   # set OS_DATA_DIR to your NVMe path, tune heap
+#   docker compose up -d
+#
+# Point the dev stack at it (~/.pipeline/dev env):
+#   OPENSEARCH_HOST=<this host's LAN IP or name>
+#   OPENSEARCH_PORT=9200
+#   OPENSEARCH_PROTOCOL=http
+#
+# NO real hostnames belong in this file — everything site-specific comes
+# from .env (gitignored) or Portainer stack env vars.
+
+services:
+
+  opensearch:
+    image: opensearchproject/opensearch:${OS_VERSION:-3.6.0}
+    container_name: opensearch
+    hostname: opensearch
+    environment:
+      cluster.name: ${OS_CLUSTER_NAME:-pipestream-krick}
+      node.name: ${OS_NODE_NAME:-opensearch-krick}
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      # Heap: <= 32g keeps compressed-oops; 24g default leaves ~40 GB of
+      # native memory for k-NN graphs + page cache on a 64 GB box.
+      OPENSEARCH_JAVA_OPTS: "-Xms${OS_HEAP:-24g} -Xmx${OS_HEAP:-24g}"
+      # k-NN graphs must fit in native memory or vector search latency
+      # goes from ms to seconds (disk spill). Percentage of (RAM - heap).
+      knn.memory.circuit_breaker.enabled: "true"
+      knn.memory.circuit_breaker.limit: "${OS_KNN_CB:-60%}"
+      # Bulk-ingest tuning (same rationale as the NAS stack): big
+      # indexing buffer, deep write queue for burst absorption.
+      indices.memory.index_buffer_size: "30%"
+      thread_pool.write.queue_size: "1000"
+      cluster.max_shards_per_node: "10000"
+      cluster.routing.allocation.disk.watermark.low: "85%"
+      cluster.routing.allocation.disk.watermark.high: "92%"
+      cluster.routing.allocation.disk.watermark.flood_stage: "97%"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "${OS_REST_PORT:-9200}:9200"
+      - "${OS_PERF_PORT:-9600}:9600"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    restart: unless-stopped
+
+  # One-shot init: low-priority default index template so any new index
+  # gets bulk-ingest-friendly defaults. Idempotent; re-runs on every
+  # stack start. Higher-priority user/plan templates always win.
+  init-templates:
+    image: curlimages/curl:${CURL_VERSION:-8.20.0}
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    environment:
+      OS_DEFAULT_SHARDS: "${OS_DEFAULT_SHARDS:-6}"
+      OS_DEFAULT_REPLICAS: "${OS_DEFAULT_REPLICAS:-0}"
+      OS_DEFAULT_REFRESH: "${OS_DEFAULT_REFRESH:-30s}"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        echo "Applying default bulk-ingest index template..."
+        curl -sf -X PUT 'http://opensearch:9200/_index_template/zz-bulk-ingest-defaults' \
+          -H 'Content-Type: application/json' \
+          -d @- <<EOF
+        {
+          "index_patterns": ["*"],
+          "priority": 1,
+          "_meta": {
+            "managed_by": "opensearch-krick docker-compose",
+            "purpose": "low-priority defaults; user templates override"
+          },
+          "template": {
+            "settings": {
+              "index": {
+                "number_of_shards": $${OS_DEFAULT_SHARDS},
+                "number_of_replicas": $${OS_DEFAULT_REPLICAS},
+                "refresh_interval": "$${OS_DEFAULT_REFRESH}",
+                "codec": "best_compression"
+              }
+            }
+          }
+        }
+        EOF
+        echo
+        echo "OK."
+    restart: "no"
+
+# DATA VOLUME — point at the NVMe array. Default is a Docker-managed
+# volume; for the real deployment bind it:
+#   volumes:
+#     opensearch-data:
+#       driver: local
+#       driver_opts:
+#         type: none
+#         o: bind
+#         device: ${OS_DATA_DIR}     # e.g. /mnt/nvme/opensearch/data
+# Target dir must be owned by uid 1000:
+#   sudo mkdir -p <dir> && sudo chown -R 1000:1000 <dir>
+volumes:
+  opensearch-data:
+    driver: local
