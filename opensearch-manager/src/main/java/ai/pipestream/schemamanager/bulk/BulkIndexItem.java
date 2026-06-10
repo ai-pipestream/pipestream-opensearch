@@ -12,14 +12,28 @@ import java.util.concurrent.CompletableFuture;
  * @param routing      optional routing value (null if not needed)
  * @param resultFuture optional future completed when the bulk response arrives;
  *                     null for fire-and-forget submissions (entity telemetry)
+ * @param attempts     completed submit attempts (0 = first try); bumped when a
+ *                     429-class rejection re-enqueues the item for backoff retry
  */
 public record BulkIndexItem(
     String indexName,
     String docId,
     Map<String, Object> document,
     String routing,
-    CompletableFuture<BulkItemResult> resultFuture
+    CompletableFuture<BulkItemResult> resultFuture,
+    int attempts
 ) {
+    /** First-attempt constructor — the original 5-arg shape. */
+    public BulkIndexItem(String indexName, String docId, Map<String, Object> document,
+                         String routing, CompletableFuture<BulkItemResult> resultFuture) {
+        this(indexName, docId, document, routing, resultFuture, 0);
+    }
+
+    /** Copy for a backoff retry — same identity and future, attempts+1. */
+    public BulkIndexItem nextAttempt() {
+        return new BulkIndexItem(indexName, docId, document, routing, resultFuture, attempts + 1);
+    }
+
     /**
      * Fire-and-forget factory (no routing, no result future).
      *

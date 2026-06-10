@@ -17,6 +17,7 @@ import org.opensearch.client.opensearch.core.BulkRequest;
 import org.opensearch.client.opensearch.core.BulkResponse;
 import org.opensearch.client.opensearch.core.bulk.BulkResponseItem;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -61,6 +62,20 @@ public class BulkQueueSetBean {
 
     @ConfigProperty(name = "bulk-indexing.metadata.flush-interval-ms", defaultValue = "1000")
     int metadataFlushIntervalMs;
+
+    /**
+     * Backpressure retries for 429-class bulk item rejections
+     * (es_rejected_execution_exception = the cluster's write thread-pool
+     * queue is full — a "slow down", NOT a data error). Rejected items
+     * re-enqueue after {@code attempts * retry-backoff-ms} until
+     * {@code max-retry-attempts}, then fail terminally. Everything else
+     * (index_not_found, mapper errors) stays terminal on first failure.
+     */
+    @ConfigProperty(name = "bulk-indexing.max-retry-attempts", defaultValue = "6")
+    int maxRetryAttempts;
+
+    @ConfigProperty(name = "bulk-indexing.retry-backoff-ms", defaultValue = "250")
+    int retryBackoffMs;
 
     /** CDI. */
     public BulkQueueSetBean() {
@@ -295,18 +310,56 @@ public class BulkQueueSetBean {
 
             List<BulkResponseItem> items = response.items();
             int n = Math.min(items.size(), batch.size());
+            List<BulkIndexItem> toRetry = new ArrayList<>();
             for (int i = 0; i < n; i++) {
                 BulkResponseItem responseItem = items.get(i);
-                CompletableFuture<BulkItemResult> future = batch.get(i).resultFuture();
+                BulkIndexItem submitted = batch.get(i);
+                CompletableFuture<BulkItemResult> future = submitted.resultFuture();
                 var opError = responseItem.error();
-                if (future != null) {
-                    if (opError != null) {
-                        future.complete(BulkItemResult.failed(
-                                Objects.toString(opError.reason(), "bulk item error")));
-                    } else {
+                if (opError == null) {
+                    if (future != null) {
                         future.complete(BulkItemResult.ok());
                     }
+                    continue;
                 }
+                String type = Objects.toString(opError.type(), "");
+                boolean rejected = type.contains("rejected_execution");
+                if (rejected && submitted.attempts() < maxRetryAttempts) {
+                    // 429-class: the cluster asked us to slow down. Re-enqueue
+                    // with linear backoff; the item keeps its future, so the
+                    // submitting barrier simply waits out the backpressure.
+                    toRetry.add(submitted.nextAttempt());
+                    continue;
+                }
+                if (future != null) {
+                    future.complete(BulkItemResult.failed(rejected
+                            ? "write queue rejection persisted through " + submitted.attempts()
+                                    + " retries: " + Objects.toString(opError.reason(), "")
+                            : Objects.toString(opError.reason(), "bulk item error")));
+                }
+            }
+            if (!toRetry.isEmpty()) {
+                long delayMs = (long) retryBackoffMs * toRetry.get(0).attempts();
+                LOG.infof("Bulk backpressure: re-enqueueing %d rejected item(s) after %dms (attempt %d/%d)",
+                        toRetry.size(), delayMs, toRetry.get(0).attempts(), maxRetryAttempts);
+                // Resubmit ONLY — submit() is a non-blocking offer, safe on
+                // the common-pool callback thread. The capacity trigger and the
+                // flush timer take it from there on the queue set's own
+                // scheduler. (Calling flushAll() here ran BLOCKING OpenSearch
+                // round-trips on the ForkJoinPool common pool and exhausted it:
+                // "Thread limit exceeded replacing blocked worker".)
+                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS).execute(() -> {
+                    BulkQueueSet qs = queueSet;
+                    if (qs == null) {
+                        toRetry.forEach(it -> {
+                            if (it.resultFuture() != null) {
+                                it.resultFuture().complete(BulkItemResult.failed("shutdown during backpressure retry"));
+                            }
+                        });
+                        return;
+                    }
+                    toRetry.forEach(qs::submit);
+                });
             }
             if (items.size() != batch.size()) {
                 LOG.errorf("Bulk response size mismatch: ops=%d batch=%d — completing missing futures as failed",
