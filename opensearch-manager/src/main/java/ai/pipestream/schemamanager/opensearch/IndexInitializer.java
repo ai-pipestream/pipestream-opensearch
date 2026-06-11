@@ -48,9 +48,39 @@ public class IndexInitializer {
             ensureIndex(Index.FILESYSTEM_NODES.getIndexName(), buildFilesystemNodesMapping());
             ensureIndex(Index.FILESYSTEM_DRIVES.getIndexName(), buildFilesystemDrivesMapping());
             ensureIndex(Index.REPOSITORY_DOCUMENT_UPLOADS.getIndexName(), buildDocumentUploadsMapping());
+            ensureIndex(Index.REPOSITORY_CATALOG.getIndexName(), buildCatalogMapping());
+            ensureIndex(Index.REPOSITORY_CATALOG_INTAKE.getIndexName(), buildCatalogMapping());
+            // A repository-catalog created before the stage split has no explicit
+            // stage mapping; putMapping is additive-only and idempotent, so apply
+            // it unconditionally to both so stage is always a keyword.
+            ensureStageField(Index.REPOSITORY_CATALOG.getIndexName());
+            ensureStageField(Index.REPOSITORY_CATALOG_INTAKE.getIndexName());
+            ensureCatalogAlias();
         } catch (Exception e) {
             LOG.error("Failed to initialize OpenSearch indices", e);
         }
+    }
+
+    private void ensureStageField(String indexName) throws IOException {
+        executeWithRetry("ensure stage mapping on " + indexName, () -> {
+            client.indices().putMapping(m -> m
+                    .index(indexName)
+                    .properties("stage", Property.of(p -> p.keyword(KeywordProperty.of(k -> k)))));
+            return null;
+        });
+    }
+
+    private void ensureCatalogAlias() throws IOException {
+        executeWithRetry("ensure alias " + IndexConstants.REPOSITORY_CATALOG_ALL_ALIAS, () -> {
+            client.indices().updateAliases(u -> u
+                    .actions(a -> a.add(add -> add
+                            .index(Index.REPOSITORY_CATALOG.getIndexName())
+                            .alias(IndexConstants.REPOSITORY_CATALOG_ALL_ALIAS)))
+                    .actions(a -> a.add(add -> add
+                            .index(Index.REPOSITORY_CATALOG_INTAKE.getIndexName())
+                            .alias(IndexConstants.REPOSITORY_CATALOG_ALL_ALIAS))));
+            return null;
+        });
     }
 
     private void ensureIndex(String indexName, TypeMapping mapping) throws IOException {
@@ -117,6 +147,31 @@ public class IndexInitializer {
         b.properties("metadata", Property.of(p -> p.object(o -> o.dynamic(DynamicMapping.True))));
         b.properties("created_at", Property.of(p -> p.date(d -> d)));
         b.properties("last_accessed", Property.of(p -> p.date(d -> d)));
+        b.properties("indexed_at", Property.of(p -> p.date(d -> d)));
+        return b.build();
+    }
+
+    private TypeMapping buildCatalogMapping() {
+        // Shared by repository-catalog (pipeline saves) and repository-catalog-intake
+        // (direct uploads / connector staging) — same schema, alias-unioned.
+        TypeMapping.Builder b = new TypeMapping.Builder();
+        b.properties("document_id", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("account_id", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("datasource_id", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("connector_id", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("stage", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("status", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("operation", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("storage_key", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("drive_name", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("content_hash", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("content_type", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("path", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("name", Property.of(p -> p.text(TextProperty.of(t -> t))));
+        b.properties("acls", Property.of(p -> p.keyword(KeywordProperty.of(k -> k))));
+        b.properties("size_bytes", Property.of(p -> p.long_(l -> l)));
+        b.properties("retention_intent_days", Property.of(p -> p.integer(i -> i)));
+        b.properties("created_at", Property.of(p -> p.date(d -> d)));
         b.properties("indexed_at", Property.of(p -> p.date(d -> d)));
         return b.build();
     }
