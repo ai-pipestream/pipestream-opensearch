@@ -153,6 +153,34 @@ public class OpenSearchIndexingService {
     }
 
     /**
+     * Partial-updates an existing catalog row to INACTIVE without creating a
+     * skeleton row when the document was never written to that stage's index
+     * (no upsert). Used for logical deletes that span both catalog stages.
+     */
+    private void markCatalogInactiveIfPresent(String indexName, String docId, long now) {
+        Map<String, Object> patch = new HashMap<>();
+        patch.put("status", "INACTIVE");
+        patch.put("operation", "DELETED");
+        patch.put(CommonFields.INDEXED_AT.getFieldName(), now);
+        try {
+            openSearchAsyncClient.update(r -> r.index(indexName).id(docId).doc(patch), Map.class)
+                    .toCompletableFuture().get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.ExecutionException ee) {
+            Throwable cause = ee.getCause();
+            String msg = cause != null && cause.getMessage() != null ? cause.getMessage() : "";
+            if (msg.contains("document_missing_exception")) {
+                LOG.debugf("No %s row for %s — nothing to tombstone", indexName, docId);
+            } else {
+                LOG.warnf(cause, "Catalog tombstone failed (%s/%s, ack anyway; idempotent consumer)", indexName, docId);
+            }
+        } catch (IOException e) {
+            LOG.warnf(e, "Catalog tombstone submit failed (%s/%s)", indexName, docId);
+        }
+    }
+
+    /**
      * Blocks until the async OpenSearch delete completes, ignoring failures
      * (Kafka consumer ACK semantics treat deletes as idempotent).
      */
@@ -265,18 +293,35 @@ public class OpenSearchIndexingService {
             if (!updated.getContentType().isEmpty()) commonFields.put("content_type", updated.getContentType());
         }
 
-        // --- Repository Catalog: last-write-wins, one row per document ---
+        // --- Repository Catalog: last-write-wins per stage, one row per document ---
+        // Intake writes and pipeline saves go to separate same-schema indices
+        // (unioned by the repository-catalog-all alias) so promotion through a
+        // pipeline never overwrites the intake audit row. Empty stage = legacy
+        // emitter, routed to the pipeline index to preserve pre-stage behavior.
+        String stage = event.getStage();
         Map<String, Object> catalogDoc = new HashMap<>(commonFields);
         catalogDoc.put("status", event.hasDeleted() ? "INACTIVE" : "ACTIVE");
         catalogDoc.put("operation", operation);
+        catalogDoc.put("stage", "intake".equals(stage) ? "intake" : "pipeline");
         catalogDoc.put(CommonFields.CREATED_AT.getFieldName(), eventTimestamp);
         catalogDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
-        queueForIndexing(Index.REPOSITORY_CATALOG.getIndexName(), kafkaKey.toString(), catalogDoc);
+        if (event.hasDeleted() && stage.isEmpty()) {
+            // Logical document delete with no stage: the document is gone from
+            // both worlds — tombstone whichever rows exist in each index.
+            markCatalogInactiveIfPresent(Index.REPOSITORY_CATALOG.getIndexName(), kafkaKey.toString(), now);
+            markCatalogInactiveIfPresent(Index.REPOSITORY_CATALOG_INTAKE.getIndexName(), kafkaKey.toString(), now);
+        } else {
+            String catalogIndex = "intake".equals(stage)
+                    ? Index.REPOSITORY_CATALOG_INTAKE.getIndexName()
+                    : Index.REPOSITORY_CATALOG.getIndexName();
+            queueForIndexing(catalogIndex, kafkaKey.toString(), catalogDoc);
+        }
 
         // --- Repository History: append-only, one row per event ---
         Map<String, Object> historyDoc = new HashMap<>(commonFields);
         historyDoc.put("event_id", event.getEventId());
         historyDoc.put("operation", operation);
+        if (!stage.isEmpty()) historyDoc.put("stage", stage);
         historyDoc.put("event_timestamp", eventTimestamp);
         historyDoc.put(CommonFields.INDEXED_AT.getFieldName(), now);
         if (event.hasSource()) {

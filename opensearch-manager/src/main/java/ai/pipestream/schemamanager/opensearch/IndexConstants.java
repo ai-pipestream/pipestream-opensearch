@@ -9,6 +9,14 @@ public final class IndexConstants {
     }
 
     /**
+     * Alias unioning the intake and pipeline catalog indices
+     * ({@link Index#REPOSITORY_CATALOG_INTAKE} + {@link Index#REPOSITORY_CATALOG}).
+     * Query this for the merged view; collapse on {@code document_id} preferring
+     * {@code stage=pipeline} when one row per document is wanted.
+     */
+    public static final String REPOSITORY_CATALOG_ALL_ALIAS = "repository-catalog-all";
+
+    /**
      * Logical OpenSearch index names for platform entity types.
      */
     public enum Index {
@@ -34,8 +42,10 @@ public final class IndexConstants {
         /** Index for document upload tracking. */
         REPOSITORY_DOCUMENT_UPLOADS("repository-document-uploads"),
 
-        /** Index for catalog entries. */
+        /** Index for catalog entries written by pipeline saves. */
         REPOSITORY_CATALOG("repository-catalog"),
+        /** Index for catalog entries written at intake (direct upload / connector staging). Same schema as {@link #REPOSITORY_CATALOG}; kept separate so pipeline saves never overwrite the intake audit row. */
+        REPOSITORY_CATALOG_INTAKE("repository-catalog-intake"),
         /** Index for repository history events. */
         REPOSITORY_HISTORY("repository-history");
 
