@@ -78,14 +78,14 @@
 #   accessed directly. (example: "foo.example.com,bar.example.com")
 #
 ###
-FROM registry.access.redhat.com/ubi9-minimal:9.7
+FROM registry.access.redhat.com/ubi10/ubi-minimal:10.1
 
 ENV LANGUAGE='en_US:en'
 
 # Install Java 21 runtime (headless for smaller size) and update CVEs
 # curl-minimal is pre-installed in ubi9-minimal and supports -f flag for health checks
 RUN microdnf install -y \
-    java-21-openjdk-headless \
+    java-25-openjdk-headless \
     ca-certificates \
     && microdnf update -y \
     && microdnf clean all \
